@@ -2,6 +2,7 @@ import Foundation
 import SwiftUI
 import AppKit
 import Combine
+import ServiceManagement
 
 @MainActor
 final class AppState: ObservableObject {
@@ -39,6 +40,7 @@ final class AppState: ObservableObject {
     @Published var cleanupBackendName: String = "…"
     @Published var lastSttMs: Int?
     @Published var lastCleanupMs: Int?
+    @Published var launchAtLogin: Bool = SMAppService.mainApp.status == .enabled
 
     let accessibility = AccessibilityPermission()
 
@@ -65,6 +67,14 @@ final class AppState: ObservableObject {
         didLaunch = true
 
         UsageLog.migrateLegacyLogIfNeeded()
+
+        // Default to starting at login on first run; the menu toggle can turn
+        // it off, and we never re-force it after that.
+        let loginDefaultKey = "didApplyLoginItemDefault"
+        if !UserDefaults.standard.bool(forKey: loginDefaultKey) {
+            UserDefaults.standard.set(true, forKey: loginDefaultKey)
+            setLaunchAtLogin(true)
+        }
 
         // Install hotkeys as soon as Accessibility is trusted, whether that's
         // true already at launch or the user grants it later from the menu
@@ -246,6 +256,19 @@ final class AppState: ObservableObject {
                 }
             }
         }
+    }
+
+    func setLaunchAtLogin(_ on: Bool) {
+        do {
+            if on {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+        } catch {
+            // Fall through to re-reading actual status below.
+        }
+        launchAtLogin = SMAppService.mainApp.status == .enabled
     }
 
     func copyCleaned() {

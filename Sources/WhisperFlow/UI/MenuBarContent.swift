@@ -23,6 +23,11 @@ struct MenuBarContent: View {
             openTranscriptWindow()
         }
 
+        Toggle("Start at Login", isOn: Binding(
+            get: { state.launchAtLogin },
+            set: { state.setLaunchAtLogin($0) }
+        ))
+
         Divider()
 
         if accessibility.isTrusted {
