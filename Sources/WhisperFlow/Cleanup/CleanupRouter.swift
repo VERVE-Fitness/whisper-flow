@@ -58,6 +58,13 @@ struct CleanupRouter: Sendable {
                 FileHandle.standardError.write(Data("[cleanup] \(backend.name) kept only \(Int(retention * 100))% of content words; using raw\n".utf8))
                 return CleanupResult(text: raw, backendName: backend.name, fellBackToRaw: true, durationMs: elapsedMs())
             }
+            // Additions guard: a faithful cleanup introduces almost no new words;
+            // an answered request does (e.g. "Here is a list: 1. 2. ..." echoes
+            // the request's words, passing retention, but adds its own framing).
+            if Self.addsTooManyNewWords(raw: raw, cleaned: trimmed) {
+                FileHandle.standardError.write(Data("[cleanup] \(backend.name) introduced too many new words (looks like an answer, not a cleanup); using raw\n".utf8))
+                return CleanupResult(text: raw, backendName: backend.name, fellBackToRaw: true, durationMs: elapsedMs())
+            }
             return CleanupResult(text: trimmed, backendName: backend.name, fellBackToRaw: false, durationMs: elapsedMs())
         } catch {
             FileHandle.standardError.write(Data("[cleanup] \(backend.name) failed (\(error.localizedDescription)); using raw\n".utf8))
@@ -65,9 +72,11 @@ struct CleanupRouter: Sendable {
         }
     }
 
-    /// Fraction of the raw transcript's non-filler word count still present in
-    /// the cleaned text (by simple ratio of counts). Fillers are excluded from
-    /// the raw count so legitimate filler removal doesn't depress the score.
+    /// Fraction of the raw transcript's distinct non-filler words that still
+    /// appear in the cleaned text. Word-count ratios miss paraphrases and
+    /// answered questions (similar length, different words) — checking which
+    /// words survived catches deletions AND rewrites: a faithful cleanup keeps
+    /// nearly all original words, an answer or paraphrase keeps very few.
     static func contentWordRetention(raw: String, cleaned: String) -> Double {
         let fillers: Set<String> = ["um", "uh", "uhm", "erm", "er", "ah", "hmm", "mmm", "like", "you", "know", "so"]
         func words(_ s: String) -> [String] {
@@ -75,10 +84,29 @@ struct CleanupRouter: Sendable {
                 .components(separatedBy: CharacterSet.alphanumerics.inverted)
                 .filter { !$0.isEmpty }
         }
-        let rawContent = words(raw).filter { !fillers.contains($0) }
+        let rawContent = Set(words(raw)).subtracting(fillers)
         guard !rawContent.isEmpty else { return 1.0 }
-        let cleanedCount = words(cleaned).count
-        return min(1.0, Double(cleanedCount) / Double(rawContent.count))
+        let cleanedSet = Set(words(cleaned))
+        let kept = rawContent.intersection(cleanedSet).count
+        return Double(kept) / Double(rawContent.count)
+    }
+
+    /// True when the cleaned text contains a suspicious number of words that
+    /// were never spoken. Legitimate cleanup only adds words when correcting a
+    /// mis-hearing (a handful at most); an LLM answering the dictation adds its
+    /// own framing ("Here is…", list numbers, new content). Small dictations
+    /// get an absolute allowance of 2 new words so corrections never trip it.
+    static func addsTooManyNewWords(raw: String, cleaned: String) -> Bool {
+        func words(_ s: String) -> Set<String> {
+            Set(s.lowercased()
+                .components(separatedBy: CharacterSet.alphanumerics.inverted)
+                .filter { !$0.isEmpty })
+        }
+        let rawSet = words(raw)
+        let cleanedSet = words(cleaned)
+        guard !cleanedSet.isEmpty else { return false }
+        let added = cleanedSet.subtracting(rawSet).count
+        return Double(added) > max(2.0, 0.25 * Double(cleanedSet.count))
     }
 }
 

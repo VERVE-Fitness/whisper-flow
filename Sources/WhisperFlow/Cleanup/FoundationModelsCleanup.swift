@@ -24,9 +24,15 @@ struct FoundationModelsCleanup: CleanupBackend {
             guard SystemLanguageModel.default.availability == .available else {
                 throw CleanupError.unavailable(name)
             }
-            let session = LanguageModelSession(instructions: cleanupSystemPrompt)
-            let response = try await session.respond(to: raw)
-            let cleaned = response.content.trimmingCharacters(in: .whitespacesAndNewlines)
+            let examples = cleanupFewShot
+                .map { "Input: \($0.user)\nOutput: \($0.assistant)" }
+                .joined(separator: "\n\n")
+            let session = LanguageModelSession(instructions: cleanupSystemPrompt + "\n\nExamples:\n" + examples)
+            let response = try await session.respond(to: wrapTranscript(raw))
+            let cleaned = response.content
+                .replacingOccurrences(of: "<transcript>", with: "")
+                .replacingOccurrences(of: "</transcript>", with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
             guard !cleaned.isEmpty else { throw CleanupError.emptyOutput }
             return cleaned
         }

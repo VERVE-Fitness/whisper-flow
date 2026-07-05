@@ -41,9 +41,9 @@ struct MenuBarContent: View {
 
         Divider()
 
-        Text("Push-to-talk: hold Right ⌥")
+        Text("Start dictation: ⌘ + Right ⌥")
             .foregroundStyle(.secondary)
-        Text("Hands-free: ⌃⌥Space")
+        Text("Finish: press any key · Cancel: esc")
             .foregroundStyle(.secondary)
 
         Divider()

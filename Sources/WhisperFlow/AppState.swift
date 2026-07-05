@@ -26,11 +26,10 @@ final class AppState: ObservableObject {
     }
 
     /// How the current/last dictation was triggered. Window dictations show
-    /// text in the transcript window (M1 behaviour); ptt/toggle dictations
-    /// insert at the cursor and show the floating pill instead.
+    /// text in the transcript window (M1 behaviour); hotkey dictations insert
+    /// at the cursor and show the floating pill instead.
     enum DictationMode: String {
-        case pushToTalk = "ptt"
-        case toggle = "toggle"
+        case hotkey = "hotkey"
         case window = "window"
     }
 
@@ -78,25 +77,30 @@ final class AppState: ObservableObject {
 
         pill.onTapStop = { [weak self] in
             guard let self, self.currentMode != .window else { return }
+            self.hotkeys.endCaptureMode()
             self.stopRecording()
         }
 
-        hotkeys.onPushToTalkStart = { [weak self] in
-            guard let self, self.accessibility.isTrusted else { return }
-            self.beginDictation(mode: .pushToTalk)
+        hotkeys.onActivate = { [weak self] in
+            guard let self, self.accessibility.isTrusted, self.canRecord else { return }
+            self.beginDictation(mode: .hotkey)
+            self.hotkeys.beginCaptureMode()
         }
-        hotkeys.onPushToTalkStop = { [weak self] in
+        hotkeys.onFinish = { [weak self] in
             guard let self else { return }
-            guard self.isRecording, self.currentMode == .pushToTalk else { return }
+            guard self.isRecording, self.currentMode == .hotkey else {
+                self.hotkeys.endCaptureMode()
+                return
+            }
             self.stopRecording()
         }
-        hotkeys.onToggle = { [weak self] in
-            guard let self, self.accessibility.isTrusted else { return }
-            if self.isRecording, self.currentMode == .toggle {
-                self.stopRecording()
-            } else if self.canRecord {
-                self.beginDictation(mode: .toggle)
+        hotkeys.onDiscard = { [weak self] in
+            guard let self else { return }
+            guard self.isRecording, self.currentMode == .hotkey else {
+                self.hotkeys.endCaptureMode()
+                return
             }
+            self.cancelDictation()
         }
 
         Task {
@@ -161,8 +165,27 @@ final class AppState: ObservableObject {
                 }
             } catch {
                 phase = .error(error.localizedDescription)
-                if mode != .window { pill.hide() }
+                if mode != .window {
+                    pill.hide()
+                    hotkeys.endCaptureMode()
+                }
             }
+        }
+    }
+
+    /// Escape pressed during a hotkey dictation: throw the audio away, insert
+    /// nothing. (The event tap drains itself after the Escape key-up.)
+    private func cancelDictation() {
+        guard isRecording else { return }
+        phase = .idle
+        capture.stop()
+        pill.hide()
+        Task {
+            await feedTask?.value
+            feedTask = nil
+            _ = try? await backend.finishStream()
+            rawTranscript = ""
+            cleanedTranscript = ""
         }
     }
 
@@ -217,7 +240,10 @@ final class AppState: ObservableObject {
                                 cleanupBackend: backendLogName)
             } catch {
                 phase = .error(error.localizedDescription)
-                if mode != .window { pill.hide() }
+                if mode != .window {
+                    pill.hide()
+                    hotkeys.endCaptureMode()
+                }
             }
         }
     }

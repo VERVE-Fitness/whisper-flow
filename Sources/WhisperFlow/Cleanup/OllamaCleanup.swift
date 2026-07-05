@@ -29,15 +29,19 @@ struct OllamaCleanup: CleanupBackend {
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.timeoutInterval = requestTimeout
 
+        var messages: [[String: Any]] = [["role": "system", "content": cleanupSystemPrompt]]
+        for shot in cleanupFewShot {
+            messages.append(["role": "user", "content": shot.user])
+            messages.append(["role": "assistant", "content": shot.assistant])
+        }
+        messages.append(["role": "user", "content": wrapTranscript(raw)])
+
         let body: [String: Any] = [
             "model": model,
             "stream": false,
             "keep_alive": "30m",
             "options": ["temperature": 0],
-            "messages": [
-                ["role": "system", "content": cleanupSystemPrompt],
-                ["role": "user", "content": raw]
-            ]
+            "messages": messages
         ]
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
@@ -56,7 +60,10 @@ struct OllamaCleanup: CleanupBackend {
               let content = message["content"] as? String else {
             throw CleanupError.badResponse("unexpected JSON shape")
         }
-        let cleaned = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleaned = content
+            .replacingOccurrences(of: "<transcript>", with: "")
+            .replacingOccurrences(of: "</transcript>", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleaned.isEmpty else { throw CleanupError.emptyOutput }
         return cleaned
     }

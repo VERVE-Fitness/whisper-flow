@@ -28,7 +28,9 @@ private struct PillContentView: View {
                 Circle()
                     .fill(Color.red)
                     .frame(width: 8, height: 8)
-                Text("Listening… \(trailing(partial, 60))")
+                Text(partial.isEmpty
+                     ? "Listening… any key finishes · esc cancels"
+                     : "Listening… \(trailing(partial, 60))")
                     .lineLimit(1)
             case .cleaning:
                 ProgressView()
