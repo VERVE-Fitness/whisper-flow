@@ -49,11 +49,36 @@ struct CleanupRouter: Sendable {
                 FileHandle.standardError.write(Data("[cleanup] \(backend.name) output \(trimmed.count) chars > 1.6x raw \(raw.count); using raw\n".utf8))
                 return CleanupResult(text: raw, backendName: backend.name, fellBackToRaw: true, durationMs: elapsedMs())
             }
+            // Content-retention guard: small local models sometimes delete whole
+            // clauses they judge to be noise, not just fillers. If the cleaned text
+            // keeps fewer than 60% of the raw's non-filler words, treat it as a
+            // content change and use the raw transcript instead.
+            let retention = Self.contentWordRetention(raw: raw, cleaned: trimmed)
+            if retention < 0.6 {
+                FileHandle.standardError.write(Data("[cleanup] \(backend.name) kept only \(Int(retention * 100))% of content words; using raw\n".utf8))
+                return CleanupResult(text: raw, backendName: backend.name, fellBackToRaw: true, durationMs: elapsedMs())
+            }
             return CleanupResult(text: trimmed, backendName: backend.name, fellBackToRaw: false, durationMs: elapsedMs())
         } catch {
             FileHandle.standardError.write(Data("[cleanup] \(backend.name) failed (\(error.localizedDescription)); using raw\n".utf8))
             return CleanupResult(text: raw, backendName: backend.name, fellBackToRaw: true, durationMs: elapsedMs())
         }
+    }
+
+    /// Fraction of the raw transcript's non-filler word count still present in
+    /// the cleaned text (by simple ratio of counts). Fillers are excluded from
+    /// the raw count so legitimate filler removal doesn't depress the score.
+    static func contentWordRetention(raw: String, cleaned: String) -> Double {
+        let fillers: Set<String> = ["um", "uh", "uhm", "erm", "er", "ah", "hmm", "mmm", "like", "you", "know", "so"]
+        func words(_ s: String) -> [String] {
+            s.lowercased()
+                .components(separatedBy: CharacterSet.alphanumerics.inverted)
+                .filter { !$0.isEmpty }
+        }
+        let rawContent = words(raw).filter { !fillers.contains($0) }
+        guard !rawContent.isEmpty else { return 1.0 }
+        let cleanedCount = words(cleaned).count
+        return min(1.0, Double(cleanedCount) / Double(rawContent.count))
     }
 }
 
