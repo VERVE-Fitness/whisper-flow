@@ -211,23 +211,24 @@ final class AppState: ObservableObject {
             feedTask = nil
             do {
                 let sttT0 = Date()
-                let raw = try await backend.finishStream()
+                let raw = TextNormalizer.normalizeSentenceSpacing(try await backend.finishStream())
                 // stt_ms: time from stop-press to final text (streaming absorbed the rest).
                 let sttMs = Int(Date().timeIntervalSince(sttT0) * 1000)
                 _ = sttStart
                 rawTranscript = raw
 
-                let result = await router.clean(raw)
-                cleanedTranscript = result.text
-                cleanupBackendName = result.backendName
+                let cleanResult = await router.clean(raw)
+                let cleanedText = TextNormalizer.normalizeSentenceSpacing(cleanResult.text)
+                cleanedTranscript = cleanedText
+                cleanupBackendName = cleanResult.backendName
                 lastSttMs = sttMs
-                lastCleanupMs = result.durationMs
+                lastCleanupMs = cleanResult.durationMs
                 phase = .done
 
-                let backendLogName = result.backendName + (result.fellBackToRaw ? " (fallback-to-raw)" : "")
+                let backendLogName = cleanResult.backendName + (cleanResult.fellBackToRaw ? " (fallback-to-raw)" : "")
 
                 if mode != .window {
-                    let outcome = TextInserter.insert(result.text, accessibilityTrusted: accessibility.isTrusted)
+                    let outcome = TextInserter.insert(cleanedText, accessibilityTrusted: accessibility.isTrusted)
                     switch outcome {
                     case .inserted:
                         pill.show(.inserted)
@@ -239,12 +240,12 @@ final class AppState: ObservableObject {
                 UsageLog.append(mode: mode.rawValue,
                                 audioSeconds: audioSeconds,
                                 rawChars: raw.count,
-                                cleanedChars: result.text.count,
+                                cleanedChars: cleanedText.count,
                                 sttMs: sttMs,
-                                cleanupMs: result.durationMs,
+                                cleanupMs: cleanResult.durationMs,
                                 cleanupBackend: backendLogName,
                                 rawText: raw,
-                                cleanedText: result.text)
+                                cleanedText: cleanedText)
             } catch {
                 phase = .error(error.localizedDescription)
                 if mode != .window {

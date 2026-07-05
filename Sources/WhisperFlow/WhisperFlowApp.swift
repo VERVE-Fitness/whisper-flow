@@ -86,7 +86,7 @@ private func runCLITranscription(path: String, rawOnly: Bool) -> Int32 {
             try await backend.prepare()
 
             let sttT0 = Date()
-            let raw = try await backend.transcribeFile(samples: samples)
+            let raw = TextNormalizer.normalizeSentenceSpacing(try await backend.transcribeFile(samples: samples))
             let sttMs = Int(Date().timeIntervalSince(sttT0) * 1000)
 
             print("RAW: \(raw)")
@@ -100,9 +100,9 @@ private func runCLITranscription(path: String, rawOnly: Bool) -> Int32 {
                 let result = await router.clean(raw)
                 cleanupMs = result.durationMs
                 backendName = result.backendName + (result.fellBackToRaw ? " (fallback-to-raw)" : "")
-                cleanedChars = result.text.count
-                cleanedText = result.text
-                print("CLEANED (\(backendName)): \(result.text)")
+                cleanedText = TextNormalizer.normalizeSentenceSpacing(result.text)
+                cleanedChars = cleanedText.count
+                print("CLEANED (\(backendName)): \(cleanedText)")
             }
             print("TIMING: stt=\(sttMs) cleanup=\(cleanupMs)")
 
