@@ -90,29 +90,21 @@ final class AppState: ObservableObject {
 
         pill.onTapStop = { [weak self] in
             guard let self, self.currentMode != .window else { return }
-            self.hotkeys.endCaptureMode()
             self.stopRecording()
         }
 
-        hotkeys.onActivate = { [weak self] in
+        hotkeys.onStart = { [weak self] in
             guard let self, self.accessibility.isTrusted, self.canRecord else { return }
             self.beginDictation(mode: .hotkey)
-            self.hotkeys.beginCaptureMode()
         }
         hotkeys.onFinish = { [weak self] in
             guard let self else { return }
-            guard self.isRecording, self.currentMode == .hotkey else {
-                self.hotkeys.endCaptureMode()
-                return
-            }
+            guard self.isRecording, self.currentMode == .hotkey else { return }
             self.stopRecording()
         }
-        hotkeys.onDiscard = { [weak self] in
+        hotkeys.onCancel = { [weak self] in
             guard let self else { return }
-            guard self.isRecording, self.currentMode == .hotkey else {
-                self.hotkeys.endCaptureMode()
-                return
-            }
+            guard self.isRecording, self.currentMode == .hotkey else { return }
             self.cancelDictation()
         }
 
@@ -180,14 +172,14 @@ final class AppState: ObservableObject {
                 phase = .error(error.localizedDescription)
                 if mode != .window {
                     pill.hide()
-                    hotkeys.endCaptureMode()
+                    hotkeys.reset()
                 }
             }
         }
     }
 
-    /// Escape pressed during a hotkey dictation: throw the audio away, insert
-    /// nothing. (The event tap drains itself after the Escape key-up.)
+    /// Escape pressed during a hands-free hotkey dictation: throw the audio
+    /// away, insert nothing.
     private func cancelDictation() {
         guard isRecording else { return }
         phase = .idle
@@ -255,7 +247,7 @@ final class AppState: ObservableObject {
                 phase = .error(error.localizedDescription)
                 if mode != .window {
                     pill.hide()
-                    hotkeys.endCaptureMode()
+                    hotkeys.reset()
                 }
             }
         }

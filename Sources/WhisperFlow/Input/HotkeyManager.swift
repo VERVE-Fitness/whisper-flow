@@ -1,23 +1,24 @@
 import Foundation
 import AppKit
-import Carbon.HIToolbox
 import os
 
 private let hkLog = Logger(subsystem: "com.niallwogan.whisperflow", category: "hotkeys")
 
-/// Owns the global dictation hotkey scheme:
+/// Two ways to dictate, sharing one state machine:
 ///
-/// 1. **Activate: ⌘ + Right Option** (pressed in either order). Watched via
-///    NSEvent flagsChanged monitors (global + local). Right Option is
-///    distinguished from Left Option via the device-dependent flag bit, so
-///    typing special characters with Left Option is never affected.
-/// 2. **While dictating**, a CGEventTap swallows every key press system-wide:
-///    any key finishes the dictation (text gets inserted), Escape discards it.
-///    The swallowed key never reaches the frontmost app, and the matching
-///    key-up is drained so apps never see an orphan keystroke.
+/// 1. **Push-to-talk**: hold Right Option alone → listens while held, stops
+///    the instant you release it.
+/// 2. **Hands-free**: hold ⌘ + Right Option → keeps listening after you let
+///    go of both keys; only a later key press ends it (Escape discards
+///    instead of inserting). You can also add ⌘ *while already holding*
+///    Right Option mid-dictation to switch from "stop on release" to
+///    "stop on next key" without restarting the recording.
 ///
-/// Requires Accessibility trust for both the monitors and the event tap;
-/// AppState only calls `install()` once trust is granted.
+/// Right Option is identified by key code (61) AND the device-specific
+/// modifier bit, so Left Option — used for typing accented characters and
+/// symbols — is never touched. Requires Accessibility trust for both the
+/// flagsChanged monitors and the event tap; AppState only calls `install()`
+/// once trust is granted.
 @MainActor
 final class HotkeyManager {
     private static let rightOptionKeyCode: UInt16 = 61
@@ -27,24 +28,42 @@ final class HotkeyManager {
     /// NX_DEVICERALTKEYMASK — set while the RIGHT Option key is physically down.
     private static let rightOptionDeviceMask: UInt = 0x40
 
-    /// ⌘ + Right ⌥ pressed while idle.
-    var onActivate: (() -> Void)?
-    /// Any non-Escape key pressed while capturing → finish and insert.
+    /// Ignore Right-Option holds shorter than this before committing to a
+    /// plain push-to-talk start (accidental taps never start a dictation).
+    /// Not applied to the ⌘+Option hands-free chord, which is intentional and
+    /// instantaneous by nature.
+    private let pttDebounce: TimeInterval = 0.150
+
+    /// Called exactly once when a dictation begins, regardless of which path
+    /// triggered it.
+    var onStart: (() -> Void)?
+    /// Called when the dictation ends and should be inserted (Option
+    /// released in push-to-talk mode, or any key pressed in hands-free mode).
     var onFinish: (() -> Void)?
-    /// Escape pressed while capturing → discard the dictation.
-    var onDiscard: (() -> Void)?
+    /// Called when a hands-free dictation is discarded via Escape.
+    var onCancel: (() -> Void)?
+
+    private enum State {
+        case idle
+        /// Right Option down, no ⌘ yet, waiting out the debounce.
+        case pendingPTT
+        /// Recording; ends when Right Option is released.
+        case recordingPTT
+        /// Recording; ends only via a key press (any-key-finish tap active).
+        case recordingHandsFree
+    }
+    private var state: State = .idle
 
     private var globalFlagsMonitor: Any?
     private var localFlagsMonitor: Any?
     private var isInstalled = false
 
+    private var downAt: Date?
+    private var debounceWorkItem: DispatchWorkItem?
+
     private var eventTap: CFMachPort?
     private var eventTapSource: CFRunLoopSource?
-    private(set) var isCapturing = false
-    /// Key whose key-up we still need to swallow after the deciding key-down.
     private var drainKeyCode: Int64?
-
-    // MARK: - Activation combo (⌘ + Right ⌥)
 
     func install() {
         guard !isInstalled else { return }
@@ -63,44 +82,118 @@ final class HotkeyManager {
         hkLog.info("flags monitors installed (global: \(self.globalFlagsMonitor != nil))")
     }
 
+    /// Force back to idle and tear down the event tap, regardless of current
+    /// state. Called by AppState if a dictation errors out from underneath a
+    /// hands-free session, so a stuck tap never keeps swallowing keystrokes.
+    func reset() {
+        debounceWorkItem?.cancel()
+        debounceWorkItem = nil
+        teardownEventTap()
+        state = .idle
+    }
+
     func uninstall() {
         if let m = globalFlagsMonitor { NSEvent.removeMonitor(m) }
         if let m = localFlagsMonitor { NSEvent.removeMonitor(m) }
         globalFlagsMonitor = nil
         localFlagsMonitor = nil
-        endCaptureMode()
+        debounceWorkItem?.cancel()
+        debounceWorkItem = nil
+        teardownEventTap()
+        state = .idle
         isInstalled = false
     }
 
-    private func handleFlagsChanged(_ event: NSEvent) {
-        guard !isCapturing else { return }
-        // Fire when the combo completes in either order: the event is either
-        // the Right Option press (with ⌘ already down) or a Command press
-        // (with Right Option already physically down, per the device bit).
-        let isComboKey = event.keyCode == Self.rightOptionKeyCode
-            || event.keyCode == Self.leftCommandKeyCode
-            || event.keyCode == Self.rightCommandKeyCode
-        guard isComboKey else { return }
+    // MARK: - flagsChanged: Right Option down/up, ⌘ down
 
+    private func handleFlagsChanged(_ event: NSEvent) {
         let flags = event.modifierFlags
-        let rightOptionDown = (flags.rawValue & Self.rightOptionDeviceMask) != 0
-        hkLog.info("flagsChanged keyCode=\(event.keyCode) rawFlags=0x\(String(flags.rawValue, radix: 16)) rightOpt=\(rightOptionDown) cmd=\(flags.contains(.command))")
-        guard rightOptionDown, flags.contains(.command), flags.contains(.option) else { return }
-        hkLog.info("activation combo detected")
-        onActivate?()
+        let rightOptionPhysicallyDown = (flags.rawValue & Self.rightOptionDeviceMask) != 0
+        let cmdDown = flags.contains(.command)
+
+        if event.keyCode == Self.rightOptionKeyCode {
+            if rightOptionPhysicallyDown {
+                handleRightOptionDown(cmdAlreadyDown: cmdDown)
+            } else {
+                handleRightOptionUp()
+            }
+        } else if event.keyCode == Self.leftCommandKeyCode || event.keyCode == Self.rightCommandKeyCode {
+            if cmdDown && rightOptionPhysicallyDown {
+                handleCmdJoinedWhileOptionHeld()
+            }
+        }
     }
 
-    // MARK: - Any-key capture while dictating
+    private func handleRightOptionDown(cmdAlreadyDown: Bool) {
+        guard state == .idle else { return }
 
-    /// Start swallowing key presses system-wide. The first key-down decides:
-    /// Escape → onDiscard, anything else → onFinish. Its key-up is drained,
-    /// then the tap tears itself down.
-    func beginCaptureMode() {
-        drainKeyCode = nil
-        if eventTap != nil {
-            isCapturing = true
+        if cmdAlreadyDown {
+            hkLog.info("hands-free start (⌘ already down)")
+            state = .recordingHandsFree
+            onStart?()
+            setupEventTap()
             return
         }
+
+        downAt = Date()
+        state = .pendingPTT
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.state == .pendingPTT else { return }
+            hkLog.info("push-to-talk start")
+            self.state = .recordingPTT
+            self.onStart?()
+        }
+        debounceWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + pttDebounce, execute: work)
+    }
+
+    private func handleCmdJoinedWhileOptionHeld() {
+        switch state {
+        case .pendingPTT:
+            // Cmd landed before the debounce fired: skip straight to
+            // hands-free instead of also starting a plain PTT dictation.
+            debounceWorkItem?.cancel()
+            debounceWorkItem = nil
+            hkLog.info("hands-free start (⌘ joined before debounce)")
+            state = .recordingHandsFree
+            onStart?()
+            setupEventTap()
+        case .recordingPTT:
+            // Already recording via push-to-talk: switch how it ends, don't
+            // restart the dictation.
+            hkLog.info("upgrading push-to-talk -> hands-free mid-dictation")
+            state = .recordingHandsFree
+            setupEventTap()
+        case .idle, .recordingHandsFree:
+            break
+        }
+    }
+
+    private func handleRightOptionUp() {
+        switch state {
+        case .pendingPTT:
+            // Released before the debounce fired: accidental tap, nothing started.
+            debounceWorkItem?.cancel()
+            debounceWorkItem = nil
+            state = .idle
+        case .recordingPTT:
+            hkLog.info("push-to-talk stop (release)")
+            state = .idle
+            onFinish?()
+        case .recordingHandsFree:
+            // Hands-free persists after the key is released; only a
+            // subsequent key press (via the event tap) ends it.
+            break
+        case .idle:
+            break
+        }
+    }
+
+    // MARK: - Any-key-finish / Escape-cancel while hands-free
+
+    private func setupEventTap() {
+        guard eventTap == nil else { return }
+        drainKeyCode = nil
 
         let mask = (CGEventMask(1) << CGEventType.keyDown.rawValue)
                  | (CGEventMask(1) << CGEventType.keyUp.rawValue)
@@ -108,8 +201,6 @@ final class HotkeyManager {
         let callback: CGEventTapCallBack = { _, type, event, refcon in
             guard let refcon else { return Unmanaged.passUnretained(event) }
             let manager = Unmanaged<HotkeyManager>.fromOpaque(refcon).takeUnretainedValue()
-            // The tap's run-loop source lives on the main run loop, so this
-            // callback always runs on the main thread.
             return MainActor.assumeIsolated {
                 manager.handleTapEvent(type: type, event: event)
             }
@@ -122,8 +213,8 @@ final class HotkeyManager {
                                           callback: callback,
                                           userInfo: Unmanaged.passUnretained(self).toOpaque())
         else {
-            // Tap creation failed (permission edge). Dictation can still be
-            // finished by clicking the pill; keys just aren't captured.
+            // Tap creation failed (permission edge). Hands-free dictation can
+            // still be finished by clicking the pill.
             return
         }
 
@@ -132,13 +223,9 @@ final class HotkeyManager {
         eventTapSource = source
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
-        isCapturing = true
     }
 
-    /// Tear the tap down immediately (pill click, cancel paths, uninstall).
-    /// Safe to call at any time, including mid-drain.
-    func endCaptureMode() {
-        isCapturing = false
+    private func teardownEventTap() {
         drainKeyCode = nil
         if let tap = eventTap {
             CGEvent.tapEnable(tap: tap, enable: false)
@@ -158,23 +245,24 @@ final class HotkeyManager {
             return Unmanaged.passUnretained(event)
 
         case .keyDown:
-            guard isCapturing else { return Unmanaged.passUnretained(event) }
+            guard state == .recordingHandsFree else { return Unmanaged.passUnretained(event) }
             let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
-            isCapturing = false
+            state = .idle
             drainKeyCode = keyCode
             if keyCode == Self.escapeKeyCode {
-                onDiscard?()
+                hkLog.info("hands-free cancel (esc)")
+                onCancel?()
             } else {
+                hkLog.info("hands-free finish (key)")
                 onFinish?()
             }
             return nil
 
         case .keyUp:
-            if isCapturing { return nil }
             let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
             if let drain = drainKeyCode, drain == keyCode {
                 drainKeyCode = nil
-                endCaptureMode()
+                teardownEventTap()
                 return nil
             }
             return Unmanaged.passUnretained(event)
