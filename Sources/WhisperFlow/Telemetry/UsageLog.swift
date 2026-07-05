@@ -12,6 +12,11 @@ enum UsageLog {
         let stt_ms: Int
         let cleanup_ms: Int
         let cleanup_backend: String
+        /// Truncated to 200 chars each — kept local-only, same as everything
+        /// else in this file, purely so a bad cleanup can actually be
+        /// diagnosed after the fact instead of guessed at from char counts.
+        let raw_text: String
+        let cleaned_text: String
     }
 
     static var logURL: URL {
@@ -50,12 +55,14 @@ enum UsageLog {
     }
 
     static func append(mode: String, audioSeconds: Double, rawChars: Int, cleanedChars: Int,
-                       sttMs: Int, cleanupMs: Int, cleanupBackend: String) {
+                       sttMs: Int, cleanupMs: Int, cleanupBackend: String,
+                       rawText: String = "", cleanedText: String = "") {
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let entry = Entry(ts: iso.string(from: Date()), mode: mode, audio_seconds: audioSeconds,
                           raw_chars: rawChars, cleaned_chars: cleanedChars,
-                          stt_ms: sttMs, cleanup_ms: cleanupMs, cleanup_backend: cleanupBackend)
+                          stt_ms: sttMs, cleanup_ms: cleanupMs, cleanup_backend: cleanupBackend,
+                          raw_text: String(rawText.prefix(200)), cleaned_text: String(cleanedText.prefix(200)))
         do {
             let dir = logURL.deletingLastPathComponent()
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

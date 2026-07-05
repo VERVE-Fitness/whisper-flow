@@ -242,7 +242,9 @@ final class AppState: ObservableObject {
                                 cleanedChars: result.text.count,
                                 sttMs: sttMs,
                                 cleanupMs: result.durationMs,
-                                cleanupBackend: backendLogName)
+                                cleanupBackend: backendLogName,
+                                rawText: raw,
+                                cleanedText: result.text)
             } catch {
                 phase = .error(error.localizedDescription)
                 if mode != .window {

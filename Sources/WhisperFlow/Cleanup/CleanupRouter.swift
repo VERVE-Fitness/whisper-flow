@@ -52,9 +52,15 @@ struct CleanupRouter: Sendable {
             // Content-retention guard: small local models sometimes delete whole
             // clauses they judge to be noise, not just fillers. If the cleaned text
             // keeps fewer than 60% of the raw's non-filler words, treat it as a
-            // content change and use the raw transcript instead.
+            // content change and use the raw transcript instead. Short utterances
+            // (few content words) get a much stricter bar — with only 1-3 words to
+            // begin with, losing even one is a bigger deal, and this is exactly
+            // where a small model is cheapest to hallucinate a one-word "answer"
+            // like turning "What's next?" into "Absolutely."
+            let contentWordCount = Self.contentWordCount(raw)
+            let retentionThreshold = contentWordCount <= 4 ? 0.99 : 0.6
             let retention = Self.contentWordRetention(raw: raw, cleaned: trimmed)
-            if retention < 0.6 {
+            if retention < retentionThreshold {
                 FileHandle.standardError.write(Data("[cleanup] \(backend.name) kept only \(Int(retention * 100))% of content words; using raw\n".utf8))
                 return CleanupResult(text: raw, backendName: backend.name, fellBackToRaw: true, durationMs: elapsedMs())
             }
@@ -77,16 +83,30 @@ struct CleanupRouter: Sendable {
     /// answered questions (similar length, different words) — checking which
     /// words survived catches deletions AND rewrites: a faithful cleanup keeps
     /// nearly all original words, an answer or paraphrase keeps very few.
+    private static let fillerWords: Set<String> = ["um", "uh", "uhm", "erm", "er", "ah", "hmm", "mmm", "like", "you", "know", "so"]
+
+    private static func words(_ s: String) -> [String] {
+        s.lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+    }
+
+    /// Count of distinct non-filler words in the raw transcript — used to
+    /// decide how strict the retention bar should be (short utterances get a
+    /// much stricter one; see contentWordRetention's caller).
+    static func contentWordCount(_ raw: String) -> Int {
+        Set(words(raw)).subtracting(fillerWords).count
+    }
+
     static func contentWordRetention(raw: String, cleaned: String) -> Double {
-        let fillers: Set<String> = ["um", "uh", "uhm", "erm", "er", "ah", "hmm", "mmm", "like", "you", "know", "so"]
-        func words(_ s: String) -> [String] {
-            s.lowercased()
-                .components(separatedBy: CharacterSet.alphanumerics.inverted)
-                .filter { !$0.isEmpty }
-        }
-        let rawContent = Set(words(raw)).subtracting(fillers)
-        guard !rawContent.isEmpty else { return 1.0 }
+        let rawContent = Set(words(raw)).subtracting(fillerWords)
         let cleanedSet = Set(words(cleaned))
+        guard !rawContent.isEmpty else {
+            // Raw was pure filler/trivial. Only bypass the guard if the
+            // cleaned output is equally trivial (near-empty) — anything
+            // substantial here is unearned content, not a legitimate cleanup.
+            return cleanedSet.count <= 1 ? 1.0 : 0.0
+        }
         let kept = rawContent.intersection(cleanedSet).count
         return Double(kept) / Double(rawContent.count)
     }
@@ -97,13 +117,8 @@ struct CleanupRouter: Sendable {
     /// own framing ("Here is…", list numbers, new content). Small dictations
     /// get an absolute allowance of 2 new words so corrections never trip it.
     static func addsTooManyNewWords(raw: String, cleaned: String) -> Bool {
-        func words(_ s: String) -> Set<String> {
-            Set(s.lowercased()
-                .components(separatedBy: CharacterSet.alphanumerics.inverted)
-                .filter { !$0.isEmpty })
-        }
-        let rawSet = words(raw)
-        let cleanedSet = words(cleaned)
+        let rawSet = Set(words(raw))
+        let cleanedSet = Set(words(cleaned))
         guard !cleanedSet.isEmpty else { return false }
         let added = cleanedSet.subtracting(rawSet).count
         return Double(added) > max(2.0, 0.25 * Double(cleanedSet.count))

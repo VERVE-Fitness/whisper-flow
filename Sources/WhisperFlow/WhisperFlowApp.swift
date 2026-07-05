@@ -94,12 +94,14 @@ private func runCLITranscription(path: String, rawOnly: Bool) -> Int32 {
             var cleanupMs = 0
             var backendName = "raw-only"
             var cleanedChars = raw.count
+            var cleanedText = raw
             if !rawOnly {
                 let router = CleanupRouter()
                 let result = await router.clean(raw)
                 cleanupMs = result.durationMs
                 backendName = result.backendName + (result.fellBackToRaw ? " (fallback-to-raw)" : "")
                 cleanedChars = result.text.count
+                cleanedText = result.text
                 print("CLEANED (\(backendName)): \(result.text)")
             }
             print("TIMING: stt=\(sttMs) cleanup=\(cleanupMs)")
@@ -110,7 +112,9 @@ private func runCLITranscription(path: String, rawOnly: Bool) -> Int32 {
                             cleanedChars: cleanedChars,
                             sttMs: sttMs,
                             cleanupMs: cleanupMs,
-                            cleanupBackend: backendName)
+                            cleanupBackend: backendName,
+                            rawText: raw,
+                            cleanedText: cleanedText)
         } catch {
             FileHandle.standardError.write(Data("error: \(error.localizedDescription)\n".utf8))
             exitCode = 1
