@@ -25,7 +25,10 @@ mkdir -p "$APP_DIR/Contents/MacOS"
 cp "$BIN" "$APP_DIR/Contents/MacOS/WhisperFlow"
 cp "$REPO_DIR/Resources/Info.plist" "$APP_DIR/Contents/Info.plist"
 
-echo "==> Codesigning (ad-hoc)…"
-codesign --force --sign - "$APP_DIR"
+echo "==> Codesigning…"
+# Stable identity keeps TCC (Accessibility/Microphone) grants valid across
+# rebuilds. Falls back to ad-hoc when the cert isn't present (other machines).
+CODESIGN_ID="${CODESIGN_ID:-A289D6D61201940E4DA8BC484D7B2935A23558B4}"
+codesign --force --sign "$CODESIGN_ID" "$APP_DIR" || codesign --force --sign - "$APP_DIR"
 
 echo "==> Done: $APP_DIR"

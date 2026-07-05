@@ -1,6 +1,9 @@
 import Foundation
 import AppKit
 import Carbon.HIToolbox
+import os
+
+private let hkLog = Logger(subsystem: "com.niallwogan.whisperflow", category: "hotkeys")
 
 /// Owns the global dictation hotkey scheme:
 ///
@@ -57,6 +60,7 @@ final class HotkeyManager {
             handler(event)
             return event
         }
+        hkLog.info("flags monitors installed (global: \(self.globalFlagsMonitor != nil))")
     }
 
     func uninstall() {
@@ -80,7 +84,9 @@ final class HotkeyManager {
 
         let flags = event.modifierFlags
         let rightOptionDown = (flags.rawValue & Self.rightOptionDeviceMask) != 0
+        hkLog.info("flagsChanged keyCode=\(event.keyCode) rawFlags=0x\(String(flags.rawValue, radix: 16)) rightOpt=\(rightOptionDown) cmd=\(flags.contains(.command))")
         guard rightOptionDown, flags.contains(.command), flags.contains(.option) else { return }
+        hkLog.info("activation combo detected")
         onActivate?()
     }
 

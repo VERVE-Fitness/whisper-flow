@@ -3,6 +3,7 @@ import SwiftUI
 import AppKit
 import Combine
 import ServiceManagement
+import os
 
 @MainActor
 final class AppState: ObservableObject {
@@ -80,8 +81,10 @@ final class AppState: ObservableObject {
         // true already at launch or the user grants it later from the menu
         // (no relaunch required).
         accessibilityCancellable = accessibility.$isTrusted
-            .filter { $0 }
-            .sink { [weak self] _ in self?.installHotkeys() }
+            .sink { [weak self] trusted in
+                os_log("accessibility trusted: %{public}@", String(trusted))
+                if trusted { self?.installHotkeys() }
+            }
 
         accessibility.checkAndPromptIfNeeded()
 
