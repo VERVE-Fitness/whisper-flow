@@ -2,7 +2,7 @@
 import PackageDescription
 
 let package = Package(
-    name: "Murmur",
+    name: "WhisperFlow",
     platforms: [
         .macOS(.v15)
     ],
@@ -11,11 +11,11 @@ let package = Package(
     ],
     targets: [
         .executableTarget(
-            name: "Murmur",
+            name: "WhisperFlow",
             dependencies: [
                 .product(name: "FluidAudio", package: "FluidAudio")
             ],
-            path: "Sources/Murmur",
+            path: "Sources/WhisperFlow",
             swiftSettings: [
                 .swiftLanguageMode(.v5)
             ]

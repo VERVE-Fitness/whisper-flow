@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import AppKit
+import Combine
 
 @MainActor
 final class AppState: ObservableObject {
@@ -24,6 +25,15 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// How the current/last dictation was triggered. Window dictations show
+    /// text in the transcript window (M1 behaviour); ptt/toggle dictations
+    /// insert at the cursor and show the floating pill instead.
+    enum DictationMode: String {
+        case pushToTalk = "ptt"
+        case toggle = "toggle"
+        case window = "window"
+    }
+
     @Published var phase: Phase = .loadingModels
     @Published var rawTranscript: String = ""
     @Published var cleanedTranscript: String = ""
@@ -31,16 +41,64 @@ final class AppState: ObservableObject {
     @Published var lastSttMs: Int?
     @Published var lastCleanupMs: Int?
 
+    let accessibility = AccessibilityPermission()
+
     private let backend: TranscriptionBackend = ParakeetBackend()
     private let router = CleanupRouter()
     private let capture = AudioCapture()
+    private let hotkeys = HotkeyManager()
+    private let pill = StatusPillController()
+
     private var feedTask: Task<Void, Never>?
     private var recordStart: Date?
+    private var currentMode: DictationMode = .window
+    private var accessibilityCancellable: AnyCancellable?
 
     var isRecording: Bool { phase == .recording }
     var canRecord: Bool { phase == .idle || phase == .done }
 
+    private var didLaunch = false
+
+    /// Idempotent: the menu bar content and the (optional) transcript window
+    /// both call this on appear, but only the first call should do anything.
     func onLaunch() {
+        guard !didLaunch else { return }
+        didLaunch = true
+
+        UsageLog.migrateLegacyLogIfNeeded()
+
+        // Install hotkeys as soon as Accessibility is trusted, whether that's
+        // true already at launch or the user grants it later from the menu
+        // (no relaunch required).
+        accessibilityCancellable = accessibility.$isTrusted
+            .filter { $0 }
+            .sink { [weak self] _ in self?.installHotkeys() }
+
+        accessibility.checkAndPromptIfNeeded()
+
+        pill.onTapStop = { [weak self] in
+            guard let self, self.currentMode != .window else { return }
+            self.stopRecording()
+        }
+
+        hotkeys.onPushToTalkStart = { [weak self] in
+            guard let self, self.accessibility.isTrusted else { return }
+            self.beginDictation(mode: .pushToTalk)
+        }
+        hotkeys.onPushToTalkStop = { [weak self] in
+            guard let self else { return }
+            guard self.isRecording, self.currentMode == .pushToTalk else { return }
+            self.stopRecording()
+        }
+        hotkeys.onToggle = { [weak self] in
+            guard let self, self.accessibility.isTrusted else { return }
+            if self.isRecording, self.currentMode == .toggle {
+                self.stopRecording()
+            } else if self.canRecord {
+                self.beginDictation(mode: .toggle)
+            }
+        }
+
         Task {
             // Resolve cleanup backend for the status line.
             let cleanup = await router.resolveBackend()
@@ -54,23 +112,44 @@ final class AppState: ObservableObject {
         }
     }
 
-    func toggleRecording() {
-        if isRecording { stopRecording() } else { startRecording() }
+    private func installHotkeys() {
+        hotkeys.install()
     }
 
-    private func startRecording() {
+    // MARK: - Window button entry point (M1 behaviour: unchanged)
+
+    func toggleRecording() {
+        if isRecording {
+            stopRecording()
+        } else {
+            beginDictation(mode: .window)
+        }
+    }
+
+    // MARK: - Shared start/stop path
+
+    private func beginDictation(mode: DictationMode) {
         guard canRecord else { return }
+        currentMode = mode
         rawTranscript = ""
         cleanedTranscript = ""
         lastSttMs = nil
         lastCleanupMs = nil
         recordStart = Date()
 
+        if mode != .window {
+            pill.show(.listening(partial: ""))
+        }
+
         Task {
             do {
                 try await backend.startStream { [weak self] partial in
                     Task { @MainActor in
-                        self?.rawTranscript = partial.displayText
+                        guard let self else { return }
+                        self.rawTranscript = partial.displayText
+                        if self.currentMode != .window {
+                            self.pill.update(.listening(partial: partial.displayText))
+                        }
                     }
                 }
                 let stream = try capture.start()
@@ -82,6 +161,7 @@ final class AppState: ObservableObject {
                 }
             } catch {
                 phase = .error(error.localizedDescription)
+                if mode != .window { pill.hide() }
             }
         }
     }
@@ -89,9 +169,14 @@ final class AppState: ObservableObject {
     private func stopRecording() {
         guard isRecording else { return }
         phase = .cleaning
+        let mode = currentMode
         let sttStart = recordStart ?? Date()
         let audioSeconds = capture.capturedSeconds
         capture.stop()
+
+        if mode != .window {
+            pill.update(.cleaning)
+        }
 
         Task {
             await feedTask?.value
@@ -111,15 +196,28 @@ final class AppState: ObservableObject {
                 lastCleanupMs = result.durationMs
                 phase = .done
 
-                UsageLog.append(mode: "mic",
+                let backendLogName = result.backendName + (result.fellBackToRaw ? " (fallback-to-raw)" : "")
+
+                if mode != .window {
+                    let outcome = TextInserter.insert(result.text, accessibilityTrusted: accessibility.isTrusted)
+                    switch outcome {
+                    case .inserted:
+                        pill.show(.inserted)
+                    case .copiedOnly:
+                        pill.show(.copiedOnly)
+                    }
+                }
+
+                UsageLog.append(mode: mode.rawValue,
                                 audioSeconds: audioSeconds,
                                 rawChars: raw.count,
                                 cleanedChars: result.text.count,
                                 sttMs: sttMs,
                                 cleanupMs: result.durationMs,
-                                cleanupBackend: result.backendName + (result.fellBackToRaw ? " (fallback-to-raw)" : ""))
+                                cleanupBackend: backendLogName)
             } catch {
                 phase = .error(error.localizedDescription)
+                if mode != .window { pill.hide() }
             }
         }
     }

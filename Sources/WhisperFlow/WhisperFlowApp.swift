@@ -2,7 +2,7 @@ import Foundation
 import SwiftUI
 
 @main
-enum MurmurMain {
+enum WhisperFlowMain {
     static func main() {
         let args = CommandLine.arguments
         if let idx = args.firstIndex(of: "--transcribe-file") {
@@ -15,19 +15,59 @@ enum MurmurMain {
             let exitCode = runCLITranscription(path: path, rawOnly: rawOnly)
             exit(exitCode)
         }
-        MurmurApp.main()
+        WhisperFlowApp.main()
     }
 }
 
-struct MurmurApp: App {
+/// Drives launch-time setup. An accessory (LSUIElement) app has no window to
+/// hang `.onAppear` off reliably, so `applicationDidFinishLaunching` is the
+/// dependable hook for `AppState.onLaunch()`.
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    var state: AppState?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        state?.onLaunch()
+    }
+}
+
+struct WhisperFlowApp: App {
     @StateObject private var state = AppState()
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    @Environment(\.openWindow) private var openWindow
+
+    static let transcriptWindowID = "transcript"
 
     var body: some Scene {
-        WindowGroup("Murmur") {
+        // `body` is evaluated while SwiftUI builds the scene graph, which
+        // happens before AppKit fires applicationDidFinishLaunching — so the
+        // delegate is guaranteed to have its state reference by the time
+        // that callback runs. (`let _ =` keeps this a plain statement rather
+        // than a SceneBuilder expression, since bindDelegate() returns Void.)
+        let _ = bindDelegate()
+
+        // Menu-bar accessory: this is the only UI that appears at launch.
+        // LSUIElement (Info.plist) keeps us out of the Dock; no window opens
+        // automatically.
+        MenuBarExtra {
+            MenuBarContent(accessibility: state.accessibility) {
+                openWindow(id: Self.transcriptWindowID)
+            }
+            .environmentObject(state)
+        } label: {
+            Image(systemName: "mic.circle")
+        }
+        .menuBarExtraStyle(.menu)
+
+        // Transcript window: hidden at launch, opened only via the menu.
+        Window("Whisper Flow", id: Self.transcriptWindowID) {
             MainView()
                 .environmentObject(state)
         }
         .windowResizability(.contentSize)
+    }
+
+    private func bindDelegate() {
+        appDelegate.state = state
     }
 }
 

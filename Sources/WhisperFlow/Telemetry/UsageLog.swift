@@ -1,11 +1,11 @@
 import Foundation
 
 /// Append-only JSONL usage log at
-/// ~/Library/Application Support/Murmur/usage.jsonl
+/// ~/Library/Application Support/WhisperFlow/usage.jsonl
 enum UsageLog {
     struct Entry: Codable {
         let ts: String
-        let mode: String            // "mic" | "file"
+        let mode: String            // "ptt" | "toggle" | "window" | "file"
         let audio_seconds: Double
         let raw_chars: Int
         let cleaned_chars: Int
@@ -16,8 +16,37 @@ enum UsageLog {
 
     static var logURL: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("WhisperFlow", isDirectory: true)
+            .appendingPathComponent("usage.jsonl")
+    }
+
+    /// Old Murmur-era log location. If it exists and the new one doesn't yet,
+    /// its contents are migrated on first launch.
+    private static var legacyLogURL: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Murmur", isDirectory: true)
             .appendingPathComponent("usage.jsonl")
+    }
+
+    /// One-time migration: move the old Murmur usage.jsonl contents into the
+    /// new WhisperFlow location. Safe to call every launch (no-ops after the
+    /// first successful migration since the legacy file is removed).
+    static func migrateLegacyLogIfNeeded() {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: legacyLogURL.path) else { return }
+        guard !fm.fileExists(atPath: logURL.path) else {
+            // New log already exists; just drop the legacy file so we don't
+            // keep re-checking every launch.
+            try? fm.removeItem(at: legacyLogURL)
+            return
+        }
+        do {
+            let dir = logURL.deletingLastPathComponent()
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            try fm.moveItem(at: legacyLogURL, to: logURL)
+        } catch {
+            FileHandle.standardError.write(Data("[usage-log] legacy migration failed: \(error)\n".utf8))
+        }
     }
 
     static func append(mode: String, audioSeconds: Double, rawChars: Int, cleanedChars: Int,
