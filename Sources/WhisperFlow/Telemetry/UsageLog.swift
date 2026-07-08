@@ -17,6 +17,14 @@ enum UsageLog {
         /// diagnosed after the fact instead of guessed at from char counts.
         let raw_text: String
         let cleaned_text: String
+        /// Optional fields for the silence/short-clip/low-confidence guards.
+        /// Swift's synthesized `Encodable` conformance calls
+        /// `encodeIfPresent` for `Optional` stored properties, so these are
+        /// simply omitted from the JSON line (not written as `null`) when nil
+        /// — kept out of every existing log line until a guard fires.
+        let stt_confidence: Double?
+        let rms: Double?
+        let outcome: String
     }
 
     static var logURL: URL {
@@ -56,13 +64,16 @@ enum UsageLog {
 
     static func append(mode: String, audioSeconds: Double, rawChars: Int, cleanedChars: Int,
                        sttMs: Int, cleanupMs: Int, cleanupBackend: String,
-                       rawText: String = "", cleanedText: String = "") {
+                       rawText: String = "", cleanedText: String = "",
+                       sttConfidence: Double? = nil, rms: Double? = nil,
+                       outcome: String = "inserted") {
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let entry = Entry(ts: iso.string(from: Date()), mode: mode, audio_seconds: audioSeconds,
                           raw_chars: rawChars, cleaned_chars: cleanedChars,
                           stt_ms: sttMs, cleanup_ms: cleanupMs, cleanup_backend: cleanupBackend,
-                          raw_text: String(rawText.prefix(200)), cleaned_text: String(cleanedText.prefix(200)))
+                          raw_text: String(rawText.prefix(200)), cleaned_text: String(cleanedText.prefix(200)),
+                          stt_confidence: sttConfidence, rms: rms, outcome: outcome)
         do {
             let dir = logURL.deletingLastPathComponent()
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

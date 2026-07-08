@@ -6,5 +6,5 @@ struct PassthroughCleanup: CleanupBackend {
 
     func isAvailable() async -> Bool { true }
 
-    func clean(_ raw: String) async throws -> String { raw }
+    func clean(_ raw: String, dictionary: [String], context: String?) async throws -> String { raw }
 }

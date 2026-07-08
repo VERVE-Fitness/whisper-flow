@@ -23,18 +23,19 @@ struct OllamaCleanup: CleanupBackend {
         }
     }
 
-    func clean(_ raw: String) async throws -> String {
+    func clean(_ raw: String, dictionary: [String] = [], context: String? = nil) async throws -> String {
         var req = URLRequest(url: baseURL.appendingPathComponent("api/chat"))
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.timeoutInterval = requestTimeout
 
-        var messages: [[String: Any]] = [["role": "system", "content": cleanupSystemPrompt]]
+        let systemPrompt = cleanupSystemPrompt + dictionaryPromptAddendum(dictionary)
+        var messages: [[String: Any]] = [["role": "system", "content": systemPrompt]]
         for shot in cleanupFewShot {
             messages.append(["role": "user", "content": shot.user])
             messages.append(["role": "assistant", "content": shot.assistant])
         }
-        messages.append(["role": "user", "content": wrapTranscript(raw)])
+        messages.append(["role": "user", "content": wrapTranscript(raw, context: context)])
 
         let body: [String: Any] = [
             "model": model,

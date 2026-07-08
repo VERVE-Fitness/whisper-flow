@@ -18,7 +18,7 @@ struct FoundationModelsCleanup: CleanupBackend {
         return false
     }
 
-    func clean(_ raw: String) async throws -> String {
+    func clean(_ raw: String, dictionary: [String] = [], context: String? = nil) async throws -> String {
         #if canImport(FoundationModels)
         if #available(macOS 26.0, *) {
             guard SystemLanguageModel.default.availability == .available else {
@@ -27,8 +27,9 @@ struct FoundationModelsCleanup: CleanupBackend {
             let examples = cleanupFewShot
                 .map { "Input: \($0.user)\nOutput: \($0.assistant)" }
                 .joined(separator: "\n\n")
-            let session = LanguageModelSession(instructions: cleanupSystemPrompt + "\n\nExamples:\n" + examples)
-            let response = try await session.respond(to: wrapTranscript(raw))
+            let systemPrompt = cleanupSystemPrompt + dictionaryPromptAddendum(dictionary)
+            let session = LanguageModelSession(instructions: systemPrompt + "\n\nExamples:\n" + examples)
+            let response = try await session.respond(to: wrapTranscript(raw, context: context))
             let cleaned = response.content
                 .replacingOccurrences(of: "<transcript>", with: "")
                 .replacingOccurrences(of: "</transcript>", with: "")

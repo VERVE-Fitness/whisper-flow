@@ -76,10 +76,21 @@ final class ParakeetBackend: TranscriptionBackend, @unchecked Sendable {
     // MARK: - Batch (CLI)
 
     func transcribeFile(samples: [Float]) async throws -> String {
+        try await transcribeFileWithConfidence(samples: samples).text
+    }
+
+    /// FluidAudio's `ASRResult.confidence` is the average of token-level TDT
+    /// softmax probabilities for the whole utterance: ~0.1 for an empty/
+    /// near-silent transcription up to 1.0 for full confidence (see
+    /// `AsrManager+TokenProcessing.swift: calculateConfidence` in the
+    /// FluidAudio package). Decoding the complete retained buffer here (vs.
+    /// the sliding-window streaming path) gives a real per-clip score to gate
+    /// short/clipped dictations on.
+    func transcribeFileWithConfidence(samples: [Float]) async throws -> (text: String, confidence: Float) {
         guard let manager = batchManager else { throw TranscriptionError.notPrepared }
         var decoderState = TdtDecoderState.make(decoderLayers: await manager.decoderLayerCount)
         let result = try await manager.transcribe(samples, decoderState: &decoderState)
-        return result.text
+        return (result.text, result.confidence)
     }
 
     // MARK: - Helpers

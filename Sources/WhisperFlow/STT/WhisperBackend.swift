@@ -27,4 +27,8 @@ final class WhisperBackend: TranscriptionBackend {
     func transcribeFile(samples: [Float]) async throws -> String {
         throw TranscriptionError.notImplemented(name)
     }
+
+    func transcribeFileWithConfidence(samples: [Float]) async throws -> (text: String, confidence: Float) {
+        throw TranscriptionError.notImplemented(name)
+    }
 }

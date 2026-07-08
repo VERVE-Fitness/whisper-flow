@@ -54,4 +54,11 @@ protocol TranscriptionBackend: AnyObject {
 
     /// Batch-transcribe a complete buffer of 16 kHz mono Float32 samples.
     func transcribeFile(samples: [Float]) async throws -> String
+
+    /// Batch-transcribe a complete buffer, also returning the backend's own
+    /// per-utterance confidence score so callers can gate on it (used to
+    /// re-check short/clipped streaming dictations against the more accurate
+    /// full-clip batch path). Confidence scale is backend-defined; FluidAudio's
+    /// Parakeet ranges ~0.1 (empty/near-silent) to 1.0 (fully confident).
+    func transcribeFileWithConfidence(samples: [Float]) async throws -> (text: String, confidence: Float)
 }

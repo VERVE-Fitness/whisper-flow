@@ -28,6 +28,11 @@ struct MenuBarContent: View {
             set: { state.setLaunchAtLogin($0) }
         ))
 
+        Toggle("Auto-learn corrections", isOn: Binding(
+            get: { CorrectionLearner.isEnabled },
+            set: { UserDefaults.standard.set($0, forKey: CorrectionLearner.enabledDefaultsKey) }
+        ))
+
         Divider()
 
         if accessibility.isTrusted {

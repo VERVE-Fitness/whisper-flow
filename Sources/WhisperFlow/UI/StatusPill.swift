@@ -8,10 +8,14 @@ enum PillState: Equatable {
     case cleaning
     case inserted
     case copiedOnly
+    /// Nothing was typed: the clip was near-silent, too short, or the
+    /// decoder's own confidence on the re-checked batch pass was too low to
+    /// trust (see AppState.stopRecording's silence/confidence gates).
+    case discarded
 
     var isTerminal: Bool {
         switch self {
-        case .inserted, .copiedOnly: return true
+        case .inserted, .copiedOnly, .discarded: return true
         default: return false
         }
     }
@@ -44,6 +48,10 @@ private struct PillContentView: View {
                 Image(systemName: "doc.on.clipboard")
                     .foregroundStyle(.secondary)
                 Text("Copied — paste with ⌘V")
+            case .discarded:
+                Image(systemName: "questionmark.circle")
+                    .foregroundStyle(.secondary)
+                Text("Didn't catch that")
             }
         }
         .font(.system(size: 12, weight: .medium))
