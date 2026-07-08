@@ -60,6 +60,19 @@ final class HotkeyManager {
 
     private var downAt: Date?
     private var debounceWorkItem: DispatchWorkItem?
+    /// The global and local flagsChanged monitors are meant to be mutually
+    /// exclusive (global fires when another app is frontmost, local when we
+    /// are), but AppKit can hand the SAME physical key event to both -- each
+    /// delivery independently reads the state machine as "recording" and
+    /// calls onFinish, producing two full stop-clean-insert cycles for one
+    /// key release (observed 2026-07-08: "which type of site..." typed
+    /// twice, both log entries carrying identical audio_seconds/rms -- same
+    /// captured buffer, processed twice). NSEvent.timestamp reflects the
+    /// underlying hardware event, so a duplicate delivery of the same
+    /// physical event carries the identical timestamp even though the two
+    /// monitors invoke us at slightly different wall-clock moments -- unlike
+    /// a real second key press, which always gets a new timestamp.
+    private var lastHandledFlagsTimestamp: TimeInterval?
 
     private var eventTap: CFMachPort?
     private var eventTapSource: CFRunLoopSource?
@@ -107,6 +120,12 @@ final class HotkeyManager {
     // MARK: - flagsChanged: Right Option down/up, ⌘ down
 
     private func handleFlagsChanged(_ event: NSEvent) {
+        // Drop a redundant delivery of the identical physical event (see
+        // lastHandledFlagsTimestamp's doc comment) before it reaches any
+        // state-machine logic.
+        guard event.timestamp != lastHandledFlagsTimestamp else { return }
+        lastHandledFlagsTimestamp = event.timestamp
+
         let flags = event.modifierFlags
         let rightOptionPhysicallyDown = (flags.rawValue & Self.rightOptionDeviceMask) != 0
         let cmdDown = flags.contains(.command)
