@@ -64,6 +64,18 @@ final class AppState: ObservableObject {
     /// own pill/window may have shifted focus, so capturing later would read
     /// the wrong element.
     private var capturedFocusContext: String?
+    /// Defense-in-depth against stopRecording() being entered twice for one
+    /// dictation: the actual observed cause was duplicate flagsChanged
+    /// delivery (see HotkeyManager.lastHandledFlagsTimestamp), now deduped at
+    /// the source, but this guard doesn't depend on that diagnosis being
+    /// complete -- it makes the stop path itself non-reentrant regardless of
+    /// what triggers a second call (a second monitor, a race between the
+    /// pill's tap-to-stop and the hotkey release, a future regression).
+    /// `phase = .cleaning` alone isn't sufficient: it's read-then-written
+    /// synchronously, but if two calls somehow interleave before either
+    /// write lands, both can pass. This flag is set unconditionally as the
+    /// very first statement, before any other work, closing that window.
+    private var isStopping = false
 
     var isRecording: Bool { phase == .recording }
     var canRecord: Bool { phase == .idle || phase == .done }
@@ -254,7 +266,16 @@ final class AppState: ObservableObject {
     }
 
     private func stopRecording() {
+        // isStopping is set here, unconditionally, before isRecording is even
+        // read -- if two calls somehow land back to back (see isStopping's
+        // doc comment), the second sees isStopping already true and bails,
+        // regardless of what phase happens to read as at that instant.
+        guard !isStopping else {
+            FileHandle.standardError.write(Data("[stop] stopRecording re-entered while already stopping; ignoring\n".utf8))
+            return
+        }
         guard isRecording else { return }
+        isStopping = true
         phase = .cleaning
         let mode = currentMode
         let sttStart = recordStart ?? Date()
@@ -266,6 +287,7 @@ final class AppState: ObservableObject {
         }
 
         Task {
+            defer { isStopping = false }
             let captured = await feedTask?.value ?? []
             feedTask = nil
             do {

@@ -123,7 +123,16 @@ final class HotkeyManager {
         // Drop a redundant delivery of the identical physical event (see
         // lastHandledFlagsTimestamp's doc comment) before it reaches any
         // state-machine logic.
-        guard event.timestamp != lastHandledFlagsTimestamp else { return }
+        guard event.timestamp != lastHandledFlagsTimestamp else {
+            // Logged deliberately: this is the only direct evidence that the
+            // diagnosed duplicate-delivery mechanism is what's actually
+            // happening. If duplicate dictation recurs WITHOUT this line
+            // appearing in Console.app (search "hotkeys" / "duplicate
+            // flagsChanged"), the cause is something else and this fix
+            // didn't address it.
+            hkLog.info("suppressed duplicate flagsChanged delivery (same hardware timestamp)")
+            return
+        }
         lastHandledFlagsTimestamp = event.timestamp
 
         let flags = event.modifierFlags
