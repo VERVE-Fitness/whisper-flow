@@ -389,14 +389,22 @@ final class AppState: ObservableObject {
 
                 let backendLogName = cleanResult.backendName + (cleanResult.fellBackToRaw ? " (fallback-to-raw)" : "")
 
+                // Tracked explicitly rather than left at UsageLog's "inserted"
+                // default -- window-mode dictations never attempt insertion at
+                // all, and copiedOnly (accessibility not trusted) is a
+                // meaningfully different outcome from a real insert; both used
+                // to be silently mislabeled "inserted" in the log.
+                var loggedOutcome = "window"
                 if mode != .window {
                     let outcome = TextInserter.insert(cleanedText, accessibilityTrusted: accessibility.isTrusted)
                     switch outcome {
                     case .inserted:
                         pill.show(.inserted)
                         CorrectionLearner.observe(insertedText: cleanedText)
+                        loggedOutcome = "inserted"
                     case .copiedOnly:
                         pill.show(.copiedOnly)
+                        loggedOutcome = "copied_only"
                     }
                 }
 
@@ -410,7 +418,8 @@ final class AppState: ObservableObject {
                                 rawText: raw,
                                 cleanedText: cleanedText,
                                 sttConfidence: sttConfidence,
-                                rms: Double(rms))
+                                rms: Double(rms),
+                                outcome: loggedOutcome)
             } catch {
                 phase = .error(error.localizedDescription)
                 if mode != .window {

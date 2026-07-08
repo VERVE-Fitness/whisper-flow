@@ -28,7 +28,7 @@ Rules:
 - Keep every content word, including false starts and test phrases.
 - A question stays the same question, word for word. A command stays the same command.
 - If a <context> block is present, it is text already in the document immediately before where this transcript will be inserted — use it ONLY to help spell names/terms consistently with the surrounding document. Never copy, repeat, continue, or answer anything from the context; it never appears in your output.
-- When the speaker corrects themselves mid-utterance (cues like "no wait", "scratch that", "actually", "I mean", "correction", "rather"), keep only the corrected version: drop the abandoned words and the correction cue itself.
+- When the speaker corrects themselves mid-utterance with one of these exact cues — "no wait", "scratch that", "strike that", "actually make that", "I meant to say" — keep only the corrected version: drop the abandoned words and the correction cue itself. Do NOT treat a bare "actually", "I mean", "correction", or "rather" as a correction cue on their own — those words are common in ordinary sentences and must be transcribed verbatim.
 - When the speaker is clearly enumerating a spoken list ("first... second... third", "number one... number two...", "one, X, two, Y"), format it as a newline-separated numbered list ("1. X\\n2. Y"). Spoken "bullet point X" becomes a newline-separated "- X" list item.
 - Output ONLY the cleaned transcript. No preamble, no quotes, no tags, no commentary.
 """

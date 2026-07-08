@@ -114,11 +114,22 @@ private struct DictionaryEditor: View {
                 ForEach(words, id: \.self) { word in
                     HStack {
                         Text(word)
-                        Spacer()
-                        Button(role: .destructive) { remove(word) } label: {
-                            Image(systemName: "trash")
+                        if isBuiltin(word) {
+                            Text("built-in").font(.caption2).foregroundStyle(.secondary)
                         }
-                        .buttonStyle(.borderless)
+                        Spacer()
+                        // Built-ins are compiled into the app, not stored in
+                        // lexicon.json -- removeDictionaryWord only edits the
+                        // stored file, so a trash click on one of these would
+                        // silently no-op (it reappears immediately on the
+                        // next merge). Hiding the button instead of shipping
+                        // a button that visibly does nothing.
+                        if !isBuiltin(word) {
+                            Button(role: .destructive) { remove(word) } label: {
+                                Image(systemName: "trash")
+                            }
+                            .buttonStyle(.borderless)
+                        }
                     }
                 }
             }
@@ -136,6 +147,10 @@ private struct DictionaryEditor: View {
     private func remove(_ word: String) {
         UserLexicon.shared.removeDictionaryWord(word)
         words = UserLexicon.shared.dictionary.sorted()
+    }
+
+    private func isBuiltin(_ word: String) -> Bool {
+        BuiltinLexicon.dictionary.contains { $0.caseInsensitiveCompare(word) == .orderedSame }
     }
 }
 
