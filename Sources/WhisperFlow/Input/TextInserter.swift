@@ -24,7 +24,8 @@ enum TextInserter {
             return .copiedOnly
         }
 
-        let toInsert = withLeadingSpaceIfNeeded(text)
+        let currentApp = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        let toInsert = withLeadingSpaceIfNeeded(text, currentApp: currentApp)
 
         let pasteboard = NSPasteboard.general
         let previous = pasteboard.string(forType: .string)
@@ -46,6 +47,7 @@ enum TextInserter {
             }
         }
 
+        lastInsertion = (currentApp, Date())
         return .inserted
     }
 
@@ -71,6 +73,18 @@ enum TextInserter {
         keyUp.post(tap: .cghidEventTap)
     }
 
+    /// Timestamp and target app of our own last successful insertion, used by
+    /// `withLeadingSpaceIfNeeded`'s fallback when Accessibility can't answer
+    /// directly (see that function's doc comment).
+    private static var lastInsertion: (appBundleID: String?, at: Date)?
+
+    /// How long after our own last insertion a follow-on dictation into the
+    /// same app is still treated as "probably right after it" for the
+    /// fallback heuristic. Long enough to cover a natural pause between two
+    /// push-to-talk sentences, short enough that switching away and back
+    /// later doesn't wrongly glue unrelated text.
+    private static let continuationWindow: TimeInterval = 20
+
     /// Prepends a space when it looks like this insertion is landing right
     /// after existing text with nothing separating them. Each dictation is
     /// cleaned and pasted independently — `TextNormalizer` fixes spacing
@@ -79,23 +93,41 @@ enum TextInserter {
     /// press again) each paste a complete, period-terminated block, and
     /// without this check they land glued together with zero space between
     /// them: "First sentence.Second sentence."
-    ///
-    /// Best-effort: if the frontmost app doesn't expose caret position via
-    /// Accessibility (some Electron/web views don't), this silently no-ops
-    /// and behaviour is unchanged from before.
-    static func withLeadingSpaceIfNeeded(_ text: String) -> String {
+    static func withLeadingSpaceIfNeeded(_ text: String, currentApp: String?) -> String {
         guard let first = text.first, !first.isWhitespace else { return text }
         // Punctuation that should never be preceded by a space anyway.
         let noSpaceBefore: Set<Character> = [".", ",", ";", ":", "!", "?", ")", "]", "}", "\u{2019}", "\u{201D}"]
         guard !noSpaceBefore.contains(first) else { return text }
 
-        guard let priorChar = characterBeforeCaret()?.first else { return text }
-        if priorChar.isWhitespace || priorChar.isNewline { return text }
-        // Don't add a space right after an opening bracket/quote.
-        let noSpaceAfter: Set<Character> = ["(", "[", "{", "\u{201C}", "\u{2018}", "'", "\""]
-        if noSpaceAfter.contains(priorChar) { return text }
+        // The reliable path: Accessibility gave us the actual character.
+        // Trust it completely, in either direction.
+        if let priorChar = characterBeforeCaret()?.first {
+            if priorChar.isWhitespace || priorChar.isNewline { return text }
+            // Don't add a space right after an opening bracket/quote.
+            let noSpaceAfter: Set<Character> = ["(", "[", "{", "\u{201C}", "\u{2018}", "'", "\""]
+            if noSpaceAfter.contains(priorChar) { return text }
+            return " " + text
+        }
 
-        return " " + text
+        // AX gave no answer -- common in web/Electron text fields (Notion,
+        // Slack, browser textareas, many chat/ticket tools), which is most
+        // of what people actually dictate into. Without this fallback,
+        // "can't tell" silently meant "assume no space needed," which is
+        // exactly backwards for the common case this feature exists for:
+        // two push-to-talk sentences in a row. Fall back to our own
+        // insertion history instead — if OUR last insertion landed in this
+        // same frontmost app within the last `continuationWindow` seconds,
+        // assume this is the very next dictation with nothing typed in
+        // between, and add the space. Wrong only if the user manually typed
+        // their own trailing space/newline in that window without switching
+        // apps, which is rare and self-correcting (an extra space is far
+        // less disruptive than words silently glued together).
+        if let last = lastInsertion, last.appBundleID != nil, last.appBundleID == currentApp,
+           Date().timeIntervalSince(last.at) < continuationWindow {
+            return " " + text
+        }
+
+        return text
     }
 
     /// Reads the single character immediately before the text caret in the
