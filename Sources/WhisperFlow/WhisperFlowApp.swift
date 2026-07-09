@@ -15,6 +15,14 @@ enum WhisperFlowMain {
             let exitCode = runCLITranscription(path: path, rawOnly: rawOnly)
             exit(exitCode)
         }
+        if let idx = args.firstIndex(of: "--simulate-streaming") {
+            guard idx + 1 < args.count else {
+                FileHandle.standardError.write(Data("error: --simulate-streaming requires a path argument\n".utf8))
+                exit(2)
+            }
+            let exitCode = runCLIStreamingSimulation(path: args[idx + 1])
+            exit(exitCode)
+        }
         WhisperFlowApp.main()
     }
 }
@@ -117,6 +125,64 @@ private func runCLITranscription(path: String, rawOnly: Bool) -> Int32 {
                             cleanedText: cleanedText)
         } catch {
             FileHandle.standardError.write(Data("error: \(error.localizedDescription)\n".utf8))
+            exitCode = 1
+        }
+        semaphore.signal()
+    }
+
+    semaphore.wait()
+    return exitCode
+}
+
+/// Diagnostic-only: feeds a file through the SAME streaming path a live
+/// push-to-talk dictation uses (startStream/feed/finishStream in
+/// AudioCapture-sized chunks, paced at real-time), instead of the one-shot
+/// batch decode --transcribe-file uses. Exists to reproduce streaming-only
+/// bugs (e.g. long dictations appearing to stop being heard after ~20s)
+/// without needing a live microphone.
+private func runCLIStreamingSimulation(path: String) -> Int32 {
+    let semaphore = DispatchSemaphore(value: 0)
+    var exitCode: Int32 = 0
+
+    Task {
+        do {
+            let samples = try loadAudioFileAs16kMonoFloats(path: path)
+            let audioSeconds = Double(samples.count) / AudioCapture.targetSampleRate
+            print("audio: \(String(format: "%.2f", audioSeconds))s (\(samples.count) samples)")
+
+            let backend = ParakeetBackend()
+            try await backend.prepare()
+
+            var lastLoggedLen = 0
+            try await backend.startStream { partial in
+                // Log only on growth so the trace shows exactly where (if
+                // anywhere) confirmed text stops advancing.
+                if partial.displayText.count != lastLoggedLen {
+                    lastLoggedLen = partial.displayText.count
+                    print("  [partial @ \(Date().timeIntervalSince1970)] len=\(partial.displayText.count) tail=…\(partial.displayText.suffix(60))")
+                }
+            }
+
+            // Same chunk size AudioCapture's real tap uses, paced at
+            // real-time so any wall-clock-dependent chunking logic in the
+            // streaming manager sees the same cadence a live mic would.
+            let chunkSize = 4096
+            var i = 0
+            let chunkSeconds = Double(chunkSize) / AudioCapture.targetSampleRate
+            let feedT0 = Date()
+            while i < samples.count {
+                let end = min(i + chunkSize, samples.count)
+                try await backend.feed(samples: Array(samples[i..<end]))
+                i = end
+                try await Task.sleep(nanoseconds: UInt64(chunkSeconds * 1_000_000_000))
+            }
+            print("fed all chunks in \(String(format: "%.2f", Date().timeIntervalSince(feedT0)))s")
+
+            let final = try await backend.finishStream()
+            print("FINAL STREAMING TRANSCRIPT (\(final.count) chars):")
+            print(final)
+        } catch {
+            FileHandle.standardError.write(Data("error: \(error)\n".utf8))
             exitCode = 1
         }
         semaphore.signal()

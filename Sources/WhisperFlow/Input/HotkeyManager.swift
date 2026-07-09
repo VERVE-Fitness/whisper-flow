@@ -205,7 +205,14 @@ final class HotkeyManager {
             debounceWorkItem = nil
             state = .idle
         case .recordingPTT:
-            hkLog.info("push-to-talk stop (release)")
+            // Hold duration, to distinguish a genuine key release from any
+            // other mechanism that might end up calling handleRightOptionUp
+            // (e.g. a spurious HID up/down cycle on some keyboards). If a
+            // user reports the app "stops listening" after a fixed duration
+            // like ~20s, this line's logged duration is the fact that
+            // confirms or rules out "the key registered as released."
+            let heldFor = downAt.map { Date().timeIntervalSince($0) }
+            hkLog.info("push-to-talk stop (release) after \(heldFor.map { String(format: "%.2f", $0) } ?? "?")s held")
             state = .idle
             onFinish?()
         case .recordingHandsFree:

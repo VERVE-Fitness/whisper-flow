@@ -1,5 +1,8 @@
 import Foundation
 import AVFoundation
+import os
+
+private let captureLog = Logger(subsystem: "com.niallwogan.whisperflow", category: "audio-capture")
 
 enum AudioCaptureError: Error, LocalizedError {
     case converterCreationFailed
@@ -22,6 +25,32 @@ final class AudioCapture {
     private var converter: AVAudioConverter?
     private var continuation: AsyncStream<[Float]>.Continuation?
     private(set) var capturedSeconds: Double = 0
+    /// Diagnostic only (see the tap callback): if the hardware tap ever
+    /// stops delivering buffers mid-recording -- a driver/USB/Bluetooth
+    /// dropout, or macOS throttling a backgrounded app's audio thread -- this
+    /// is the one place that would notice, since everything downstream
+    /// (feedTask, the STT backend) just sees "no more chunks arrived" and has
+    /// no way to distinguish that from a legitimate key release.
+    /// The tap callback runs on AVAudioEngine's real-time audio thread, while
+    /// the stall-check timer reads this from the main thread -- genuinely
+    /// concurrent access, so this needs real synchronization (unlike
+    /// `capturedSeconds`, which the rest of this class gets away without
+    /// locking only because it's read exclusively after `stop()`, once the
+    /// tap thread has already gone quiet).
+    private let lastBufferLock = NSLock()
+    private var _lastBufferAt: Date?
+    private var lastBufferAt: Date? {
+        get { lastBufferLock.lock(); defer { lastBufferLock.unlock() }; return _lastBufferAt }
+        set { lastBufferLock.lock(); defer { lastBufferLock.unlock() }; _lastBufferAt = newValue }
+    }
+    private var stallCheckTimer: Timer?
+    /// How long without a new buffer counts as a stall worth logging. Real
+    /// taps deliver every ~0.25s (4096 samples @ the input device's native
+    /// rate); anything past a couple of seconds of silence from the tap
+    /// itself (not the audio content -- silence still delivers buffers, it's
+    /// buffer DELIVERY that would stop) means the hardware/driver stopped
+    /// feeding us, not that the user paused speaking.
+    private static let stallThreshold: TimeInterval = 2.0
 
     /// Start capturing. Returns a stream of 16 kHz mono Float32 chunks.
     func start() throws -> AsyncStream<[Float]> {
@@ -63,6 +92,7 @@ final class AudioCapture {
                   let channel = out.floatChannelData?[0] else { return }
             let samples = Array(UnsafeBufferPointer(start: channel, count: Int(out.frameLength)))
             self.capturedSeconds += Double(samples.count) / Self.targetSampleRate
+            self.lastBufferAt = Date()
             self.continuation?.yield(samples)
         }
 
@@ -74,6 +104,21 @@ final class AudioCapture {
             self.continuation = nil
             throw AudioCaptureError.engineStartFailed(error.localizedDescription)
         }
+
+        let startedAt = Date()
+        lastBufferAt = startedAt
+        stallCheckTimer?.invalidate()
+        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            let gap = Date().timeIntervalSince(self.lastBufferAt ?? startedAt)
+            if gap > Self.stallThreshold {
+                let recordedFor = Date().timeIntervalSince(startedAt)
+                captureLog.error("mic tap stalled: no buffer for \(String(format: "%.2f", gap))s (recording for \(String(format: "%.2f", recordedFor))s total) -- diagnostic for the '20 second cutoff' report")
+            }
+        }
+        stallCheckTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+
         return stream
     }
 
@@ -83,6 +128,8 @@ final class AudioCapture {
         continuation?.finish()
         continuation = nil
         converter = nil
+        stallCheckTimer?.invalidate()
+        stallCheckTimer = nil
     }
 }
 
