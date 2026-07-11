@@ -21,9 +21,10 @@ fi
 
 echo "==> Assembling $APP_DIR…"
 rm -rf "$APP_DIR"
-mkdir -p "$APP_DIR/Contents/MacOS"
+mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 cp "$BIN" "$APP_DIR/Contents/MacOS/WhisperFlow"
 cp "$REPO_DIR/Resources/Info.plist" "$APP_DIR/Contents/Info.plist"
+cp "$REPO_DIR/Resources/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
 
 # Embed the ollama runtime so WhisperFlow owns its own local-LLM process
 # (EmbeddedOllama.swift) instead of depending on a separately-registered
