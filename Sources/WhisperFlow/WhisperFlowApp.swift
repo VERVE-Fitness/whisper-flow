@@ -34,7 +34,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var state: AppState?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Own the local LLM cleanup backend end-to-end: start it here,
+        // stop it in applicationWillTerminate below, so WhisperFlow never
+        // depends on some separately-registered background service for
+        // dictation cleanup.
+        EmbeddedOllama.start()
         state?.onLaunch()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        EmbeddedOllama.stop()
     }
 }
 

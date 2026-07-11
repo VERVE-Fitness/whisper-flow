@@ -35,11 +35,21 @@ struct CleanupRouter: Sendable {
         let corrections = UserLexicon.shared.corrections
 
         func elapsedMs() -> Int { Int(Date().timeIntervalSince(start) * 1000) }
-        // Deterministic dictionary corrections apply on EVERY path, including
-        // passthrough/raw fallback, so they work even without an LLM.
+        // Deterministic dictionary corrections, self-correction stripping,
+        // and digit formatting all apply on EVERY path, including
+        // passthrough/raw fallback -- unlike the correctionCues-aware guard
+        // relaxation above, none of these three depend on an LLM backend
+        // being reachable at all. This matters in practice: the dictation
+        // that motivated stripStandaloneCorrections ("Maybe I should talk
+        // for five minutes. No scratch that. Say ten minutes.") landed on
+        // Passthrough because Ollama wasn't running, so the LLM-based
+        // correction handling above never ran -- raw text went straight
+        // through, cue and all.
         func finalize(_ text: String, backendName: String, fellBackToRaw: Bool) -> CleanupResult {
             let corrected = Self.applyCorrections(corrections, to: text)
-            return CleanupResult(text: corrected, backendName: backendName, fellBackToRaw: fellBackToRaw, durationMs: elapsedMs())
+            let selfCorrected = Self.stripStandaloneCorrections(corrected)
+            let digitsFormatted = SpokenNumbers.convert(selfCorrected)
+            return CleanupResult(text: digitsFormatted, backendName: backendName, fellBackToRaw: fellBackToRaw, durationMs: elapsedMs())
         }
 
         if backend is PassthroughCleanup {
@@ -140,6 +150,71 @@ struct CleanupRouter: Sendable {
     static func containsCorrectionCue(_ raw: String) -> Bool {
         let lower = raw.lowercased()
         return correctionCues.contains { lower.contains($0) }
+    }
+
+    /// Deterministic, narrower sibling of the LLM-based correction handling
+    /// above: only handles a correction cue that stands as its OWN whole
+    /// sentence ("Talk for five minutes. No, scratch that. Ten minutes." ->
+    /// "Ten minutes."), dropping that sentence and the one immediately
+    /// before it. This is deliberately conservative -- it does NOT attempt
+    /// the harder, genuinely-needs-language-understanding case the LLM path
+    /// exists for ("on tuesday no wait wednesday" -> "on wednesday", a
+    /// mid-sentence word-level swap) -- because a mechanical rule can't
+    /// reliably tell how far back a mid-sentence correction refers, and a
+    /// wrong guess there deletes real content. The whole-sentence pattern
+    /// has only one sane reading, so it's safe to do without a model.
+    static func stripStandaloneCorrections(_ text: String) -> String {
+        let sentences = splitSentences(text)
+        guard sentences.count > 1 else { return text }
+
+        var kept: [String] = []
+        for sentence in sentences {
+            if isStandaloneCorrectionMarker(sentence) {
+                _ = kept.popLast()
+            } else {
+                kept.append(sentence)
+            }
+        }
+        guard kept.count != sentences.count else { return text }
+        return kept.joined(separator: " ")
+    }
+
+    /// Short interjections that commonly precede a correction cue spoken as
+    /// its own sentence ("No, scratch that.", "Okay scratch that.").
+    private static let correctionPrefixes = [
+        "no", "no,", "okay", "okay,", "ok", "ok,", "sorry", "sorry,", "actually", "actually,", "wait", "wait,",
+    ]
+
+    private static func isStandaloneCorrectionMarker(_ sentence: String) -> Bool {
+        var s = sentence.lowercased().trimmingCharacters(in: .whitespaces)
+        while let last = s.last, ".?!".contains(last) { s.removeLast() }
+        s = s.trimmingCharacters(in: .whitespaces)
+
+        for cue in correctionCues {
+            if s == cue { return true }
+            for prefix in correctionPrefixes where s == "\(prefix) \(cue)" {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Splits on '.', '?', '!' while keeping the terminator attached to each
+    /// sentence; a trailing fragment without a terminator is kept as-is.
+    private static func splitSentences(_ text: String) -> [String] {
+        var sentences: [String] = []
+        var current = ""
+        for ch in text {
+            current.append(ch)
+            if ch == "." || ch == "?" || ch == "!" {
+                let trimmed = current.trimmingCharacters(in: .whitespaces)
+                if !trimmed.isEmpty { sentences.append(trimmed) }
+                current = ""
+            }
+        }
+        let remainder = current.trimmingCharacters(in: .whitespaces)
+        if !remainder.isEmpty { sentences.append(remainder) }
+        return sentences
     }
 
     /// Applies the deterministic misheard->corrected map, case-insensitive,

@@ -1,10 +1,13 @@
 import Foundation
 
-/// LLM cleanup via a local Ollama server (fully local, no cloud).
+/// LLM cleanup via a local Ollama server (fully local, no cloud). Talks to
+/// the app-owned instance EmbeddedOllama spawns/kills as part of
+/// WhisperFlow's own lifecycle -- not a separately-registered background
+/// service -- on EmbeddedOllama's dedicated port.
 struct OllamaCleanup: CleanupBackend {
     let name = "ollama"
     let model = "llama3.2:3b"
-    private let baseURL = URL(string: "http://127.0.0.1:11434")!
+    private let baseURL = EmbeddedOllama.baseURL
     private let requestTimeout: TimeInterval = 10
 
     func isAvailable() async -> Bool {
