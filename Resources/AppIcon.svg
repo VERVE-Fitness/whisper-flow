@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- Whisper Flow app icon: speaking head in profile with sound waves.
+       Vector source of record for Resources/AppIcon.icns. Regenerate the
+       .icns with scripts/make-icon.sh after editing this file, never by
+       hand-editing the binary .icns.
+
+       Layout follows Apple's macOS icon template: the rounded-square plate
+       is 824x824 inset in a 1024x1024 canvas (corner radius 185),
+       with the mark inset further so it never crowds the corners at small
+       sizes. The head outline is a closed Catmull-Rom spline through
+       anatomical key points (crown, brow, nose tip, chin, jaw, nape), so
+       the silhouette stays smooth; see scripts/gen-icon.py. -->
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="#ffffff"/>
+
+  <g transform="translate(-29.72, 113.13) scale(3.7882)"
+     fill="none" stroke="#1a1a1a" stroke-width="6.2"
+     stroke-linecap="round" stroke-linejoin="round">
+    <path d="M 100.00 16.00 C 109.00 13.00 124.00 20.33 132.00 26.00 C 140.00 31.67 144.33 42.33 148.00 50.00 C 151.67 57.67 153.83 66.67 154.00 72.00 C 154.17 77.33 148.83 77.83 149.00 82.00 C 149.17 86.17 151.83 91.67 155.00 97.00 C 158.17 102.33 168.17 109.83 168.00 114.00 C 167.83 118.17 157.33 118.83 154.00 122.00 C 150.67 125.17 148.33 129.83 148.00 133.00 C 147.67 136.17 152.33 137.83 152.00 141.00 C 151.67 144.17 145.67 148.50 146.00 152.00 C 146.33 155.50 154.33 158.17 154.00 162.00 C 153.67 165.83 149.00 171.50 144.00 175.00 C 139.00 178.50 131.00 181.33 124.00 183.00 C 117.00 184.67 108.83 185.67 102.00 185.00 C 95.17 184.33 88.33 182.33 83.00 179.00 C 77.67 175.67 73.50 170.67 70.00 165.00 C 66.50 159.33 64.00 152.17 62.00 145.00 C 60.00 137.83 58.50 129.83 58.00 122.00 C 57.50 114.17 57.67 106.33 59.00 98.00 C 60.33 89.67 62.83 81.00 66.00 72.00 C 69.17 63.00 72.33 53.33 78.00 44.00 C 83.67 34.67 91.00 19.00 100.00 16.00 Z"/>
+    <path d="M 179.28 109.75 A 40 40 0 0 1 179.28 168.25"/>
+    <path d="M 191.56 96.58 A 58 58 0 0 1 191.56 181.42"/>
+    <path d="M 203.83 83.42 A 76 76 0 0 1 203.83 194.58"/>
+  </g>
+</svg>
