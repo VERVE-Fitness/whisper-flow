@@ -185,14 +185,50 @@ struct CleanupRouter: Sendable {
         "no", "no,", "okay", "okay,", "ok", "ok,", "sorry", "sorry,", "actually", "actually,", "wait", "wait,",
     ]
 
+    /// Short tags that commonly follow a correction cue spoken as its own
+    /// sentence ("No scratch that, right?", "Scratch that yeah."). STT
+    /// tends to punctuate these as a "?", which is exactly what motivates
+    /// the droppedQuestion fix below -- the tag reads like a question mark
+    /// but isn't a real one. Kept to a small, near-unambiguous set for the
+    /// same reason correctionCues is narrow: a suffix that also shows up in
+    /// ordinary prose would let real content slip through as "just a tag".
+    private static let correctionSuffixes: Set<String> = ["right", "yeah", "okay", "ok", "sorry"]
+
     private static func isStandaloneCorrectionMarker(_ sentence: String) -> Bool {
         var s = sentence.lowercased().trimmingCharacters(in: .whitespaces)
         while let last = s.last, ".?!".contains(last) { s.removeLast() }
         s = s.trimmingCharacters(in: .whitespaces)
 
+        // Commas inside the marker are tag punctuation ("No, scratch that,
+        // right?"), not sentence structure -- normalize them out so the
+        // token-sequence check below only has to reason about word shape,
+        // not comma placement.
+        let tokens = s.replacingOccurrences(of: ",", with: " ")
+            .components(separatedBy: .whitespaces)
+            .filter { !$0.isEmpty }
+        guard !tokens.isEmpty else { return false }
+        let prefixWords = Set(correctionPrefixes.map { $0.replacingOccurrences(of: ",", with: "") })
+
         for cue in correctionCues {
-            if s == cue { return true }
-            for prefix in correctionPrefixes where s == "\(prefix) \(cue)" {
+            let cueWords = cue.components(separatedBy: " ")
+            let n = cueWords.count
+
+            // Bare cue: "scratch that".
+            if tokens == cueWords { return true }
+            // Prefix + cue: "no scratch that".
+            if tokens.count == n + 1, prefixWords.contains(tokens[0]), Array(tokens[1...]) == cueWords {
+                return true
+            }
+            // Cue + trailing tail: "scratch that yeah". Tight on purpose --
+            // only ONE suffix word is ever tolerated, so a sentence with
+            // real extra words ("no scratch that plan entirely") can't
+            // sneak through as "cue + tag".
+            if tokens.count == n + 1, Array(tokens[0..<n]) == cueWords, correctionSuffixes.contains(tokens[n]) {
+                return true
+            }
+            // Prefix + cue + trailing tail: "no scratch that, right".
+            if tokens.count == n + 2, prefixWords.contains(tokens[0]),
+               Array(tokens[1..<(1 + n)]) == cueWords, correctionSuffixes.contains(tokens[n + 1]) {
                 return true
             }
         }
@@ -333,8 +369,17 @@ struct CleanupRouter: Sendable {
     /// True when the raw transcript asked a question that the cleaned text no
     /// longer poses. Punctuation-only, so it's cheap and independent of
     /// utterance length -- see the call site for why that matters.
+    ///
+    /// Checked against stripStandaloneCorrections(raw), not raw itself:
+    /// STT punctuates a correction marker like "No scratch that, right?"
+    /// with a "?" that isn't a real question. Without this, a legitimate
+    /// cleanup that removes the correction (as it should) makes the "?"
+    /// disappear and trips this guard, forcing the un-corrected raw text
+    /// through instead -- exactly the "two hundred and forty. No scratch
+    /// that, right? two hundred and forty five." case that motivated it.
     static func droppedQuestion(raw: String, cleaned: String) -> Bool {
-        raw.contains("?") && !cleaned.contains("?")
+        let strippedRaw = stripStandaloneCorrections(raw)
+        return strippedRaw.contains("?") && !cleaned.contains("?")
     }
 }
 

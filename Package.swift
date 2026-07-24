@@ -19,6 +19,14 @@ let package = Package(
             swiftSettings: [
                 .swiftLanguageMode(.v5)
             ]
+        ),
+        .testTarget(
+            name: "WhisperFlowTests",
+            dependencies: ["WhisperFlow"],
+            path: "Tests/WhisperFlowTests",
+            swiftSettings: [
+                .swiftLanguageMode(.v5)
+            ]
         )
     ]
 )
