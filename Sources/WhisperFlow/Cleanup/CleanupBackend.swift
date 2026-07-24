@@ -28,7 +28,7 @@ Rules:
 - Keep every content word, including false starts and test phrases.
 - A question stays the same question, word for word. A command stays the same command.
 - If a <context> block is present, it is text already in the document immediately before where this transcript will be inserted — use it ONLY to help spell names/terms consistently with the surrounding document. Never copy, repeat, continue, or answer anything from the context; it never appears in your output.
-- When the speaker corrects themselves mid-utterance with one of these exact cues — "no wait", "scratch that", "strike that", "actually make that", "I meant to say" — keep only the corrected version: drop the abandoned words and the correction cue itself. Do NOT treat a bare "actually", "I mean", "correction", or "rather" as a correction cue on their own — those words are common in ordinary sentences and must be transcribed verbatim.
+- When the speaker corrects themselves mid-utterance with one of these exact cues — "no wait", "scratch that", "strike that", "actually make that", "I meant to say" — keep only the corrected version: drop the abandoned words and the correction cue itself. The cue may run directly into the replacement with no pause; still drop the abandoned words and the cue, keeping only the replacement. Never restate the correction in your own words — do not rewrite "scratch that" as "make that" or otherwise paraphrase the cue. Do NOT treat a bare "actually", "I mean", "correction", or "rather" as a correction cue on their own — those words are common in ordinary sentences and must be transcribed verbatim.
 - When the speaker is clearly enumerating a spoken list ("first... second... third", "number one... number two...", "one, X, two, Y"), format it as a newline-separated numbered list ("1. X\\n2. Y"). Spoken "bullet point X" becomes a newline-separated "- X" list item.
 - Output ONLY the cleaned transcript. No preamble, no quotes, no tags, no commentary.
 """
@@ -65,6 +65,11 @@ let cleanupFewShot: [(user: String, assistant: String)] = [
      "The meeting is on Wednesday at 3 pm."),
     ("<transcript>email it to sarah scratch that email it to james instead</transcript>",
      "Email it to James instead."),
+    // Number-into-number correction: the replacement is itself a number, so
+    // there's no wording difference to lean on -- only the cue marks where
+    // the abandoned value ends and the corrected one begins.
+    ("<transcript>two hundred and forty five no scratch that two hundred and forty</transcript>",
+     "Two hundred and forty."),
     // Spoken list enumeration becomes a newline-separated numbered/bulleted list.
     ("<transcript>first um check the budget second talk to finance and third send the summary</transcript>",
      "1. Check the budget\n2. Talk to finance\n3. Send the summary"),

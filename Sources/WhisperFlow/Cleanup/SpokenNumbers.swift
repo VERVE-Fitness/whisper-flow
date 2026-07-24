@@ -78,6 +78,19 @@ enum SpokenNumbers {
                 continue
             }
 
+            // Pair-style hundreds ("two forty five" -> 245): how people
+            // actually say three-digit numbers in casual speech -- nobody
+            // dictates "two hundred forty five" out loud. Must run after
+            // the magnitude check above (so "two hundred..." is claimed by
+            // that grammar first) and before the plain unit/tens-compound
+            // checks below (so "two" isn't consumed alone before this gets
+            // a chance to look ahead).
+            if let pair = parsePairHundred(tokens, at: i) {
+                out.append(String(pair.value) + pair.punct)
+                i += pair.consumed
+                continue
+            }
+
             // Compound "twenty five" -> "25": only when the two words are
             // adjacent with no intervening punctuation (a comma or period
             // between them means they're not one number).
@@ -222,6 +235,50 @@ enum SpokenNumbers {
 
         // No thousands part -- try a bare "<1-9> hundred [...]".
         return parseHundredPart(tokens, at: i)
+    }
+
+    /// Parses the "pair-style" spoken hundreds pattern: a bare unit 2-9
+    /// (word or digit, no trailing punctuation) immediately followed by a
+    /// tens/teens/ten value (10-99, via parseSmallNumber) -- "two forty
+    /// five" -> 245, "two fifteen" -> 215, "two ten" -> 210, "room two
+    /// forty" -> "room 240". This is how people actually say three-digit
+    /// numbers in casual speech (nobody dictates "two hundred forty
+    /// five"), so it needs recognising as its own shape rather than
+    /// relying on the explicit "hundred" magnitude grammar above, which
+    /// only fires when the speaker says "hundred" out loud.
+    ///
+    /// Must run AFTER parseMagnitudeNumber in convert()'s dispatch order:
+    /// letting the magnitude grammar claim "hundred"/"thousand" phrases
+    /// first means this only ever sees numbers that don't have a magnitude
+    /// word -- exactly the ambiguous case it exists for. Running it first
+    /// would risk mis-parsing the leading unit of "two hundred and forty
+    /// five" as this pair pattern's unit before "hundred" is ever seen.
+    ///
+    /// "one" is deliberately excluded from the leading unit (range is 2-9,
+    /// not 1-9): unlike 2-9, bare "one" is disproportionately non-numeric
+    /// in ordinary speech (see oneUnitFollowers above) -- "one twenty" is
+    /// far more likely "the 1:20 meeting" than "120", so it's left as "one
+    /// 20" (the plain per-word conversion) rather than folded into a pair.
+    ///
+    /// The tail value must be >= 10: below that, "two five" reads as two
+    /// separate digits (a room number, a score) rather than a botched
+    /// "twenty-five", and the existing per-word conversion already handles
+    /// it correctly as "2 5" without this rule's help.
+    private static func parsePairHundred(_ tokens: [String], at i: Int) -> (value: Int, consumed: Int, punct: String)? {
+        guard i < tokens.count else { return nil }
+        let (word, punct) = split(tokens[i])
+        guard punct.isEmpty else { return nil }
+
+        var unitValue: Int?
+        if let digitValue = Int(word), (2...9).contains(digitValue) {
+            unitValue = digitValue
+        } else if let value = units[word.lowercased()], (2...9).contains(value) {
+            unitValue = value
+        }
+        guard let uValue = unitValue, i + 1 < tokens.count else { return nil }
+
+        guard let tail = parseSmallNumber(tokens, at: i + 1), tail.value >= 10 else { return nil }
+        return (uValue * 100 + tail.value, 1 + tail.consumed, tail.punct)
     }
 
     private static func split(_ token: String) -> (word: String, punct: String) {

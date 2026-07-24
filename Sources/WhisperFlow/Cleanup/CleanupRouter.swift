@@ -147,36 +147,245 @@ struct CleanupRouter: Sendable {
     /// must NOT be listed — "I'd rather we ship Friday" is not a backtrack.
     private static let correctionCues = ["no wait", "scratch that", "strike that", "actually make that", "i meant to say"]
 
+    /// Cues that are inherently replacement-flavoured -- saying them at all
+    /// only makes sense if the speaker is substituting new content for old,
+    /// unlike "scratch that" which also reads fine as ordinary language
+    /// ("scratch that itch"). Because these cues carry their own unambiguous
+    /// correction meaning, the cue-led-replacement matcher below
+    /// (cueLedRemainder) lets them trigger with no prefix word and no comma
+    /// required -- the two signals that stand in for that unambiguity
+    /// everywhere else. Bare "make that" is deliberately NOT here: it's
+    /// everyday English ("Talk to finance. Make that happen today." must
+    /// never eat the finance sentence), so it only fires with a prefix
+    /// ("no make that 240") or a trailing comma ("Make that, 240") like any
+    /// other ambiguous cue -- and the paraphrase case that motivated this
+    /// list ("Actually, make that 2 and 40") is covered by the
+    /// "actually make that" entry. Deliberately overlaps correctionCues:
+    /// both entries are in that list too, just reached from the LLM-parity
+    /// list above as well as from here.
+    private static let replacementCues = ["actually make that", "i meant to say"]
+
     static func containsCorrectionCue(_ raw: String) -> Bool {
         let lower = raw.lowercased()
         return correctionCues.contains { lower.contains($0) }
     }
 
     /// Deterministic, narrower sibling of the LLM-based correction handling
-    /// above: only handles a correction cue that stands as its OWN whole
-    /// sentence ("Talk for five minutes. No, scratch that. Ten minutes." ->
-    /// "Ten minutes."), dropping that sentence and the one immediately
-    /// before it. This is deliberately conservative -- it does NOT attempt
-    /// the harder, genuinely-needs-language-understanding case the LLM path
-    /// exists for ("on tuesday no wait wednesday" -> "on wednesday", a
-    /// mid-sentence word-level swap) -- because a mechanical rule can't
-    /// reliably tell how far back a mid-sentence correction refers, and a
-    /// wrong guess there deletes real content. The whole-sentence pattern
-    /// has only one sane reading, so it's safe to do without a model.
+    /// above. Handles three shapes, tried in this order per sentence:
+    ///
+    /// 1. A correction cue that stands as its OWN whole sentence ("Talk for
+    ///    five minutes. No, scratch that. Ten minutes." -> "Ten minutes."),
+    ///    dropping that sentence and the one immediately before it.
+    /// 2. A cue that leads a whole sentence with real content after it
+    ///    ("Tune and forty five. No scratch that two and forty." -> "Two
+    ///    and forty.") -- the LLM-paraphrase-proof net: even when the LLM
+    ///    cleanup rewrote the cue in its own words upstream, this runs on
+    ///    the ORIGINAL raw transcript (stripStandaloneCorrections is called
+    ///    on raw, before the LLM ever sees it -- see CleanupRouter.finalize)
+    ///    so a paraphrase downstream can't hide the cue from it.
+    /// 3. The same two shapes again at COMMA-CLAUSE granularity within a
+    ///    single sentence ("Two forty five, no scratch that, two forty." ->
+    ///    "Two forty.") -- STT often punctuates a spoken correction as
+    ///    clauses of one sentence rather than separate sentences, and the
+    ///    correction reads identically either way.
+    ///
+    /// This is deliberately conservative -- it does NOT attempt the harder,
+    /// genuinely-needs-language-understanding case the LLM path exists for
+    /// ("on tuesday no wait wednesday" -> "on wednesday", a mid-sentence
+    /// word-level swap without any comma or sentence boundary) -- because a
+    /// mechanical rule can't reliably tell how far back a truly mid-clause
+    /// correction refers, and a wrong guess there deletes real content. The
+    /// sentence/clause-boundary patterns above have only one sane reading,
+    /// so they're safe to handle without a model.
     static func stripStandaloneCorrections(_ text: String) -> String {
         let sentences = splitSentences(text)
-        guard sentences.count > 1 else { return text }
+        guard !sentences.isEmpty else { return text }
 
         var kept: [String] = []
         for sentence in sentences {
             if isStandaloneCorrectionMarker(sentence) {
                 _ = kept.popLast()
+                continue
+            }
+            let (body, terminator) = stripTerminator(sentence)
+            // Cue-led whole-sentence replacement requires a previous
+            // sentence to actually replace -- without that guard, a
+            // sentence like "No scratch that plan entirely." spoken on its
+            // own (nothing before it to correct) would misfire on the bare
+            // prefix+cue signal alone. Exact markers above don't need this
+            // guard: their tight shape (bare cue, or cue plus one prefix/
+            // suffix word) is unambiguous regardless of context, but a cue
+            // with arbitrary trailing content only reads as a correction
+            // when there's something in scope for it to replace.
+            if !kept.isEmpty, let remainder = cueLedRemainder(body) {
+                _ = kept.popLast()
+                kept.append(capitalizeFirstLetter(remainder) + terminator)
+                continue
+            }
+            if let rebuilt = stripClauseLevelCorrection(body: body, terminator: terminator, kept: &kept) {
+                if !rebuilt.isEmpty { kept.append(rebuilt) }
+                continue
+            }
+            kept.append(sentence)
+        }
+        guard kept != sentences else { return text }
+        return kept.joined(separator: " ")
+    }
+
+    /// Splits a sentence body (terminator already stripped by stripTerminator)
+    /// into comma-delimited clauses and looks for a correction inside it,
+    /// mirroring stripStandaloneCorrections' two shapes at clause
+    /// granularity:
+    ///
+    /// - An exact marker clause ("no scratch that" as a whole clause) drops
+    ///   that clause and the one before it -- or, if the marker is the
+    ///   sentence's FIRST clause, drops the previous SENTENCE instead (via
+    ///   `kept`), since there's no earlier clause in this sentence to reach
+    ///   back into.
+    /// - A cue-led clause with trailing content ("..., make that 2 and 40")
+    ///   drops the clause before it and keeps only the remainder. Only
+    ///   checked from the second clause onward: a cue-led match at clause
+    ///   index 0 is exactly the whole-sentence cueLedRemainder check the
+    ///   caller already tried (a clause starting at index 0 spans the same
+    ///   tokens the sentence itself starts with), so re-checking it here
+    ///   would be redundant, not additive.
+    ///
+    /// Returns nil when neither shape is found in a multi-clause sentence
+    /// (caller falls back to keeping the sentence verbatim), or when the
+    /// sentence has no commas at all. Returns "" in the degenerate case
+    /// where removing the matched clauses empties the sentence entirely --
+    /// the caller skips appending an empty result.
+    private static func stripClauseLevelCorrection(body: String, terminator: String, kept: inout [String]) -> String? {
+        let clauses = body.components(separatedBy: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+        guard clauses.count > 1 else { return nil }
+
+        if let k = clauses.firstIndex(where: { isStandaloneCorrectionMarker($0) }) {
+            var remaining = clauses
+            remaining.remove(at: k)
+            if k > 0 {
+                remaining.remove(at: k - 1)
             } else {
-                kept.append(sentence)
+                _ = kept.popLast()
+            }
+            guard !remaining.isEmpty else { return "" }
+            return capitalizeFirstLetter(remaining.joined(separator: ", ")) + terminator
+        }
+
+        for k in 1..<clauses.count {
+            if let remainder = cueLedRemainder(clauses[k]) {
+                var remaining = clauses
+                remaining[k] = remainder
+                remaining.remove(at: k - 1)
+                guard !remaining.isEmpty else { return "" }
+                return capitalizeFirstLetter(remaining.joined(separator: ", ")) + terminator
             }
         }
-        guard kept.count != sentences.count else { return text }
-        return kept.joined(separator: " ")
+        return nil
+    }
+
+    /// Splits a sentence into (body, terminator): the trailing ".", "?", or
+    /// "!" pulled off separately so clause-splitting and cue matching never
+    /// have to special-case it, and callers can re-append the exact
+    /// original terminator after rebuilding the sentence.
+    private static func stripTerminator(_ sentence: String) -> (body: String, terminator: String) {
+        var s = sentence.trimmingCharacters(in: .whitespaces)
+        var terminator = ""
+        if let last = s.last, ".?!".contains(last) {
+            terminator = String(last)
+            s.removeLast()
+        }
+        return (s.trimmingCharacters(in: .whitespaces), terminator)
+    }
+
+    /// Uppercases just the first character, leaving the rest untouched --
+    /// used to re-capitalize a rebuilt sentence/clause after its original
+    /// first word (which may have been the dropped correction cue or
+    /// prefix) is gone. A no-op when the new first character isn't a
+    /// letter (e.g. a rebuilt sentence that now starts with a digit, like
+    /// "2 and 40.").
+    private static func capitalizeFirstLetter(_ s: String) -> String {
+        guard let first = s.first else { return s }
+        return String(first).uppercased() + s.dropFirst()
+    }
+
+    /// Matches the "cue-led replacement" shape: `text` (a sentence body or a
+    /// single already-comma-split clause, terminator already stripped)
+    /// OPENS with [prefix]? + cue and still has real content after it --
+    /// e.g. "No scratch that two and forty" (prefix "no" + cue "scratch
+    /// that" + remainder "two and forty"), or "make that 2 and 40" (bare
+    /// replacement cue + remainder). Returns the remainder in ORIGINAL
+    /// casing/punctuation (never the lowercased matching form), so digits
+    /// and proper nouns in the surviving correction come through untouched.
+    ///
+    /// This is deliberately a LOOSER shape than isStandaloneCorrectionMarker
+    /// (which only tolerates a single trailing tag word) -- it exists
+    /// specifically for the case that motivated it: an LLM cleanup backend
+    /// that paraphrases the correction instead of applying it ("No scratch
+    /// that ..." rewritten as "Actually, make that ..."). No prompt-level
+    /// rule can stop that reliably, but the paraphrase the model reaches
+    /// for is itself cue-shaped -- and since finalize() runs this pass on
+    /// whichever text won (LLM output or raw fallback alike), the
+    /// paraphrased form gets caught here on the way out. Because it's
+    /// looser, it needs a real
+    /// trigger signal to fire, not just "starts with a cue word" -- a bare
+    /// cue with trailing content and none of the three signals below is
+    /// exactly the false-positive class this has to avoid: "Scratch that
+    /// plan entirely." and "Scratch that idea and move on." use "scratch
+    /// that" in its ordinary sense, not as a correction, and must pass
+    /// through unchanged.
+    private static func cueLedRemainder(_ text: String) -> String? {
+        // Commas are discarded for matching purposes (mirrors
+        // isStandaloneCorrectionMarker) -- a prefix and cue spoken either
+        // side of a comma ("Actually, make that ...") are still "prefix
+        // then cue" for this purpose. The remainder is built from the same
+        // comma-normalized token stream, so it never carries a stray comma
+        // forward from a prefix/cue boundary.
+        let rawTokens = text.replacingOccurrences(of: ",", with: " ")
+            .components(separatedBy: .whitespaces)
+            .filter { !$0.isEmpty }
+        guard !rawTokens.isEmpty else { return nil }
+        let lowerTokens = rawTokens.map { $0.lowercased() }
+        let prefixWords = Set(correctionPrefixes.map { $0.replacingOccurrences(of: ",", with: "") })
+        // "make that" joins the candidate list here as an AMBIGUOUS cue: it
+        // can fire via the prefix or trailing-comma signals below ("no make
+        // that 240", "Make that, 240") but is kept out of replacementCues,
+        // so bare "Make that happen today" never triggers.
+        let allCues = correctionCues + (replacementCues + ["make that"]).filter { !correctionCues.contains($0) }
+
+        for cue in allCues {
+            let cueWords = cue.components(separatedBy: " ")
+            let n = cueWords.count
+
+            // Prefix + cue + real content: "No scratch that two and
+            // forty." The prefix word alone is signal enough here -- no
+            // comma or replacement-cue membership required.
+            if lowerTokens.count > n + 1, prefixWords.contains(lowerTokens[0]), Array(lowerTokens[1..<(1 + n)]) == cueWords {
+                return rawTokens[(1 + n)...].joined(separator: " ")
+            }
+            // Bare cue + real content, no prefix: "Scratch that, two
+            // forty." / "Make that 2 and 40." Only a replacement-flavoured
+            // cue (always correction-shaped) or a comma immediately after
+            // the cue in the original text is a strong enough signal on
+            // its own -- neither present is the ordinary-sentence
+            // false-positive case documented above.
+            if lowerTokens.count > n, Array(lowerTokens[0..<n]) == cueWords {
+                if replacementCues.contains(cue) || commaImmediatelyFollows(cueWords, in: text) {
+                    return rawTokens[n...].joined(separator: " ")
+                }
+            }
+        }
+        return nil
+    }
+
+    /// True when `text` starts with `cueWords` (words only, whitespace
+    /// between) immediately followed by a comma -- the "Scratch that, two
+    /// forty" shape, checked against the ORIGINAL text (comma intact),
+    /// unlike the token matching above which normalizes commas away.
+    private static func commaImmediatelyFollows(_ cueWords: [String], in text: String) -> Bool {
+        let pattern = "(?i)^\\s*" + cueWords.map { NSRegularExpression.escapedPattern(for: $0) }.joined(separator: "\\s+") + "\\s*,"
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return false }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return regex.firstMatch(in: text, range: range) != nil
     }
 
     /// Short interjections that commonly precede a correction cue spoken as
