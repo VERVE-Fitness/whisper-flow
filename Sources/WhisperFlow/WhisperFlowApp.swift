@@ -101,6 +101,7 @@ struct WhisperFlowApp: App {
     @Environment(\.openWindow) private var openWindow
 
     static let transcriptWindowID = "transcript"
+    static let meetingWindowID = "meeting"
 
     var body: some Scene {
         // `body` is evaluated while SwiftUI builds the scene graph, which
@@ -114,9 +115,10 @@ struct WhisperFlowApp: App {
         // LSUIElement (Info.plist) keeps us out of the Dock; no window opens
         // automatically.
         MenuBarExtra {
-            MenuBarContent(accessibility: state.accessibility) {
-                openWindow(id: Self.transcriptWindowID)
-            }
+            MenuBarContent(accessibility: state.accessibility,
+                           meetings: state.meetings,
+                           openTranscriptWindow: { openWindow(id: Self.transcriptWindowID) },
+                           openMeetingWindow: { openWindow(id: Self.meetingWindowID) })
             .environmentObject(state)
         } label: {
             Image(systemName: "mic.circle")
@@ -126,6 +128,14 @@ struct WhisperFlowApp: App {
         // Transcript window: hidden at launch, opened only via the menu.
         Window("Whisper Flow", id: Self.transcriptWindowID) {
             MainView()
+                .environmentObject(state)
+        }
+        .windowResizability(.contentSize)
+
+        // Review window for the last meeting. Also hidden at launch; it opens
+        // itself only via the menu, and it reads what is already on disk.
+        Window("Last meeting", id: Self.meetingWindowID) {
+            MeetingWindow()
                 .environmentObject(state)
         }
         .windowResizability(.contentSize)

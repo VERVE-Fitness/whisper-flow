@@ -56,7 +56,23 @@ final class AppState: ObservableObject {
 
     let accessibility = AccessibilityPermission()
 
-    private let backend: TranscriptionBackend = ParakeetBackend()
+    // MARK: - Meetings
+
+    /// The meeting recorder owns its OWN AudioCapture, so a meeting running in
+    /// the background does not touch the dictation capture and Right Option
+    /// keeps working mid-meeting.
+    let meetings = MeetingRecorder()
+    /// Plain-English line for the menu ("Recording", "Separating speakers… 40%",
+    /// "Saved", "Failed: …"). Nil when no meeting has run this launch.
+    @Published var meetingStatus: String?
+    /// The meeting the review window and "Open last meeting folder" act on.
+    @Published var lastMeetingID: String?
+    private var meetingTicker: AnyCancellable?
+
+    /// Concrete, not the `TranscriptionBackend` protocol: MeetingTranscriber
+    /// needs `transcribeLong(url:)`, which only Parakeet has (it is the
+    /// disk-backed long-form path, and there is no second backend shipping).
+    private let backend = ParakeetBackend()
     private let router = CleanupRouter()
     private let capture = AudioCapture()
     private let hotkeys = HotkeyManager()
@@ -216,12 +232,29 @@ final class AppState: ObservableObject {
         startUpdateChecks()
 
         pill.onTapStop = { [weak self] in
-            guard let self, self.currentMode != .window else { return }
+            guard let self else { return }
+            // A meeting owns the pill while it records, so a tap means "stop
+            // the meeting" and must not fall through to the dictation stop.
+            if self.meetings.isRecording {
+                self.stopMeeting()
+                return
+            }
+            guard self.currentMode != .window else { return }
             // The hands-free key tap is still armed; without this it would
             // swallow the user's next keypress as the "finish" key.
             self.hotkeys.reset()
             self.stopRecording()
         }
+
+        // Redraw the elapsed time on the pill twice a second while a meeting
+        // records. Guarded on isRecording so a late tick cannot put the pill
+        // back up after the meeting stopped.
+        meetingTicker = meetings.$elapsedSeconds
+            .receive(on: RunLoop.main)
+            .sink { [weak self] elapsed in
+                guard let self, self.meetings.isRecording else { return }
+                self.pill.update(.meeting(elapsed: elapsed))
+            }
 
         hotkeys.onStart = { [weak self] in
             guard let self, self.accessibility.isTrusted, self.canRecord else { return }
@@ -667,6 +700,93 @@ final class AppState: ObservableObject {
                     hotkeys.reset()
                 }
             }
+        }
+    }
+
+    // MARK: - Meetings
+
+    /// Consent gate first, always. `ConsentGate.present` returning nil is a
+    /// cancel and nothing is recorded -- there is no path to a recording that
+    /// skips this, and the CLI harnesses stamp their own wording version so a
+    /// test run can never be mistaken for a real consent.
+    func startMeeting() {
+        guard !meetings.isRecording else { return }
+        Task {
+            guard let consent = await ConsentGate.present(managerName: nil) else {
+                meetingStatus = "Cancelled, nothing recorded"
+                return
+            }
+            do {
+                _ = try await meetings.start(title: "", attendees: [], consent: consent)
+                pill.show(.meeting(elapsed: 0))
+                meetingStatus = "Recording"
+            } catch {
+                meetingStatus = "Could not start: \(error.localizedDescription)"
+                pill.show(.failed(error.localizedDescription))
+            }
+        }
+    }
+
+    /// Stop, then the whole offline pass: both tracks through Parakeet, the far
+    /// side through the diariser, names proposed from the attendee list, and a
+    /// summary when a key is on the machine. Every stage reports into the pill
+    /// because the first run downloads the diariser model and silence would
+    /// read as a hang.
+    func stopMeeting() {
+        guard meetings.isRecording else { return }
+        Task {
+            guard let rec = await meetings.stop() else { return }
+            lastMeetingID = rec.id
+            pill.update(.meetingProcessing("Transcribing…"))
+            meetingStatus = "Transcribing…"
+            do {
+                let transcriber = MeetingTranscriber(backend: backend) { [weak self] status in
+                    Task { @MainActor in
+                        guard let self else { return }
+                        self.meetingStatus = status
+                        self.pill.update(.meetingProcessing(status))
+                    }
+                }
+                var transcript = try await transcriber.transcribe(meetingID: rec.id)
+                transcript.speakerNames = SpeakerNaming.proposeNames(for: transcript,
+                                                                    ownerName: NSFullUserName(),
+                                                                    attendees: rec.attendees)
+                var updated = try MeetingStore.load(id: rec.id)
+                updated.speakerNames = transcript.speakerNames
+                try MeetingStore.save(updated)
+                try transcriber.write(transcript, record: updated)
+
+                pill.update(.meetingProcessing("Summarising…"))
+                meetingStatus = "Summarising…"
+                let summary = try await MeetingSummariser.summarise(meetingID: rec.id)
+                meetingStatus = summary == nil ? "Saved (no summary: no Anthropic key on this Mac)" : "Saved"
+                pill.show(.inserted)   // reuses the green tick, auto-hides
+                NSWorkspace.shared.open(MeetingStore.directory(for: rec.id))
+            } catch {
+                meetingStatus = "Failed: \(error.localizedDescription)"
+                pill.show(.failed(error.localizedDescription))
+            }
+        }
+    }
+
+    func openMeetingFolder(_ id: String) {
+        NSWorkspace.shared.open(MeetingStore.directory(for: id))
+    }
+
+    /// Rename one speaker on a saved meeting: rewrites transcript.json,
+    /// transcript.md and the name map in meeting.json so the folder on disk and
+    /// the review window never disagree.
+    func applySpeakerName(meetingID: String, speakerId: String, name: String) {
+        do {
+            var record = try MeetingStore.load(id: meetingID)
+            let data = try Data(contentsOf: MeetingStore.transcriptJSONURL(meetingID))
+            let transcript = SpeakerNaming.renamed(try JSONDecoder().decode(Transcript.self, from: data),
+                                                   speakerId: speakerId, to: name)
+            record.speakerNames = transcript.speakerNames
+            try MeetingStore.save(record)
+            try MeetingTranscriber(backend: backend).write(transcript, record: record)
+        } catch {
+            meetingStatus = "Could not rename: \(error.localizedDescription)"
         }
     }
 
