@@ -86,6 +86,58 @@ The app is signed with an Apple Development certificate, not Developer ID, and i
 
 Guard rails: empty output, output longer than 1.6× the raw text, too few content words kept, too many new words, a dropped question mark, errors, or the timeout all fall back to the raw transcript (logged to stderr and the usage log). Deterministic passes (dictionary corrections, self-correction stripping, digit formatting) run on every path. Whole-sentence cue-led replacement ("… by Tuesday. Actually make that Wednesday.") only deletes the previous sentence when the replacement is at least half its length; shorter remainders are word-level swaps left for the LLM.
 
+## Meetings (week 1, Mac-only)
+
+**Record meeting…** in the menu records both sides of a call and, at Stop, leaves you a folder with the audio, a speaker-labelled transcript and a summary. Nothing goes to the Engine, Supabase or Flow in week 1: everything stays on this Mac.
+
+**Wear headphones.** Two tracks are recorded: track A is your microphone, track B is whatever the Mac is playing (the other side of the call). Out loud through the speakers, your microphone hears their side as well, so both tracks carry the same words and the speaker names get mixed up. Headphones keep the two apart.
+
+**Consent gate.** Every recording passes through it, there is no auto-record, and the wording version you saw (`consent-v1`) plus the timestamp is written into `meeting.json`. Cancel is the safe path; a cancelled gate records nothing at all. CLI harness runs stamp `consent-v1-cli` so a test run can never be read as a real person agreeing.
+
+**What Stop does**, with each stage shown on the pill: transcribes track A (you), transcribes track B (them), separates track B into speakers with the offline diariser (the first run downloads a 22 MB model), shifts track B on to track A's clock, names the speakers from the attendee list in the order they first spoke, writes the transcript, then summarises it if a key is on the machine. Finder opens the folder when it is done.
+
+**The folder** is `~/Library/Application Support/WhisperFlow/meetings/<id>/`, one per meeting, id shaped `2026-09-05-1432-<8 hex>`:
+
+| File | What it is |
+|---|---|
+| `meeting.json` | Times, title, attendees, the consent record, status, track lengths, the measured track-B offset, the speaker name map |
+| `track-a.wav` | Your microphone, 16 kHz mono Float32 |
+| `track-b.wav` | The Mac's output audio, same format. Always present; empty when the system tap was unavailable |
+| `transcript.json` | Segments with speaker ids, start and end times |
+| `transcript.md` | The readable transcript, timestamps and names |
+| `summary.md` | Summary, decisions, actions, catch-up. Only when a key is present |
+
+**Track alignment.** The microphone is started first and the system tap a second later (starting the tap posts a configuration change that would kill a still-starting mic engine). Each WAV therefore begins at its own zero. The recorder measures the gap, stores it as `trackBOffsetSeconds`, and the transcriber adds it to every track-B time before merging, so the far side lands where it was actually said. Typical measured value on this M4 is 1.03 to 1.08 s.
+
+**Permissions.** Microphone (the usual prompt), plus **System Audio Recording**, granted in System Settings → Privacy & Security → Screen & System Audio Recording → "System Audio Recording Only". Without it the tap still runs and `track-b.wav` is silent; a `[capture] system-audio:` note on stderr says so. The system tap needs macOS 14.2; below that the meeting records your microphone only and says so.
+
+**Summariser key (week 1 only).** `ANTHROPIC_API_KEY` in the environment, or a file at `~/Library/Application Support/WhisperFlow/anthropic.key`. Only the transcript text is sent, never audio. No key means no summary and no error; everything else still runs. In week 2 the Engine does the summarising and the key leaves the Mac entirely.
+
+**CLI harnesses** (the debug binary, `$HOME/.cache/whisperflow-build-scratch/debug/WhisperFlow`):
+
+| Command | What it does |
+|---|---|
+| `--tap-test <seconds>` | System audio tap only: buffer counts, RMS, gap-fill, transcript |
+| `--dual-test <seconds>` | Microphone and tap at the same time, to prove neither starves the other |
+| `--record-test <seconds>` | One real recording through `MeetingRecorder`; prints the folder, both track lengths and the measured offset |
+| `--transcribe-meeting <id>` | Parakeet over both tracks plus the diariser, prints `transcript.md` |
+| `--summarise-meeting <id>` | Anthropic summary for an already-transcribed meeting, prints `summary.md` |
+| `--meeting-test <seconds> [--attendees "A,B"]` | The whole chain in one go: record, transcribe, name, summarise, print |
+
+**Not in week 1:** nothing is uploaded to the Engine, there is no Flow page, attendees are typed rather than read from the calendar, your manager cannot play anything back yet, and the 90-day audio retention job does not exist. All of that is week 2 and later.
+
+### Week-1 dogfood (Niall, five real meetings)
+
+```
+1. Consent alert appeared every time; Cancel was the default; you actually announced the recording.
+2. Pill counted up for the whole meeting; dictation with Right Option still worked mid-meeting.
+3. track-b.wav is not silent (open it): the other side was captured.
+4. Speakers: how many of the "them" segments had the right name after you typed attendees? (target: most; note the count)
+5. Words: read transcript.md against what was said; note the worst three errors.
+6. Summary: are decisions and actions real, not invented? Note any invented item verbatim.
+7. Time from Stop to Finder opening (target: under 3 minutes for a 30-minute meeting on this M4; note the M1 figure when a colleague tries).
+```
+
 ## Swapping the STT backend
 
 `STT/TranscriptionBackend.swift` defines the streaming protocol (prepare → startStream → feed → finishStream, plus batch `transcribeFile`). `ParakeetBackend` is the live implementation; `WhisperBackend` is a stub showing where a whisper.cpp/WhisperKit buffer+commit wrapper would conform.

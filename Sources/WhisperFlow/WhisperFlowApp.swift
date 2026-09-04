@@ -55,6 +55,27 @@ enum WhisperFlowMain {
             }
             exit(runCLITranscribeMeeting(id: args[idx + 1]))
         }
+        if let idx = args.firstIndex(of: "--summarise-meeting") {
+            guard idx + 1 < args.count else {
+                FileHandle.standardError.write(Data("error: --summarise-meeting requires a meeting id\n".utf8))
+                exit(2)
+            }
+            exit(runCLISummariseMeeting(id: args[idx + 1]))
+        }
+        if let idx = args.firstIndex(of: "--meeting-test") {
+            guard idx + 1 < args.count, let seconds = Double(args[idx + 1]) else {
+                FileHandle.standardError.write(Data("error: --meeting-test requires a duration in seconds\n".utf8))
+                exit(2)
+            }
+            var attendees: [String] = []
+            if let i = args.firstIndex(of: "--attendees"), i + 1 < args.count {
+                attendees = args[i + 1]
+                    .split(separator: ",")
+                    .map { $0.trimmingCharacters(in: .whitespaces) }
+                    .filter { !$0.isEmpty }
+            }
+            exit(runCLIMeetingTest(seconds: seconds, attendees: attendees))
+        }
         if let idx = args.firstIndex(of: "--record-test") {
             guard idx + 1 < args.count, let seconds = Double(args[idx + 1]) else {
                 FileHandle.standardError.write(Data("error: --record-test requires a duration in seconds\n".utf8))
@@ -484,7 +505,9 @@ private func runCLIRecordTest(seconds: Double) -> Int32 {
     Task { @MainActor in
         let recorder = MeetingRecorder()
         do {
-            let consent = MeetingConsent(confirmedAt: Date(), wordingVersion: ConsentGate.wordingVersion)
+            // "-cli" so nothing downstream can mistake a harness run for a real
+            // person having read the consent wording and agreed to it.
+            let consent = MeetingConsent(confirmedAt: Date(), wordingVersion: ConsentGate.wordingVersion + "-cli")
             let rec = try await recorder.start(title: "CLI record test", attendees: [], consent: consent)
             print("recording \(rec.id) for \(seconds)s …")
             try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
@@ -515,6 +538,87 @@ private func runCLITranscribeMeeting(id: String) -> Int32 {
             let transcript = try await transcriber.transcribe(meetingID: id)
             print("transcribed in \(String(format: "%.1f", Date().timeIntervalSince(t0)))s: \(transcript.segments.count) segments, speakers: \(Set(transcript.segments.map(\.speakerId)).sorted())")
             print(try String(contentsOf: MeetingStore.transcriptMarkdownURL(id), encoding: .utf8))
+        } catch {
+            FileHandle.standardError.write(Data("error: \(error.localizedDescription)\n".utf8))
+            exitCode = 1
+        }
+        finished = true
+    }
+    while !finished { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
+    return exitCode
+}
+
+/// Sends an already-transcribed meeting to the Anthropic Messages API and
+/// prints the summary that was written next to the audio. Does nothing (exit 0)
+/// when no key is on the machine: the key lives in the environment as
+/// ANTHROPIC_API_KEY or in Application Support/WhisperFlow/anthropic.key, never
+/// in the repo.
+private func runCLISummariseMeeting(id: String) -> Int32 {
+    var finished = false
+    var exitCode: Int32 = 0
+    Task {
+        do {
+            let t0 = Date()
+            if let summary = try await MeetingSummariser.summarise(meetingID: id) {
+                print("summarised in \(String(format: "%.1f", Date().timeIntervalSince(t0)))s with \(MeetingSummariser.model): \(summary.decisions.count) decisions, \(summary.actions.count) actions")
+                print(try String(contentsOf: MeetingStore.summaryURL(id), encoding: .utf8))
+            } else {
+                print("no Anthropic key on this Mac; nothing summarised")
+            }
+        } catch {
+            FileHandle.standardError.write(Data("error: \(error.localizedDescription)\n".utf8))
+            exitCode = 1
+        }
+        finished = true
+    }
+    while !finished { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
+    return exitCode
+}
+
+/// The whole week-1 meeting pipeline in one command: record for `seconds`,
+/// transcribe both tracks, name the speakers from `--attendees`, summarise if a
+/// key is present, then print the folder, the transcript and the summary. This
+/// is the harness a human uses to check a change end to end without clicking
+/// through the menu bar.
+private func runCLIMeetingTest(seconds: Double, attendees: [String]) -> Int32 {
+    var finished = false
+    var exitCode: Int32 = 0
+    Task { @MainActor in
+        let recorder = MeetingRecorder()
+        do {
+            // "-cli": a harness run must never be mistaken for real consent.
+            let consent = MeetingConsent(confirmedAt: Date(),
+                                         wordingVersion: ConsentGate.wordingVersion + "-cli")
+            let rec = try await recorder.start(title: "CLI meeting test",
+                                               attendees: attendees,
+                                               consent: consent)
+            print("recording \(rec.id) for \(seconds)s …")
+            try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            let stopped = await recorder.stop()
+            print("track A: \(String(format: "%.2f", stopped?.trackASeconds ?? 0))s   track B: \(String(format: "%.2f", stopped?.trackBSeconds ?? 0))s   track B offset: \(String(format: "%.2f", stopped?.trackBOffsetSeconds ?? 0))s")
+
+            let t0 = Date()
+            let transcriber = MeetingTranscriber(backend: ParakeetBackend()) { status in print("  \(status)") }
+            var transcript = try await transcriber.transcribe(meetingID: rec.id)
+            transcript.speakerNames = SpeakerNaming.proposeNames(for: transcript,
+                                                                ownerName: NSFullUserName(),
+                                                                attendees: attendees)
+            var record = try MeetingStore.load(id: rec.id)
+            record.speakerNames = transcript.speakerNames
+            try MeetingStore.save(record)
+            try transcriber.write(transcript, record: record)
+            print("transcribed in \(String(format: "%.1f", Date().timeIntervalSince(t0)))s: \(transcript.segments.count) segments, speakers \(transcript.speakerNames.keys.sorted())")
+
+            let summary = try await MeetingSummariser.summarise(meetingID: rec.id)
+            print("folder: \(MeetingStore.directory(for: rec.id).path)")
+            print("--- transcript.md ---")
+            print(try String(contentsOf: MeetingStore.transcriptMarkdownURL(rec.id), encoding: .utf8))
+            if summary != nil {
+                print("--- summary.md ---")
+                print(try String(contentsOf: MeetingStore.summaryURL(rec.id), encoding: .utf8))
+            } else {
+                print("--- summary.md --- (skipped: no Anthropic key on this Mac)")
+            }
         } catch {
             FileHandle.standardError.write(Data("error: \(error.localizedDescription)\n".utf8))
             exitCode = 1
