@@ -182,3 +182,35 @@ final class SpeakerNamingTests: XCTestCase {
         XCTAssertEqual(reassigned.segments[1].speakerId, "speaker_1")
     }
 }
+
+final class MeetingSummariserTests: XCTestCase {
+    func testPromptContainsTranscriptAndAsksForJSON() {
+        let t = Transcript(meetingID: "m", segments: [TranscriptSegment(speakerId: "owner", start: 0, end: 1, text: "Send the Clayton quote Wednesday")],
+                           speakerNames: ["owner": "Niall Wogan"])
+        let p = MeetingSummariser.prompt(for: t, title: "Clayton")
+        XCTAssertTrue(p.contains("Niall Wogan: Send the Clayton quote Wednesday"))
+        XCTAssertTrue(p.contains("\"decisions\""))
+        XCTAssertTrue(p.contains("Return only JSON"))
+    }
+
+    func testParseAcceptsFencedJSON() throws {
+        let text = """
+        ```json
+        {"summary":"Quote timing agreed.","decisions":["Quote goes Wednesday"],"actions":[{"text":"Send Clayton quote","owner":"Nathan Hall","due":"2026-09-09"}],"catch_up":"Nathan sends the Clayton quote Wednesday."}
+        ```
+        """
+        let s = try MeetingSummariser.parse(text)
+        XCTAssertEqual(s.decisions, ["Quote goes Wednesday"])
+        XCTAssertEqual(s.actions.first?.owner, "Nathan Hall")
+        XCTAssertEqual(s.catchUp, "Nathan sends the Clayton quote Wednesday.")
+    }
+
+    func testMarkdownSections() {
+        let s = MeetingSummary(summary: "S", decisions: ["D1"], actions: [MeetingAction(text: "A1", owner: "Niall", due: nil)], catchUp: "C")
+        let md = MeetingSummariser.markdown(s)
+        XCTAssertTrue(md.contains("## Summary\n\nS"))
+        XCTAssertTrue(md.contains("## Decisions\n\n- D1"))
+        XCTAssertTrue(md.contains("- A1 (Niall)"))
+        XCTAssertTrue(md.contains("## Catch-up\n\nC"))
+    }
+}
