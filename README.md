@@ -20,6 +20,9 @@ First run downloads the Parakeet TDT 0.6B v3 Core ML models (~600 MB, cached in 
 
 ## Release
 
+Notarisation credentials: export `NOTARY_KEY` (path to the App Store Connect API `.p8`), `NOTARY_KEY_ID` and `NOTARY_ISSUER` before `scripts/make-app.sh` (the AIOS `.env` carries them as `APP_STORE_CONNECT_*`). Without them the script falls back to a notarytool keychain profile named `whisperflow-notary`. The Developer ID Application certificate lives in the login keychain (created 4 Sep 2026 by Niall in Xcode); when it is present the build is signed with it, hardened runtime on, notarised and stapled, and Gatekeeper opens it with a double-click.
+
+
 Every release gets its own tag carrying the short commit sha, and the same zip under BOTH asset names (old shared links use `WhisperFlow-release.zip`):
 
 ```sh
