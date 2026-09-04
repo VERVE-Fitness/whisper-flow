@@ -72,7 +72,7 @@ echo "==> Codesigning…"
 # NOTE: switching identity changes the code-signing designated requirement,
 # so TCC (Microphone / Accessibility) asks once more after the first
 # Developer ID build.
-DEV_ID_HASH="$(security find-identity -v -p codesigning | grep 'Developer ID Application: VERVE Fitness Equipment Pty Ltd' | head -1 | awk '{print $2}')"
+DEV_ID_HASH="$( (security find-identity -v -p codesigning | grep 'Developer ID Application: VERVE Fitness Equipment Pty Ltd' | head -1 | awk '{print $2}') || true)"
 if [[ -n "${CODESIGN_ID:-}" ]]; then
   :
 elif [[ -n "$DEV_ID_HASH" ]]; then
@@ -92,7 +92,7 @@ SIGN_OPTS=(--force --options runtime --timestamp)
 # llama-quantize, dylibs), not just the top-level one.
 if [[ -d "$APP_DIR/Contents/Resources/ollama-bin" ]]; then
   while IFS= read -r -d '' bin; do
-    if file "$bin" | grep -q "Mach-O"; then
+    if [[ "$(file -b "$bin")" == *Mach-O* ]]; then
       codesign "${SIGN_OPTS[@]}" --sign "$CODESIGN_ID" "$bin" || codesign --force --sign - "$bin"
     fi
   done < <(find "$APP_DIR/Contents/Resources/ollama-bin" -type f -print0)
@@ -108,7 +108,7 @@ GIT_SHA="$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown
 codesign "${SIGN_OPTS[@]}" --entitlements "$ENTITLEMENTS" --sign "$CODESIGN_ID" "$APP_DIR" \
   || codesign --force --entitlements "$ENTITLEMENTS" --sign - "$APP_DIR"
 codesign --verify --deep --strict "$APP_DIR"
-codesign -dv "$APP_DIR" 2>&1 | grep -E "^Authority=" | head -1
+codesign -dv "$APP_DIR" 2>&1 | awk '/^Authority=/{print; exit}'
 
 # Release archive, built OUTSIDE the OneDrive-synced repo. ditto (not zip)
 # so the archive carries no __MACOSX junk and preserves the bundle
@@ -128,7 +128,7 @@ if [[ "$NOTARIZE" == "1" ]]; then
   xcrun stapler staple "$APP_DIR"
   rm -f "$ZIP"
   ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$ZIP"
-  spctl --assess --type execute -vv "$APP_DIR" 2>&1 | head -2
+  spctl --assess --type execute -vv "$APP_DIR" 2>&1 | awk 'NR<=2'
 fi
 echo "==> Done: $APP_DIR"
 echo "==> Release zip: $ZIP"
