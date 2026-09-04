@@ -124,7 +124,14 @@ ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$ZIP"
 # (see README "Release").
 if [[ "$NOTARIZE" == "1" ]]; then
   echo "==> Notarising (this takes 1-5 minutes)…"
-  xcrun notarytool submit "$ZIP" --keychain-profile "${NOTARY_PROFILE:-whisperflow-notary}" --wait --timeout 30m
+  # Credentials: either the App Store Connect API key (NOTARY_KEY = path to the .p8,
+  # NOTARY_KEY_ID, NOTARY_ISSUER; the AIOS .env carries them as APP_STORE_CONNECT_*)
+  # or a notarytool keychain profile. The key file never leaves disk; nothing is printed.
+  if [[ -n "${NOTARY_KEY:-}" ]]; then
+    xcrun notarytool submit "$ZIP" --key "$NOTARY_KEY" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER" --wait --timeout 30m
+  else
+    xcrun notarytool submit "$ZIP" --keychain-profile "${NOTARY_PROFILE:-whisperflow-notary}" --wait --timeout 30m
+  fi
   xcrun stapler staple "$APP_DIR"
   rm -f "$ZIP"
   ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$ZIP"
