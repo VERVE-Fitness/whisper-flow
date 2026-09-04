@@ -481,6 +481,7 @@ private func runCLIRecordTest(seconds: Double) -> Int32 {
             let done = await recorder.stop()
             print("folder: \(MeetingStore.directory(for: rec.id).path)")
             print("track A: \(String(format: "%.2f", done?.trackASeconds ?? 0))s   track B: \(String(format: "%.2f", done?.trackBSeconds ?? 0))s")
+            print("track B offset: \(String(format: "%.2f", done?.trackBOffsetSeconds ?? 0))s (added to every track B time before the merge)")
         } catch {
             FileHandle.standardError.write(Data("error: \(error.localizedDescription)\n".utf8))
             exitCode = 1

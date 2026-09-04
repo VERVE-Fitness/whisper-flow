@@ -242,3 +242,68 @@ final class MeetingSummariserTests: XCTestCase {
         XCTAssertTrue(md.contains("## Catch-up\n\nC"))
     }
 }
+
+final class TrackBAlignmentTests: XCTestCase {
+    /// A meeting.json written before trackBOffsetSeconds existed must still
+    /// load, as 0 — which is the alignment those recordings actually had.
+    func testRecordWithoutOffsetDecodesAsZero() throws {
+        let json = """
+        {
+          "attendees" : ["Nathan Hall"],
+          "consent" : { "confirmedAt" : "2026-09-05T00:00:00Z", "wordingVersion" : "consent-v1" },
+          "id" : "2026-09-05-0900-aaaaaaaa",
+          "speakerNames" : {},
+          "startedAt" : "2026-09-05T00:00:00Z",
+          "status" : "recorded",
+          "title" : "Clayton lease",
+          "trackASeconds" : 61.5,
+          "trackBSeconds" : 60.4
+        }
+        """
+        let d = JSONDecoder()
+        d.dateDecodingStrategy = .iso8601
+        let record = try d.decode(MeetingRecord.self, from: Data(json.utf8))
+        XCTAssertEqual(record.trackBOffsetSeconds, 0)
+        XCTAssertEqual(record.trackASeconds, 61.5)
+        XCTAssertEqual(record.id, "2026-09-05-0900-aaaaaaaa")
+    }
+
+    func testOffsetRoundTripsThroughTheStore() throws {
+        MeetingStore.rootOverride = FileManager.default.temporaryDirectory
+            .appendingPathComponent("meetings-offset-\(UUID().uuidString)")
+        defer {
+            if let root = MeetingStore.rootOverride { try? FileManager.default.removeItem(at: root) }
+            MeetingStore.rootOverride = nil
+        }
+        let consent = MeetingConsent(confirmedAt: Date(timeIntervalSince1970: 1_800_000_000), wordingVersion: "consent-v1")
+        let record = MeetingRecord(id: "2026-09-05-1100-cccccccc", startedAt: Date(timeIntervalSince1970: 1_800_000_000),
+                                   endedAt: nil, title: "", attendees: [], consent: consent, status: .recorded,
+                                   failureReason: nil, trackASeconds: 30, trackBSeconds: 28.9,
+                                   trackBOffsetSeconds: 1.07, speakerNames: [:])
+        try MeetingStore.save(record)
+        XCTAssertEqual(try MeetingStore.load(id: record.id).trackBOffsetSeconds, 1.07, accuracy: 1e-9)
+    }
+
+    func testShiftMovesTrackBOnToTrackATimeline() {
+        let b = [TranscriptSegment(speakerId: "S1", start: 0.5, end: 2.0, text: "Can we do Wednesday"),
+                 TranscriptSegment(speakerId: "S2", start: 3.0, end: 4.5, text: "Wednesday is realistic")]
+        let shifted = TranscriptBuilder.shifted(b, by: 1.05)
+        XCTAssertEqual(shifted.map(\.start), [1.55, 4.05])
+        XCTAssertEqual(shifted.map(\.end), [3.05, 5.55])
+        XCTAssertEqual(shifted.map(\.speakerId), ["S1", "S2"])
+        XCTAssertEqual(shifted.map(\.text), b.map(\.text))
+    }
+
+    func testShiftByZeroIsIdentityAndOrdersTheMergeCorrectly() {
+        let a = [TranscriptSegment(speakerId: "owner", start: 0, end: 1.2, text: "Morning"),
+                 TranscriptSegment(speakerId: "owner", start: 2.4, end: 3.0, text: "Wednesday works")]
+        let b = [TranscriptSegment(speakerId: "S1", start: 0.4, end: 1.2, text: "Can we do Wednesday")]
+        XCTAssertEqual(TranscriptBuilder.shifted(a, by: 0), a)
+        // Unshifted, the answer lands before the question was finished.
+        XCTAssertEqual(TranscriptBuilder.merge(a, b).map(\.text),
+                       ["Morning", "Can we do Wednesday", "Wednesday works"])
+        // Shifted by the measured second, the question lands between them.
+        XCTAssertEqual(TranscriptBuilder.merge(a, TranscriptBuilder.shifted(b, by: 1.0)).map(\.start),
+                       [0, 1.4, 2.4])
+    }
+}

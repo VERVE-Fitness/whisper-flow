@@ -16,6 +16,18 @@ final class MeetingRecorder: ObservableObject {
     struct Captures {
         let mic: CaptureHandle?
         let system: CaptureHandle?
+        /// Seconds between the mic stream starting and the system tap
+        /// starting. Measured, not assumed: the settle sleep is one second but
+        /// `AudioCapture.start` and the HAL calls either side of it take their
+        /// own time, and on a Bluetooth mic that can be seconds. Zero when
+        /// there is no system capture.
+        let systemStartOffset: Double
+
+        init(mic: CaptureHandle?, system: CaptureHandle?, systemStartOffset: Double = 0) {
+            self.mic = mic
+            self.system = system
+            self.systemStartOffset = system == nil ? 0 : systemStartOffset
+        }
     }
     typealias CaptureFactory = @MainActor () async throws -> Captures
 
@@ -40,17 +52,25 @@ final class MeetingRecorder: ObservableObject {
     static let liveCaptures: CaptureFactory = {
         let mic = AudioCapture()
         let micStream = try await mic.start(selection: InputDeviceSelection.saved)
+        // Track A's t=0. Measured here rather than assumed, because the tap is
+        // deliberately started later and both WAVs begin at their own zero.
+        let micStartedAt = DispatchTime.now()
         // Starting the tap posts AVAudioEngineConfigurationChange to the mic
         // engine; harmless once the mic is running, destructive while it is
         // still starting. Let it settle first (Task 1 report).
         try? await Task.sleep(nanoseconds: 1_000_000_000)
         var system: CaptureHandle?
+        var offset: Double = 0
         if #available(macOS 14.2, *) {
             let tap = SystemAudioTap()
             do {
                 // SystemAudioTap.start() is synchronous: the HAL calls it
                 // makes return immediately (unlike AVAudioEngine.start()).
                 let s = try tap.start()
+                // Track B's t=0: the tap zero-fills from this moment (Task 1b),
+                // so the gap between the two starts is exactly what track B has
+                // to be shifted by to sit on track A's timeline.
+                offset = Double(DispatchTime.now().uptimeNanoseconds - micStartedAt.uptimeNanoseconds) / 1_000_000_000
                 system = CaptureHandle(stream: s, stop: { tap.stop() })
             } catch {
                 FileHandle.standardError.write(Data("[meeting] system audio unavailable, recording microphone only: \(error.localizedDescription)\n".utf8))
@@ -58,15 +78,18 @@ final class MeetingRecorder: ObservableObject {
         } else {
             FileHandle.standardError.write(Data("[meeting] system audio needs macOS 14.2; recording microphone only\n".utf8))
         }
-        return Captures(mic: CaptureHandle(stream: micStream, stop: { mic.stop() }), system: system)
+        return Captures(mic: CaptureHandle(stream: micStream, stop: { mic.stop() }),
+                        system: system,
+                        systemStartOffset: offset)
     }
 
     func start(title: String, attendees: [String], consent: MeetingConsent) async throws -> MeetingRecord {
         guard !isRecording else { throw MeetingError.alreadyRecording }
         let now = Date()
-        let rec = MeetingRecord(id: MeetingStore.newMeetingID(at: now), startedAt: now, endedAt: nil,
+        var rec = MeetingRecord(id: MeetingStore.newMeetingID(at: now), startedAt: now, endedAt: nil,
                                 title: title, attendees: attendees, consent: consent, status: .recording,
-                                failureReason: nil, trackASeconds: 0, trackBSeconds: 0, speakerNames: [:])
+                                failureReason: nil, trackASeconds: 0, trackBSeconds: 0,
+                                trackBOffsetSeconds: 0, speakerNames: [:])
         try MeetingStore.save(rec)
         // Both WAVs always exist, even if a capture is missing, so the
         // transcriber never has to special-case an absent file.
@@ -75,6 +98,8 @@ final class MeetingRecorder: ObservableObject {
 
         let caps = try await captureFactory()
         captures = caps
+        rec.trackBOffsetSeconds = caps.systemStartOffset
+        try MeetingStore.save(rec)
         drainTasks = [drain(caps.mic, into: writerA, label: "A"), drain(caps.system, into: writerB, label: "B")]
         startedAt = now
         record = rec
@@ -86,7 +111,7 @@ final class MeetingRecorder: ObservableObject {
                 self.elapsedSeconds = Date().timeIntervalSince(startedAt)
             }
         }
-        FileHandle.standardError.write(Data("[meeting] recording \(rec.id) (system audio: \(caps.system != nil))\n".utf8))
+        FileHandle.standardError.write(Data("[meeting] recording \(rec.id) (system audio: \(caps.system != nil), track B starts \(String(format: "%.2f", rec.trackBOffsetSeconds))s after track A)\n".utf8))
         return rec
     }
 

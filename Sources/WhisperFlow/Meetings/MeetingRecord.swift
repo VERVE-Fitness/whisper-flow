@@ -23,8 +23,51 @@ struct MeetingRecord: Codable, Equatable {
     var failureReason: String?
     var trackASeconds: Double
     var trackBSeconds: Double
-    /// Diariser speaker id ("speaker_0", …) -> display name after naming/rename.
+    /// Seconds between track A's first sample and track B's first sample. The
+    /// microphone is started first and the system tap a second later (starting
+    /// the tap posts a configuration change to a still-starting mic engine), so
+    /// both files begin at their own t=0 about a second apart. The transcriber
+    /// adds this to every track-B time before merging, which is what puts the
+    /// far side on the same timeline as your own voice.
+    var trackBOffsetSeconds: Double = 0
+    /// Diariser speaker id ("S1", "S2", …) -> display name after naming/rename.
     var speakerNames: [String: String]
+
+    /// Hand-written so a `meeting.json` recorded before `trackBOffsetSeconds`
+    /// existed still loads (as 0, which is what those recordings assumed).
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        startedAt = try c.decode(Date.self, forKey: .startedAt)
+        endedAt = try c.decodeIfPresent(Date.self, forKey: .endedAt)
+        title = try c.decode(String.self, forKey: .title)
+        attendees = try c.decode([String].self, forKey: .attendees)
+        consent = try c.decode(MeetingConsent.self, forKey: .consent)
+        status = try c.decode(MeetingStatus.self, forKey: .status)
+        failureReason = try c.decodeIfPresent(String.self, forKey: .failureReason)
+        trackASeconds = try c.decode(Double.self, forKey: .trackASeconds)
+        trackBSeconds = try c.decode(Double.self, forKey: .trackBSeconds)
+        trackBOffsetSeconds = try c.decodeIfPresent(Double.self, forKey: .trackBOffsetSeconds) ?? 0
+        speakerNames = try c.decode([String: String].self, forKey: .speakerNames)
+    }
+
+    init(id: String, startedAt: Date, endedAt: Date?, title: String, attendees: [String],
+         consent: MeetingConsent, status: MeetingStatus, failureReason: String?,
+         trackASeconds: Double, trackBSeconds: Double, trackBOffsetSeconds: Double = 0,
+         speakerNames: [String: String]) {
+        self.id = id
+        self.startedAt = startedAt
+        self.endedAt = endedAt
+        self.title = title
+        self.attendees = attendees
+        self.consent = consent
+        self.status = status
+        self.failureReason = failureReason
+        self.trackASeconds = trackASeconds
+        self.trackBSeconds = trackBSeconds
+        self.trackBOffsetSeconds = trackBOffsetSeconds
+        self.speakerNames = speakerNames
+    }
 }
 
 /// One folder per meeting under Application Support. Everything week 1

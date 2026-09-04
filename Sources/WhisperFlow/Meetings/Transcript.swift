@@ -101,6 +101,21 @@ enum TranscriptBuilder {
         return 0
     }
 
+    /// Moves segments on to another track's clock. The two tracks of a meeting
+    /// each start at their own t=0 and the system tap is started about a second
+    /// after the microphone, so track B is shifted forward by the offset the
+    /// recorder measured before the two are merged. Without this the far side
+    /// reads about a second early and answers appear before the questions.
+    static func shifted(_ segments: [TranscriptSegment], by seconds: Double) -> [TranscriptSegment] {
+        guard seconds != 0 else { return segments }
+        return segments.map {
+            TranscriptSegment(speakerId: $0.speakerId,
+                              start: $0.start + seconds,
+                              end: $0.end + seconds,
+                              text: $0.text)
+        }
+    }
+
     static func merge(_ a: [TranscriptSegment], _ b: [TranscriptSegment]) -> [TranscriptSegment] {
         (a + b).sorted { $0.start < $1.start }
     }

@@ -46,7 +46,11 @@ final class MeetingTranscriber {
                     } else {
                         bSegments = TranscriptBuilder.assign(words: words, to: spans)
                     }
-                    FileHandle.standardError.write(Data("[meeting] track B: \(words.count) words, \(spans.count) speaker spans \(Set(spans.map(\.speakerId)).sorted()) -> \(bSegments.count) segments\n".utf8))
+                    // Track B's clock starts later than track A's (the tap is
+                    // started after the mic settles). Put it on track A's
+                    // timeline before anything is merged.
+                    bSegments = TranscriptBuilder.shifted(bSegments, by: record.trackBOffsetSeconds)
+                    FileHandle.standardError.write(Data("[meeting] track B: \(words.count) words, \(spans.count) speaker spans \(Set(spans.map(\.speakerId)).sorted()) -> \(bSegments.count) segments, shifted +\(String(format: "%.2f", record.trackBOffsetSeconds))s\n".utf8))
                 }
             }
 
