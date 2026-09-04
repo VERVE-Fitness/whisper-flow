@@ -4,7 +4,7 @@ import PackageDescription
 let package = Package(
     name: "WhisperFlow",
     platforms: [
-        .macOS(.v15)
+        .macOS(.v14)
     ],
     dependencies: [
         .package(url: "https://github.com/FluidInference/FluidAudio", exact: "0.15.4")

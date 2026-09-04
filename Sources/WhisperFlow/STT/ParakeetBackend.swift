@@ -19,10 +19,31 @@ final class ParakeetBackend: TranscriptionBackend, @unchecked Sendable {
     private var onPartial: (@Sendable (TranscriptionPartial) -> Void)?
 
     func prepare() async throws {
+        try await prepare(onProgress: nil)
+    }
+
+    /// `onProgress` receives a short human-readable status ("Downloading
+    /// speech model 37%", "Compiling speech model…") so the menu bar can
+    /// show what a first launch is actually doing during the ~600MB download
+    /// and the Core ML compile that follows it -- on an M1 that's a couple of
+    /// minutes of otherwise-silent "Loading…".
+    func prepare(onProgress: (@Sendable (String) -> Void)?) async throws {
         guard !isPrepared else { return }
         // Downloads (~600MB, one-time, cached under ~/.cache/fluidaudio thereafter)
         // then loads the v3 multilingual Parakeet TDT models.
-        let models = try await AsrModels.downloadAndLoad(version: .v3)
+        let models = try await AsrModels.downloadAndLoad(version: .v3) { progress in
+            guard let onProgress else { return }
+            switch progress.phase {
+            case .listing:
+                onProgress("Preparing speech model download…")
+            case .downloading(let done, let total):
+                let pct = Int((progress.fractionCompleted * 100).rounded())
+                onProgress("Downloading speech model \(pct)% (\(done)/\(total) files)")
+            case .compiling(let name):
+                onProgress("Compiling speech model (\(name))…")
+            }
+        }
+        onProgress?("Loading speech model…")
         self.asrModels = models
 
         let manager = AsrManager(config: .default)

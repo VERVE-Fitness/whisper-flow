@@ -6,7 +6,7 @@ import Foundation
 /// service -- on EmbeddedOllama's dedicated port.
 struct OllamaCleanup: CleanupBackend {
     let name = "ollama"
-    let model = "llama3.2:3b"
+    let model = EmbeddedOllama.model
     private let baseURL = EmbeddedOllama.baseURL
     private let requestTimeout: TimeInterval = 10
 

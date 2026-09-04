@@ -12,6 +12,10 @@ final class WhisperBackend: TranscriptionBackend {
         throw TranscriptionError.notImplemented(name)
     }
 
+    func prepare(onProgress: (@Sendable (String) -> Void)?) async throws {
+        throw TranscriptionError.notImplemented(name)
+    }
+
     func startStream(onPartial: @escaping @Sendable (TranscriptionPartial) -> Void) async throws {
         throw TranscriptionError.notImplemented(name)
     }

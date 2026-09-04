@@ -50,6 +50,17 @@ if [[ -n "$OLLAMA_RUNTIME_DIR" && -f "$OLLAMA_RUNTIME_DIR/ollama" ]]; then
   cp -R "$OLLAMA_RUNTIME_DIR/." "$APP_DIR/Contents/Resources/ollama-bin/"
   chmod +x "$APP_DIR/Contents/Resources/ollama-bin/ollama"
   find "$APP_DIR/Contents/Resources/ollama-bin" -type f -perm -u+x -exec chmod +x {} \;
+  # Homebrew's ollama ships lib/ollama/mlx_metal_v3/libmlxc.dylib as a
+  # relative symlink to /opt/homebrew/opt/mlx-c -- outside the bundle, so it
+  # is dangling on every other Mac and makes `codesign --verify --deep
+  # --strict` fail with a bare "No such file or directory" that names the
+  # .app, not the symlink. Inference runs through llama-server regardless,
+  # so drop the MLX runtime and any other dangling links before signing.
+  rm -rf "$APP_DIR/Contents/Resources/ollama-bin/lib/ollama/mlx_metal_v3"
+  while IFS= read -r -d '' dangling; do
+    echo "==> removing dangling symlink $dangling"
+    rm -f "$dangling"
+  done < <(find "$APP_DIR/Contents/Resources/ollama-bin" -type l ! -exec test -e {} \; -print0)
 else
   echo "==> WARNING: no ollama runtime found (checked \$OLLAMA_BIN and PATH) -- shipping without embedded Ollama; cleanup will fall back to Foundation Models or passthrough" >&2
 fi
@@ -68,5 +79,25 @@ if [[ -d "$APP_DIR/Contents/Resources/ollama-bin" ]]; then
   done < <(find "$APP_DIR/Contents/Resources/ollama-bin" -type f -perm -u+x -print0)
 fi
 codesign --force --sign "$CODESIGN_ID" "$APP_DIR" || codesign --force --sign - "$APP_DIR"
+codesign --verify --deep --strict "$APP_DIR"
 
+# Stamp the git commit into the bundle so the menu bar can show exactly which
+# build a colleague is running (the release tag stopped matching contents
+# once assets were rebuilt in place).
+GIT_SHA="$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+/usr/libexec/PlistBuddy -c "Add :WFGitCommit string $GIT_SHA" "$APP_DIR/Contents/Info.plist" 2>/dev/null \
+  || /usr/libexec/PlistBuddy -c "Set :WFGitCommit $GIT_SHA" "$APP_DIR/Contents/Info.plist"
+# PlistBuddy edits the sealed Info.plist, so seal again.
+codesign --force --sign "$CODESIGN_ID" "$APP_DIR" || codesign --force --sign - "$APP_DIR"
+codesign --verify --deep --strict "$APP_DIR"
+
+# Release archive, built OUTSIDE the OneDrive-synced repo. ditto (not zip)
+# so the archive carries no __MACOSX junk and preserves the bundle
+# structure Gatekeeper expects.
+ZIP="$SCRATCH/WhisperFlow.zip"
+rm -f "$ZIP"
+ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$ZIP"
 echo "==> Done: $APP_DIR"
+echo "==> Release zip: $ZIP"
+echo "    version $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_DIR/Contents/Info.plist") commit $GIT_SHA"
+shasum -a 256 "$ZIP"

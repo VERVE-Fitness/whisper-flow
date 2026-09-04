@@ -2,8 +2,8 @@ import SwiftUI
 import AppKit
 
 /// Content of the MenuBarExtra dropdown: status line, current mode,
-/// "Show Transcript Window", Accessibility permission status (+ Grant…
-/// action), and Quit.
+/// microphone picker, "Show Transcript Window", Accessibility permission
+/// status (+ Grant… action), and Quit.
 struct MenuBarContent: View {
     @EnvironmentObject var state: AppState
     @ObservedObject var accessibility: AccessibilityPermission
@@ -14,10 +14,39 @@ struct MenuBarContent: View {
             Text(statusLine)
             Text("cleanup: \(state.cleanupBackendName)")
                 .foregroundStyle(.secondary)
+            if state.llmStatus != .ready && state.llmStatus != .notStarted {
+                Text("language model: \(state.llmStatus.label)")
+                    .foregroundStyle(.secondary)
+            }
+            Text("Whisper Flow \(AppState.versionLabel)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
         .padding(.vertical, 2)
+        .onAppear { state.refreshInputDevices() }
 
         Divider()
+
+        // Microphone picker. Default is the built-in mic even when AirPods
+        // are connected -- see InputDeviceSelection for the reasoning; the
+        // "System default" entry is the opt-out for people who genuinely
+        // want the headset mic (clamshell Macs, noisy rooms).
+        Menu("Microphone: \(state.activeMicrophoneName)") {
+            micChoice(label: "Built-in Mac microphone (recommended)",
+                      selection: .builtIn,
+                      isSelected: state.inputSelection == .builtIn)
+            micChoice(label: "System default (follows AirPods / headsets)",
+                      selection: .systemDefault,
+                      isSelected: state.inputSelection == .systemDefault)
+            if !state.inputDevices.isEmpty {
+                Divider()
+                ForEach(state.inputDevices) { device in
+                    micChoice(label: device.name + (device.isBluetooth ? "  (Bluetooth)" : ""),
+                              selection: .device(uid: device.uid),
+                              isSelected: state.inputSelection == .device(uid: device.uid))
+                }
+            }
+        }
 
         Button("Show Transcript Window") {
             openTranscriptWindow()
@@ -62,6 +91,19 @@ struct MenuBarContent: View {
             NSApplication.shared.terminate(nil)
         }
         .keyboardShortcut("q", modifiers: [.command])
+    }
+
+    @ViewBuilder
+    private func micChoice(label: String, selection: InputDeviceSelection, isSelected: Bool) -> some View {
+        Button {
+            state.setInputSelection(selection)
+        } label: {
+            if isSelected {
+                Label(label, systemImage: "checkmark")
+            } else {
+                Text(label)
+            }
+        }
     }
 
     private var statusLine: String {

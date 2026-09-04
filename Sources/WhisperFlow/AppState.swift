@@ -8,7 +8,11 @@ import os
 @MainActor
 final class AppState: ObservableObject {
     enum Phase: Equatable {
-        case loadingModels
+        /// Speech model download / compile / load in progress. The payload is
+        /// a human-readable status ("Downloading speech model 37%") so a
+        /// first launch on a slow M1 doesn't sit on an opaque "Loading…" for
+        /// two minutes.
+        case loadingModels(String)
         case idle
         case recording
         case cleaning
@@ -17,7 +21,7 @@ final class AppState: ObservableObject {
 
         var label: String {
             switch self {
-            case .loadingModels: return "Loading Parakeet models…"
+            case .loadingModels(let status): return status
             case .idle: return "Ready"
             case .recording: return "Recording…"
             case .cleaning: return "Cleaning up…"
@@ -35,13 +39,18 @@ final class AppState: ObservableObject {
         case window = "window"
     }
 
-    @Published var phase: Phase = .loadingModels
+    @Published var phase: Phase = .loadingModels("Loading speech model…")
     @Published var rawTranscript: String = ""
     @Published var cleanedTranscript: String = ""
     @Published var cleanupBackendName: String = "…"
+    @Published var llmStatus: EmbeddedOllama.Status = .notStarted
     @Published var lastSttMs: Int?
     @Published var lastCleanupMs: Int?
     @Published var launchAtLogin: Bool = SMAppService.mainApp.status == .enabled
+    /// Which microphone to record from (see InputDeviceSelection for why the
+    /// default is the built-in mic, not the system default).
+    @Published var inputSelection: InputDeviceSelection = InputDeviceSelection.saved
+    @Published var inputDevices: [AudioInputDevice] = []
 
     let accessibility = AccessibilityPermission()
 
@@ -51,6 +60,18 @@ final class AppState: ObservableObject {
     private let hotkeys = HotkeyManager()
     private let pill = StatusPillController()
 
+    /// Engine bring-up for the current dictation. Awaited by stopRecording
+    /// before it tears the capture down, so a stop that lands while a
+    /// Bluetooth mic is still negotiating (1-3 s) waits for the engine to
+    /// exist instead of leaving it to start AFTER we've "stopped" it --
+    /// which is one way to get a pill stuck on "Listening…" forever.
+    private var captureStartTask: Task<AsyncStream<[Float]>, Error>?
+    /// Streaming-session bring-up (SlidingWindowAsrManager load + start).
+    /// Also awaited by stopRecording: on a slow machine, releasing the key
+    /// before this finished used to make finishStream() throw "backend not
+    /// prepared" and lose the dictation, while the late-arriving session
+    /// leaked with its model references.
+    private var streamStartTask: Task<Void, Error>?
     /// Drains the capture stream, feeding each chunk to the streaming backend
     /// while also accumulating the raw samples so stopRecording can run the
     /// silence/short-clip guards and the batch re-check against the
@@ -81,6 +102,22 @@ final class AppState: ObservableObject {
     var canRecord: Bool { phase == .idle || phase == .done }
 
     private var didLaunch = false
+
+    /// "v2026.9.4 (a1b2c3d)" -- what the menu bar shows so a colleague can
+    /// tell you which build they're running.
+    static var versionLabel: String {
+        let info = Bundle.main.infoDictionary ?? [:]
+        let version = info["CFBundleShortVersionString"] as? String ?? "dev"
+        let sha = info["WFGitCommit"] as? String
+        return "v\(version)" + (sha.map { " (\($0))" } ?? "")
+    }
+
+    /// Name of the microphone the current selection resolves to right now.
+    var activeMicrophoneName: String {
+        let (device, follows) = AudioDevices.resolve(inputSelection)
+        guard let device else { return "no microphone found" }
+        return follows ? "\(device.name) (system default)" : device.name
+    }
 
     // MARK: - Silence / short-clip / confidence gates
     //
@@ -137,6 +174,7 @@ final class AppState: ObservableObject {
             }
 
         accessibility.checkAndPromptIfNeeded()
+        refreshInputDevices()
 
         pill.onTapStop = { [weak self] in
             guard let self, self.currentMode != .window else { return }
@@ -163,7 +201,12 @@ final class AppState: ObservableObject {
             let cleanup = await router.resolveBackend()
             self.cleanupBackendName = cleanup.name
             do {
-                try await backend.prepare()
+                try await backend.prepare { [weak self] status in
+                    Task { @MainActor in
+                        guard let self, case .loadingModels = self.phase else { return }
+                        self.phase = .loadingModels(status)
+                    }
+                }
                 self.phase = .idle
             } catch {
                 self.phase = .error("model load failed: \(error.localizedDescription)")
@@ -171,8 +214,34 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// Called by EmbeddedOllama as the local LLM comes up / pulls its model.
+    func llmStatusChanged(_ status: EmbeddedOllama.Status) {
+        llmStatus = status
+        if status == .ready {
+            Task {
+                let cleanup = await router.resolveBackend()
+                self.cleanupBackendName = cleanup.name
+            }
+        }
+    }
+
     private func installHotkeys() {
         hotkeys.install()
+    }
+
+    // MARK: - Microphone selection
+
+    func refreshInputDevices() {
+        inputDevices = AudioDevices.allInputDevices().sorted { a, b in
+            if a.isBuiltIn != b.isBuiltIn { return a.isBuiltIn }
+            return a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
+        }
+    }
+
+    func setInputSelection(_ selection: InputDeviceSelection) {
+        inputSelection = selection
+        InputDeviceSelection.saved = selection
+        os_log("input device selection changed: %{public}@", String(describing: selection))
     }
 
     // MARK: - Window button entry point (M1 behaviour: unchanged)
@@ -201,6 +270,17 @@ final class AppState: ObservableObject {
             pill.show(.listening(partial: ""))
         }
 
+        // Recording from this instant, BEFORE the engine is up: a key release
+        // that lands during Bluetooth negotiation must be honoured as a stop
+        // (stopRecording awaits captureStartTask), not ignored because
+        // `isRecording` was still false.
+        phase = .recording
+        let selection = inputSelection
+        let startTask = Task { [capture] in
+            try await capture.start(selection: selection)
+        }
+        captureStartTask = startTask
+
         Task {
             // Start capture BEFORE awaiting startStream: the capture
             // AsyncStream is unbounded-buffered, so any chunks produced while
@@ -209,18 +289,21 @@ final class AppState: ObservableObject {
             // lost, which used to clip the front of short utterances.
             let stream: AsyncStream<[Float]>
             do {
-                stream = try capture.start()
+                stream = try await startTask.value
             } catch {
-                phase = .error(error.localizedDescription)
-                if mode != .window {
-                    pill.hide()
-                    hotkeys.reset()
+                // Only report if nobody has already moved us on (a stop that
+                // raced the failure will surface its own outcome).
+                if phase == .recording {
+                    phase = .error(error.localizedDescription)
+                    if mode != .window {
+                        pill.hide()
+                        hotkeys.reset()
+                    }
                 }
                 return
             }
-            phase = .recording
 
-            do {
+            let streamTask = Task { [backend] in
                 try await backend.startStream { [weak self] partial in
                     Task { @MainActor in
                         guard let self else { return }
@@ -230,20 +313,28 @@ final class AppState: ObservableObject {
                         }
                     }
                 }
-                feedTask = Task { [backend] in
-                    var captured: [Float] = []
-                    for await chunk in stream {
-                        captured.append(contentsOf: chunk)
-                        try? await backend.feed(samples: chunk)
+                await MainActor.run {
+                    self.feedTask = Task { [backend] in
+                        var captured: [Float] = []
+                        for await chunk in stream {
+                            captured.append(contentsOf: chunk)
+                            try? await backend.feed(samples: chunk)
+                        }
+                        return captured
                     }
-                    return captured
                 }
+            }
+            streamStartTask = streamTask
+            do {
+                try await streamTask.value
             } catch {
-                phase = .error(error.localizedDescription)
-                capture.stop()
-                if mode != .window {
-                    pill.hide()
-                    hotkeys.reset()
+                if phase == .recording {
+                    phase = .error(error.localizedDescription)
+                    capture.stop()
+                    if mode != .window {
+                        pill.hide()
+                        hotkeys.reset()
+                    }
                 }
             }
         }
@@ -254,9 +345,13 @@ final class AppState: ObservableObject {
     private func cancelDictation() {
         guard isRecording else { return }
         phase = .idle
-        capture.stop()
         pill.hide()
         Task {
+            _ = try? await captureStartTask?.value
+            captureStartTask = nil
+            capture.stop()
+            _ = try? await streamStartTask?.value
+            streamStartTask = nil
             _ = await feedTask?.value
             feedTask = nil
             _ = try? await backend.finishStream()
@@ -279,8 +374,6 @@ final class AppState: ObservableObject {
         phase = .cleaning
         let mode = currentMode
         let sttStart = recordStart ?? Date()
-        let audioSeconds = capture.capturedSeconds
-        capture.stop()
 
         if mode != .window {
             pill.update(.cleaning)
@@ -288,6 +381,17 @@ final class AppState: ObservableObject {
 
         Task {
             defer { isStopping = false }
+            // Let the engine finish coming up (or fail) before tearing it
+            // down; see captureStartTask's doc comment.
+            _ = try? await captureStartTask?.value
+            captureStartTask = nil
+            let audioSeconds = capture.capturedSeconds
+            let deviceName = capture.activeDevice?.name ?? "?"
+            capture.stop()
+            // And let the streaming session exist before we finish it; see
+            // streamStartTask's doc comment.
+            _ = try? await streamStartTask?.value
+            streamStartTask = nil
             let captured = await feedTask?.value ?? []
             feedTask = nil
             do {
@@ -299,7 +403,7 @@ final class AppState: ObservableObject {
 
                 let rms = Self.rms(of: captured)
                 if rms < Self.silenceRmsThreshold || captured.count < Self.minimumSamplesForTranscription {
-                    FileHandle.standardError.write(Data("[stt] discarding near-silent/too-short capture (rms=\(rms), samples=\(captured.count))\n".utf8))
+                    FileHandle.standardError.write(Data("[stt] discarding near-silent/too-short capture (rms=\(rms), samples=\(captured.count), device=\(deviceName))\n".utf8))
                     rawTranscript = ""
                     cleanedTranscript = ""
                     phase = .done

@@ -23,6 +23,24 @@ enum WhisperFlowMain {
             let exitCode = runCLIStreamingSimulation(path: args[idx + 1])
             exit(exitCode)
         }
+        if args.contains("--list-input-devices") {
+            exit(runCLIListInputDevices())
+        }
+        if let idx = args.firstIndex(of: "--capture-test") {
+            guard idx + 1 < args.count, let seconds = Double(args[idx + 1]) else {
+                FileHandle.standardError.write(Data("error: --capture-test requires a duration in seconds\n".utf8))
+                exit(2)
+            }
+            var selection = InputDeviceSelection.saved
+            if let i = args.firstIndex(of: "--input"), i + 1 < args.count {
+                switch args[i + 1] {
+                case "builtin": selection = .builtIn
+                case "default": selection = .systemDefault
+                default: selection = .device(uid: args[i + 1])
+                }
+            }
+            exit(runCLICaptureTest(seconds: seconds, selection: selection, transcribe: !args.contains("--no-stt")))
+        }
         WhisperFlowApp.main()
     }
 }
@@ -38,7 +56,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // stop it in applicationWillTerminate below, so WhisperFlow never
         // depends on some separately-registered background service for
         // dictation cleanup.
-        EmbeddedOllama.start()
+        EmbeddedOllama.start { [weak self] status in
+            self?.state?.llmStatusChanged(status)
+        }
         state?.onLaunch()
     }
 
@@ -91,7 +111,7 @@ struct WhisperFlowApp: App {
 // MARK: - Headless CLI test mode
 
 private func runCLITranscription(path: String, rawOnly: Bool) -> Int32 {
-    let semaphore = DispatchSemaphore(value: 0)
+    var finished = false
     var exitCode: Int32 = 0
 
     Task {
@@ -136,10 +156,12 @@ private func runCLITranscription(path: String, rawOnly: Bool) -> Int32 {
             FileHandle.standardError.write(Data("error: \(error.localizedDescription)\n".utf8))
             exitCode = 1
         }
-        semaphore.signal()
+        finished = true
     }
 
-    semaphore.wait()
+    while !finished {
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+    }
     return exitCode
 }
 
@@ -198,5 +220,79 @@ private func runCLIStreamingSimulation(path: String) -> Int32 {
     }
 
     semaphore.wait()
+    return exitCode
+}
+
+// MARK: - Microphone diagnostics (CLI)
+
+private func runCLIListInputDevices() -> Int32 {
+    let def = AudioDevices.defaultInputDevice()
+    let builtIn = AudioDevices.builtInMicrophone()
+    print("saved selection: \(InputDeviceSelection.saved)")
+    print("system default:  \(def?.name ?? "none") [\(def?.uid ?? "-")]")
+    print("built-in mic:    \(builtIn?.name ?? "none") [\(builtIn?.uid ?? "-")]")
+    print("all input devices:")
+    for d in AudioDevices.allInputDevices() {
+        let kind = d.isBuiltIn ? "built-in" : d.isBluetooth ? "bluetooth" : "other"
+        print("  - \(d.name)  [\(d.uid)]  \(kind)")
+    }
+    return 0
+}
+
+/// Records for `seconds` from the resolved device through the SAME
+/// AudioCapture path a live dictation uses, prints how many buffers arrived
+/// and the RMS, then (optionally) batch-transcribes what it heard. Exists to
+/// verify device pinning and mid-recording device changes without a human
+/// holding a key: switch the system default input while this runs and the
+/// buffer count must keep climbing.
+private func runCLICaptureTest(seconds: Double, selection: InputDeviceSelection, transcribe: Bool) -> Int32 {
+    // Not a semaphore: AudioCapture's stall watchdog is a main-run-loop
+    // Timer, and blocking the main thread here would silence it -- the CLI
+    // must exercise the same recovery path the app does.
+    var finished = false
+    var exitCode: Int32 = 0
+
+    Task {
+        let capture = AudioCapture()
+        do {
+            let t0 = Date()
+            let stream = try await capture.start(selection: selection)
+            print("capture started in \(String(format: "%.0f", Date().timeIntervalSince(t0) * 1000)) ms on \"\(capture.activeDevice?.name ?? "?")\"")
+            let collector = Task { () -> [Float] in
+                var all: [Float] = []
+                for await chunk in stream { all.append(contentsOf: chunk) }
+                return all
+            }
+            let ticker = Task {
+                var last = 0
+                while !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    let n = capture.buffersDelivered
+                    print("  t+\(String(format: "%.0f", Date().timeIntervalSince(t0)))s  buffers=\(n) (+\(n - last))  audio=\(String(format: "%.2f", capture.capturedSeconds))s  device=\"\(capture.activeDevice?.name ?? "?")\"")
+                    last = n
+                }
+            }
+            try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            ticker.cancel()
+            capture.stop()
+            let samples = await collector.value
+            let rms = samples.isEmpty ? 0 : (samples.reduce(Float(0)) { $0 + $1 * $1 } / Float(samples.count)).squareRoot()
+            print("captured \(samples.count) samples (\(String(format: "%.2f", Double(samples.count) / AudioCapture.targetSampleRate))s), \(capture.buffersDelivered) buffers, rms=\(rms)")
+            if transcribe, samples.count > 4_800 {
+                let backend = ParakeetBackend()
+                try await backend.prepare()
+                let (text, confidence) = try await backend.transcribeFileWithConfidence(samples: samples)
+                print("TRANSCRIPT (confidence \(String(format: "%.2f", confidence))): \(text)")
+            }
+        } catch {
+            FileHandle.standardError.write(Data("error: \(error.localizedDescription)\n".utf8))
+            exitCode = 1
+        }
+        finished = true
+    }
+
+    while !finished {
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+    }
     return exitCode
 }

@@ -43,6 +43,9 @@ protocol TranscriptionBackend: AnyObject {
     /// Load (and if needed download) models. Idempotent.
     func prepare() async throws
 
+    /// Same as `prepare()`, reporting human-readable progress for the UI.
+    func prepare(onProgress: (@Sendable (String) -> Void)?) async throws
+
     /// Begin a streaming session. `onPartial` is called as hypotheses update.
     func startStream(onPartial: @escaping @Sendable (TranscriptionPartial) -> Void) async throws
 
