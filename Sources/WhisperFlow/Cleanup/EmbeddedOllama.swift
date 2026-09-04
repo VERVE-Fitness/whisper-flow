@@ -253,6 +253,10 @@ enum EmbeddedOllama {
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             throw CleanupError.badResponse("pull HTTP \((response as? HTTPURLResponse)?.statusCode ?? -1)")
         }
+        // Progress arrives per blob (one ~2 GB weights file plus a handful of
+        // KB-sized manifests). Reporting each blob's own fraction made the
+        // menu run 98% -> 4% -> 100% at the end; aggregate across blobs.
+        var perBlob: [String: (completed: Double, total: Double)] = [:]
         var lastReported = -1
         for try await line in bytes.lines {
             guard let data = line.data(using: .utf8),
@@ -261,8 +265,11 @@ enum EmbeddedOllama {
                 throw CleanupError.badResponse("pull error: \(err)")
             }
             if let total = obj["total"] as? Double, total > 0 {
-                let completed = obj["completed"] as? Double ?? 0
-                let fraction = min(1, max(0, completed / total))
+                let digest = obj["digest"] as? String ?? "?"
+                perBlob[digest] = (obj["completed"] as? Double ?? 0, total)
+                let sumTotal = perBlob.values.reduce(0) { $0 + $1.total }
+                let sumDone = perBlob.values.reduce(0) { $0 + $1.completed }
+                let fraction = min(1, max(0, sumDone / max(sumTotal, 1)))
                 let pct = Int(fraction * 100)
                 if pct != lastReported {
                     lastReported = pct

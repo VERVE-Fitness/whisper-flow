@@ -85,12 +85,19 @@ final class ParakeetBackend: TranscriptionBackend, @unchecked Sendable {
 
     func finishStream() async throws -> String {
         guard let manager = streamingManager else { throw TranscriptionError.notPrepared }
+        let updates = streamUpdatesTask
         let text = try await manager.finish()
-        streamUpdatesTask?.cancel()
-        streamUpdatesTask = nil
+        updates?.cancel()
         await manager.cleanup()
-        streamingManager = nil
-        onPartial = nil
+        // Only clear the session fields if they still refer to THIS session.
+        // A finish that was abandoned by the caller (watchdog, cancel) can
+        // complete after a newer startStream has installed its own manager;
+        // nil-ing that one would silently break the live dictation.
+        if streamingManager === manager {
+            streamingManager = nil
+            streamUpdatesTask = nil
+            onPartial = nil
+        }
         return text
     }
 

@@ -99,6 +99,10 @@ final class AppState: ObservableObject {
     /// write lands, both can pass. This flag is set unconditionally as the
     /// very first statement, before any other work, closing that window.
     private var isStopping = false
+    /// The stop pipeline in flight, so the watchdog can cancel it. Every
+    /// await inside it is followed by a generation check, so an abandoned
+    /// stop can never insert text into whatever app is frontmost later.
+    private var stopTask: Task<Void, Never>?
     /// Identifies the stop in flight so the watchdog below only fires for
     /// the dictation it was armed for.
     private var stopGeneration: UUID?
@@ -115,7 +119,18 @@ final class AppState: ObservableObject {
     private static let releaseTailNanoseconds: UInt64 = 250_000_000
 
     var isRecording: Bool { phase == .recording }
-    var canRecord: Bool { phase == .idle || phase == .done }
+    /// `.error` is deliberately recordable: an error is a message about the
+    /// LAST dictation, not a reason to refuse the next one. (It used to be
+    /// terminal -- one failed capture wedged the hotkeys until relaunch.)
+    /// `isStopping` blocks a new start while the previous stop/cancel is
+    /// still tearing down, so its teardown can't hit the new session.
+    var canRecord: Bool {
+        guard !isStopping else { return false }
+        switch phase {
+        case .idle, .done, .error: return true
+        case .loadingModels, .recording, .cleaning: return false
+        }
+    }
 
     private var didLaunch = false
 
@@ -199,6 +214,9 @@ final class AppState: ObservableObject {
 
         pill.onTapStop = { [weak self] in
             guard let self, self.currentMode != .window else { return }
+            // The hands-free key tap is still armed; without this it would
+            // swallow the user's next keypress as the "finish" key.
+            self.hotkeys.reset()
             self.stopRecording()
         }
 
@@ -307,7 +325,7 @@ final class AppState: ObservableObject {
 
         // Recording from this instant, BEFORE the engine is up: a key release
         // that lands during Bluetooth negotiation must be honoured as a stop
-        // (stopRecording awaits captureStartTask), not ignored because
+        // (stopRecording awaits the bring-up chain), not ignored because
         // `isRecording` was still false.
         phase = .recording
         let selection = inputSelection
@@ -316,60 +334,50 @@ final class AppState: ObservableObject {
         }
         captureStartTask = startTask
 
-        Task {
-            // Start capture BEFORE awaiting startStream: the capture
-            // AsyncStream is unbounded-buffered, so any chunks produced while
-            // startStream is still loading its streaming session accumulate
-            // safely and get drained once feedTask starts — instead of being
-            // lost, which used to clip the front of short utterances.
-            let stream: AsyncStream<[Float]>
-            do {
-                stream = try await startTask.value
-            } catch {
-                // Only report if nobody has already moved us on (a stop that
-                // raced the failure will surface its own outcome).
-                if phase == .recording {
-                    phase = .error(error.localizedDescription)
-                    if mode != .window {
-                        pill.show(.failed(error.localizedDescription))
-                        hotkeys.reset()
+        // One task covers engine bring-up AND streaming-session bring-up, and
+        // it is assigned synchronously here, so stopRecording can always
+        // snapshot it: a stop that lands 100 ms in awaits the whole chain
+        // instead of finding a nil it can't wait on. The capture stream is
+        // unbounded-buffered, so audio arriving while startStream is still
+        // loading accumulates and is drained once feedTask starts.
+        let streamTask = Task { [backend] in
+            let stream = try await startTask.value
+            try await backend.startStream { [weak self] partial in
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.rawTranscript = partial.displayText
+                    if self.currentMode != .window {
+                        self.pill.update(.listening(partial: partial.displayText))
                     }
                 }
-                return
             }
+            await MainActor.run {
+                self.feedTask = Task { [backend] in
+                    var captured: [Float] = []
+                    for await chunk in stream {
+                        captured.append(contentsOf: chunk)
+                        try? await backend.feed(samples: chunk)
+                    }
+                    return captured
+                }
+            }
+        }
+        streamStartTask = streamTask
 
-            let streamTask = Task { [backend] in
-                try await backend.startStream { [weak self] partial in
-                    Task { @MainActor in
-                        guard let self else { return }
-                        self.rawTranscript = partial.displayText
-                        if self.currentMode != .window {
-                            self.pill.update(.listening(partial: partial.displayText))
-                        }
-                    }
-                }
-                await MainActor.run {
-                    self.feedTask = Task { [backend] in
-                        var captured: [Float] = []
-                        for await chunk in stream {
-                            captured.append(contentsOf: chunk)
-                            try? await backend.feed(samples: chunk)
-                        }
-                        return captured
-                    }
-                }
-            }
-            streamStartTask = streamTask
+        Task {
             do {
                 try await streamTask.value
             } catch {
-                if phase == .recording {
-                    phase = .error(error.localizedDescription)
-                    capture.stop()
-                    if mode != .window {
-                        pill.show(.failed(error.localizedDescription))
-                        hotkeys.reset()
-                    }
+                // Only report if nobody has already moved us on (a stop that
+                // raced the failure surfaces its own outcome).
+                guard phase == .recording, streamStartTask == streamTask else { return }
+                phase = .error(error.localizedDescription)
+                capture.stop()
+                captureStartTask = nil
+                streamStartTask = nil
+                if mode != .window {
+                    pill.show(.failed(error.localizedDescription))
+                    hotkeys.reset()
                 }
             }
         }
@@ -378,17 +386,23 @@ final class AppState: ObservableObject {
     /// Escape pressed during a hands-free hotkey dictation: throw the audio
     /// away, insert nothing.
     private func cancelDictation() {
-        guard isRecording else { return }
+        guard isRecording, !isStopping else { return }
+        isStopping = true
         phase = .idle
         pill.hide()
+        // Snapshot and clear the handles synchronously: a re-chord that lands
+        // during teardown starts a fresh session with fresh handles, and this
+        // teardown must only ever touch the old ones.
+        let streamTask = streamStartTask
+        captureStartTask = nil
+        streamStartTask = nil
         Task {
-            _ = try? await captureStartTask?.value
-            captureStartTask = nil
+            defer { isStopping = false }
+            _ = try? await streamTask?.value
             capture.stop()
-            _ = try? await streamStartTask?.value
-            streamStartTask = nil
-            _ = await feedTask?.value
+            let feed = feedTask
             feedTask = nil
+            _ = await feed?.value
             _ = try? await backend.finishStream()
             rawTranscript = ""
             cleanedTranscript = ""
@@ -409,6 +423,11 @@ final class AppState: ObservableObject {
         phase = .cleaning
         let mode = currentMode
         let sttStart = recordStart ?? Date()
+        // Snapshot the handles now; the watchdog or a later dictation may
+        // replace the fields while this pipeline is still awaiting.
+        let streamTask = streamStartTask
+        captureStartTask = nil
+        streamStartTask = nil
 
         if mode != .window {
             pill.update(.cleaning)
@@ -419,7 +438,14 @@ final class AppState: ObservableObject {
         Task { [weak self] in
             try? await Task.sleep(nanoseconds: Self.cleaningWatchdogSeconds * 1_000_000_000)
             guard let self, self.stopGeneration == generation, self.phase == .cleaning else { return }
-            FileHandle.standardError.write(Data("[stop] watchdog: still cleaning after \(Self.cleaningWatchdogSeconds)s; resetting so the next dictation works\n".utf8))
+            FileHandle.standardError.write(Data("[stop] watchdog: still cleaning after \(Self.cleaningWatchdogSeconds)s; abandoning this dictation so the next one works\n".utf8))
+            // Abandon the work, not just the UI: cancel the pipeline, close
+            // the mic, and let the generation guards below drop anything the
+            // wedged task still produces.
+            self.stopTask?.cancel()
+            self.stopTask = nil
+            self.capture.stop()
+            self.feedTask = nil
             self.phase = .error("Cleanup took too long; please try again")
             self.isStopping = false
             if mode != .window {
@@ -428,25 +454,56 @@ final class AppState: ObservableObject {
             }
         }
 
-        Task {
-            defer { isStopping = false }
-            // Let the engine finish coming up (or fail) before tearing it
-            // down; see captureStartTask's doc comment.
-            _ = try? await captureStartTask?.value
-            captureStartTask = nil
+        stopTask = Task {
+            defer {
+                if stopGeneration == generation {
+                    isStopping = false
+                    stopTask = nil
+                }
+            }
+            /// False once the watchdog has abandoned this stop or a newer
+            /// stop has superseded it: nothing after that point may touch
+            /// state or, above all, insert text.
+            @MainActor func current() -> Bool { stopGeneration == generation && !Task.isCancelled }
+
+            // Let the engine and the streaming session finish coming up (or
+            // fail) before tearing them down; see streamStartTask's comment.
+            do {
+                if let streamTask { try await streamTask.value }
+            } catch {
+                guard current() else { return }
+                capture.stop()
+                phase = .error(error.localizedDescription)
+                if mode != .window {
+                    pill.show(.failed(error.localizedDescription))
+                    hotkeys.reset()
+                }
+                return
+            }
+            guard current() else { return }
             try? await Task.sleep(nanoseconds: Self.releaseTailNanoseconds)
+            guard current() else { return }
             let audioSeconds = capture.capturedSeconds
             let deviceName = capture.activeDevice?.name ?? "?"
             capture.stop()
-            // And let the streaming session exist before we finish it; see
-            // streamStartTask's doc comment.
-            _ = try? await streamStartTask?.value
-            streamStartTask = nil
-            let captured = await feedTask?.value ?? []
+            let feed = feedTask
             feedTask = nil
+            guard let feed else {
+                // No streaming session was ever started, so there is nothing
+                // to finish and finishStream() would only throw.
+                phase = .done
+                if mode != .window {
+                    pill.show(.discarded)
+                    hotkeys.reset()
+                }
+                return
+            }
+            let captured = await feed.value
+            guard current() else { return }
             do {
                 let sttT0 = Date()
                 var raw = TextNormalizer.normalizeSentenceSpacing(try await backend.finishStream())
+                guard current() else { return }
                 // stt_ms: time from stop-press to final text (streaming absorbed the rest).
                 let sttMs = Int(Date().timeIntervalSince(sttT0) * 1000)
                 _ = sttStart
@@ -478,6 +535,7 @@ final class AppState: ObservableObject {
                 if audioSeconds < Self.shortClipSecondsThreshold {
                     do {
                         let batch = try await backend.transcribeFileWithConfidence(samples: captured)
+                        guard current() else { return }
                         sttConfidence = Double(batch.confidence)
                         if batch.confidence < Self.minimumBatchConfidence {
                             FileHandle.standardError.write(Data("[stt] discarding low-confidence short clip (confidence=\(batch.confidence), text=\"\(batch.text)\")\n".utf8))
@@ -556,6 +614,7 @@ final class AppState: ObservableObject {
                 }
 
                 let cleanResult = await router.clean(raw, context: capturedFocusContext)
+                guard current() else { return }
                 let cleanedText = TextNormalizer.normalizeSentenceSpacing(cleanResult.text)
                 cleanedTranscript = cleanedText
                 cleanupBackendName = cleanResult.backendName
@@ -598,6 +657,7 @@ final class AppState: ObservableObject {
                                 inputDevice: deviceName,
                                 outcome: loggedOutcome)
             } catch {
+                guard current() else { return }
                 phase = .error(error.localizedDescription)
                 if mode != .window {
                     pill.show(.failed(error.localizedDescription))

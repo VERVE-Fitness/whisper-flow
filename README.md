@@ -1,6 +1,8 @@
 # Whisper Flow
 
-Fully local macOS voice dictation (privacy-first Wispr Flow clone). Menu-bar accessory app: mic → streaming Parakeet transcription (Core ML on the Neural Engine, via [FluidAudio](https://github.com/FluidInference/FluidAudio)) → LLM cleanup on stop → text inserted at the cursor in whatever app has focus. No audio or text ever leaves the machine; the only network access is the one-time Parakeet model download from HuggingFace and calls to a local Ollama server on 127.0.0.1.
+Fully local macOS voice dictation (privacy-first Wispr Flow clone). Menu-bar accessory app: mic → streaming Parakeet transcription (Core ML on the Neural Engine, via [FluidAudio](https://github.com/FluidInference/FluidAudio)) → LLM cleanup on stop → text inserted at the cursor in whatever app has focus. No audio or text ever leaves the machine. Network access: the one-time Parakeet model download from HuggingFace, the one-time `llama3.2:3b` pull through the embedded Ollama, calls to that Ollama on 127.0.0.1, and a request to the GitHub releases API every 6 h to show "Update available" in the menu.
+
+Requires Apple silicon and macOS 14 (Sonoma) or newer.
 
 ## Build
 
@@ -8,59 +10,87 @@ The repo lives on OneDrive, so SwiftPM's scratch dir must stay outside it:
 
 ```sh
 swift build --scratch-path "$HOME/.cache/whisperflow-build"      # debug build
-scripts/make-app.sh                                              # release build + signed WhisperFlow.app
+swift test  --scratch-path "$HOME/.cache/whisperflow-build"      # unit tests
+scripts/make-app.sh                                              # release build + signed WhisperFlow.app + zip
 ```
 
-First run downloads the Parakeet TDT 0.6B v3 Core ML models (~600 MB, cached in `~/.cache/fluidaudio` thereafter).
+`make-app.sh` embeds the Homebrew Ollama runtime (`brew install ollama` first), prunes the dangling MLX symlinks Homebrew ships, signs every nested binary then the bundle, stamps the git commit into `Info.plist` (`WFGitCommit`, shown in the menu bar), verifies the signature, and writes the release archive to `~/.cache/whisperflow-build/WhisperFlow.zip`. It never writes the zip into the repo.
+
+First run downloads the Parakeet TDT 0.6B v3 Core ML models (~600 MB, cached in `~/.cache/fluidaudio` thereafter) and, if `llama3.2:3b` is not already in `~/.ollama/models`, pulls it (~2 GB) through the embedded Ollama. Both show progress in the menu bar; nothing needs Terminal.
+
+## Release
+
+Every release gets its own tag carrying the short commit sha, and the same zip under BOTH asset names (old shared links use `WhisperFlow-release.zip`):
+
+```sh
+SHA=$(git rev-parse --short HEAD); TAG="v$(date +%Y.%m.%d)-$SHA"
+gh release create "$TAG" --title "Whisper Flow $TAG" --notes-file notes.md \
+  "$HOME/.cache/whisperflow-build/WhisperFlow.zip" \
+  "$HOME/.cache/whisperflow-build/WhisperFlow.zip#WhisperFlow-release.zip"
+```
+
+The download page (`flow.vervefitness.ai/whisper`) links to `releases/latest/download/WhisperFlow.zip`, so it never needs editing for a new build. The in-app update check compares the latest tag's sha suffix with `WFGitCommit`, so tags must keep the `-<sha>` suffix and assets must not be rebuilt in place under an old tag.
 
 ## Run
 
 Whisper Flow is a menu-bar accessory app (`LSUIElement`) — it never shows a Dock icon or a window at launch. Look for the mic icon in the menu bar.
 
-- **GUI:** `open WhisperFlow.app`. Use the menu to check status, open the transcript window, grant Accessibility, or quit.
+- **GUI:** `open WhisperFlow.app`. Use the menu to check status, pick a microphone, open the transcript window, grant Accessibility, copy diagnostics, or quit.
 - **Dictation, three ways:**
   - **Push-to-talk:** hold **Right Option**, speak, release to stop. (Left Option is untouched — still safe for special characters.)
-  - **Hands-free toggle:** **⌃⌥Space** to start, press again to stop.
-  - **Window button:** open the transcript window from the menu and use Record/Stop as in M1 — text stays in the window instead of being inserted.
-- **CLI test mode (no mic needed):**
+  - **Hands-free:** **⌘ + Right Option** to start; any key finishes, esc cancels.
+  - **Window button:** open the transcript window from the menu and use Record/Stop — text stays in the window instead of being inserted.
+- **CLI modes (no GUI):**
 
 ```sh
 WhisperFlow.app/Contents/MacOS/WhisperFlow --transcribe-file /path/to/audio.wav [--raw-only]
+WhisperFlow.app/Contents/MacOS/WhisperFlow --simulate-streaming /path/to/audio.wav
+WhisperFlow.app/Contents/MacOS/WhisperFlow --list-input-devices
+WhisperFlow.app/Contents/MacOS/WhisperFlow --capture-test 6 [--input builtin|default|<device uid>] [--no-stt]
 ```
 
-Prints `RAW:`, `CLEANED (<backend>):`, and `TIMING: stt=<ms> cleanup=<ms>`, then exits.
+`--capture-test` records through the same `AudioCapture` path a live dictation uses and prints buffer counts once a second, so you can switch the system input device mid-run (`SwitchAudioSource -t input -s "BlackHole 2ch"`) and watch it keep going.
+
+## Microphone
+
+Whisper Flow records from the **Mac's built-in microphone by default, even when AirPods or another Bluetooth headset are connected**. Opening a Bluetooth mic forces the headset from A2DP down to the Hands-Free Profile: a 1–3 s switch during which the input delivers silence or changes format, narrowband audio that Parakeet transcribes worse, and phone-quality playback for the duration. The engine input is pinned via `kAudioOutputUnitProperty_CurrentDevice` so a headset connecting mid-dictation cannot yank it. The menu's **Microphone** submenu offers "System default (follows AirPods / headsets)" and every input device by name; the choice is stored in `UserDefaults` (`inputDeviceSelection`) by device UID.
+
+If the device configuration still changes under a running capture (`AVAudioEngineConfigurationChange`, or no buffer for 2 s), `AudioCapture` tears the engine down and rebuilds it on the same output stream, up to three times per dictation, logging to the `audio-capture` category of `com.niallwogan.whisperflow` in Console.
 
 ## Permissions (first launch)
 
 1. **Microphone** — standard TCC prompt on first dictation attempt.
-2. **Accessibility** — required for global hotkeys and cursor insertion. Prompted once automatically at launch; if dismissed, grant later via the menu bar's "Grant Accessibility…" item (System Settings → Privacy & Security → Accessibility → enable Whisper Flow). Without it, hotkeys and insertion silently no-op — dictated text is left on the clipboard with a "copied — paste with ⌘V" note instead.
+2. **Accessibility** — required for global hotkeys and cursor insertion. Prompted once automatically at launch; if dismissed, grant later via the menu bar's "Grant Accessibility…" item. Without it, hotkeys and insertion silently no-op — dictated text is left on the clipboard with a "copied — paste with ⌘V" note instead.
+
+The app is signed with an Apple Development certificate, not Developer ID, and is not notarised: on macOS 15+ the first launch is blocked and must be allowed from System Settings → Privacy & Security → "Open Anyway" (Control-click → Open no longer works there). The download page walks through it.
 
 ## Hotkeys and insertion
 
-- **Push-to-talk (Right Option, keyCode 61):** watched via both a global and a local `NSEvent` flagsChanged monitor, so it also fires when Whisper Flow's own UI has focus. Holds shorter than 150 ms are treated as accidental taps and ignored.
-- **Hands-free toggle (⌃⌥Space):** registered as a Carbon system hot key, so it works everywhere regardless of focus.
-- **Insertion:** on stop, the cleaned text is placed on the general pasteboard, a synthetic ⌘V is posted to the system HID event tap, and the previous clipboard contents are restored ~0.3 s later. The app never activates itself, so the target app keeps focus throughout. A floating, non-activating status pill (bottom-center of the screen with the cursor) shows Listening → Cleaning → Inserted for hotkey/toggle dictations; window-button dictations don't show the pill and keep the M1 in-window behaviour.
+- **Push-to-talk (Right Option, keyCode 61):** watched via both a global and a local `NSEvent` flagsChanged monitor, so it also fires when Whisper Flow's own UI has focus. Holds shorter than 150 ms are treated as accidental taps and ignored. The mic stays open 250 ms after release so the last word isn't clipped.
+- **Hands-free (⌘ + Right Option):** a CGEvent tap swallows the finishing key press.
+- **Insertion:** on stop, the cleaned text is placed on the general pasteboard, a synthetic ⌘V is posted to the system HID event tap, and the previous clipboard contents are restored ~0.3 s later. The app never activates itself, so the target app keeps focus throughout. A floating, non-activating status pill shows Listening → Cleaning → Inserted (or "Didn't catch that" / "Didn't work: …").
+- **Watchdog:** if a stop is still in "Cleaning…" after 45 s, the state machine is reset so the next dictation works, and the pill says so.
 
 ## Cleanup backends
 
 `CleanupRouter` picks the first available backend at each dictation:
 
 1. **FoundationModels** — Apple Intelligence on-device model (macOS 26+, only when Apple Intelligence is enabled).
-2. **Ollama** — `llama3.2:3b` at `http://127.0.0.1:11434`, temperature 0, `keep_alive 30m`.
+2. **Ollama** — `llama3.2:3b` on the app-owned server at `http://127.0.0.1:11535`, temperature 0, `keep_alive 30m`. The model is warmed as soon as the server reports ready, and the router waits 25 s instead of 10 s when the model is not resident (`/api/ps`), so a cold first dictation on an 8 GB M1 no longer falls back to raw.
 3. **Passthrough** — returns the raw transcript unchanged.
 
-Guard rails: empty output, output longer than 1.6× the raw text, errors, or a 10 s timeout all fall back to the raw transcript (logged to stderr and the usage log).
+Guard rails: empty output, output longer than 1.6× the raw text, too few content words kept, too many new words, a dropped question mark, errors, or the timeout all fall back to the raw transcript (logged to stderr and the usage log). Deterministic passes (dictionary corrections, self-correction stripping, digit formatting) run on every path. Whole-sentence cue-led replacement ("… by Tuesday. Actually make that Wednesday.") only deletes the previous sentence when the replacement is at least half its length; shorter remainders are word-level swaps left for the LLM.
 
 ## Swapping the STT backend
 
 `STT/TranscriptionBackend.swift` defines the streaming protocol (prepare → startStream → feed → finishStream, plus batch `transcribeFile`). `ParakeetBackend` is the live implementation; `WhisperBackend` is a stub showing where a whisper.cpp/WhisperKit buffer+commit wrapper would conform.
 
-## Telemetry
+## Telemetry and diagnostics
 
 Each dictation appends one JSONL line to `~/Library/Application Support/WhisperFlow/usage.jsonl`:
-`{ts, mode: "ptt"|"toggle"|"window"|"file", audio_seconds, raw_chars, cleaned_chars, stt_ms, cleanup_ms, cleanup_backend}`. Local file only. If a legacy `~/Library/Application Support/Murmur/usage.jsonl` exists from before the app was renamed, its contents are migrated into the new location on first launch.
+`{ts, mode, audio_seconds, raw_chars, cleaned_chars, stt_ms, cleanup_ms, cleanup_backend, raw_text, cleaned_text, input_device, stt_confidence, rms, outcome}`. Local file only. The embedded Ollama logs to `ollama.log` in the same folder. **Copy diagnostics** in the menu puts version, macOS, chip, RAM, permissions, microphone setup, the last eight dictations (no transcript text) and the Ollama log tail on the clipboard.
 
 ## Roadmap
 
-- **M2 (done):** menu-bar-only mode, global hotkeys (push-to-talk + hands-free toggle), system-wide cursor insertion, floating status pill.
-- **M3:** per-app dictionaries, custom vocabulary, richer error surfacing.
+- **Developer ID signing + notarisation** so first launch is one click (needs the Account Holder to create the certificate).
+- **Sparkle-style in-app update** instead of "download again from the page".

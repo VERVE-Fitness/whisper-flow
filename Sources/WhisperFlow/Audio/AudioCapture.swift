@@ -43,52 +43,62 @@ enum AudioCaptureError: Error, LocalizedError {
 ///    the dictation appeared to hang ("Listening…" forever with no words).
 ///    This version rebuilds the tap and restarts the engine on that
 ///    notification, keeping the same output stream.
+///
+/// Threading: the tap closure runs on the real-time audio thread, the
+/// configuration-change notification arrives on a CoreAudio thread, the
+/// stall timer on the main run loop, reconfiguration on a detached task, and
+/// start()/stop() on the main actor. Every field touched by more than one of
+/// those goes through `stateLock`; the tap closure captures its converter
+/// and format as constants so it never reads a field another thread may be
+/// replacing. `generation` ties each engine to the start() that created it,
+/// so a reconfigure that finishes after stop() tears its engine straight
+/// back down instead of leaving a live mic nobody is consuming.
 final class AudioCapture: @unchecked Sendable {
     static let targetSampleRate: Double = 16_000
 
     private var engine = AVAudioEngine()
-    private var converter: AVAudioConverter?
     private var continuation: AsyncStream<[Float]>.Continuation?
-    /// Format the tap is currently installed with; re-read on reconfigure.
+    /// Format the tap is currently installed with (diagnostics only).
     private var inputFormat: AVAudioFormat?
-    private var targetFormat: AVAudioFormat?
-    private(set) var capturedSeconds: Double = 0
+    private var followsSystemDefault = false
+    private var configObserver: NSObjectProtocol?
+    private var stallCheckTimer: Timer?
+
+    private let stateLock = NSLock()
+    // -- everything below is guarded by stateLock --
+    private var _isActive = false
+    private var _generation = 0
+    private var _isReconfiguring = false
+    private var _reconfigureCount = 0
+    private var _stallLogged = false
+    private var _capturedSeconds: Double = 0
+    private var _buffersDelivered = 0
+    private var _lastBufferAt: Date?
+    private var _activeDevice: AudioInputDevice?
+
+    private func locked<T>(_ body: () -> T) -> T {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return body()
+    }
+
+    /// Seconds of 16 kHz audio delivered so far in the current capture.
+    var capturedSeconds: Double { locked { _capturedSeconds } }
+    /// Total buffers delivered across the current capture (diagnostics + the
+    /// `--capture-test` CLI mode).
+    var buffersDelivered: Int { locked { _buffersDelivered } }
     /// The device the current/last capture actually recorded from (for the
     /// menu status line and the usage log).
-    private(set) var activeDevice: AudioInputDevice?
-    private var followsSystemDefault = false
-    private var isActive = false
-    private var configObserver: NSObjectProtocol?
-    private var reconfigureCount = 0
+    var activeDevice: AudioInputDevice? { locked { _activeDevice } }
 
-    /// Diagnostic only (see the tap callback): if the hardware tap ever
-    /// stops delivering buffers mid-recording -- a driver/USB/Bluetooth
-    /// dropout, or macOS throttling a backgrounded app's audio thread -- this
-    /// is the one place that would notice, since everything downstream
-    /// (feedTask, the STT backend) just sees "no more chunks arrived" and has
-    /// no way to distinguish that from a legitimate key release.
-    /// The tap callback runs on AVAudioEngine's real-time audio thread, while
-    /// the stall-check timer reads this from the main thread -- genuinely
-    /// concurrent access, so this needs real synchronization.
-    private let lastBufferLock = NSLock()
-    private var _lastBufferAt: Date?
-    private var lastBufferAt: Date? {
-        get { lastBufferLock.lock(); defer { lastBufferLock.unlock() }; return _lastBufferAt }
-        set { lastBufferLock.lock(); defer { lastBufferLock.unlock() }; _lastBufferAt = newValue }
-    }
-    private var stallCheckTimer: Timer?
-    private var stallLogged = false
     /// How long without a new buffer counts as a stall. Real taps deliver
     /// every ~0.25s (4096 samples @ the input device's native rate); anything
     /// past a couple of seconds of silence from the tap itself (not the audio
     /// content -- silence still delivers buffers, it's buffer DELIVERY that
     /// would stop) means the hardware/driver stopped feeding us, not that the
-    /// user paused speaking. When that happens we now try one engine restart
+    /// user paused speaking. When that happens we try an engine restart
     /// rather than only logging it.
     private static let stallThreshold: TimeInterval = 2.0
-    /// Total buffers delivered across the current capture (diagnostics + the
-    /// `--capture-test` CLI mode).
-    private(set) var buffersDelivered = 0
+    private static let maxReconfigures = 3
 
     /// Start capturing from the device `selection` resolves to. Returns a
     /// stream of 16 kHz mono Float32 chunks.
@@ -99,10 +109,19 @@ final class AudioCapture: @unchecked Sendable {
     /// starves the hands-free key tap (which the system then disables for
     /// unresponsiveness, so the "any key finishes" press is lost).
     func start(selection: InputDeviceSelection = InputDeviceSelection.saved) async throws -> AsyncStream<[Float]> {
-        capturedSeconds = 0
-        buffersDelivered = 0
-        reconfigureCount = 0
-        stallLogged = false
+        // Defensive: a previous capture that was never stopped (or a
+        // reconfigure that raced a stop) must not survive into this one.
+        if locked({ _isActive }) { stop() }
+
+        let generation: Int = locked {
+            _generation += 1
+            _capturedSeconds = 0
+            _buffersDelivered = 0
+            _reconfigureCount = 0
+            _isReconfiguring = false
+            _stallLogged = false
+            return _generation
+        }
 
         let (stream, continuation) = AsyncStream.makeStream(of: [Float].self,
                                                             bufferingPolicy: .unbounded)
@@ -112,37 +131,46 @@ final class AudioCapture: @unchecked Sendable {
             try self.configureAndStart(selection: selection)
         }.value
 
-        isActive = true
-        installConfigurationChangeObserver()
-        startStallCheck()
+        locked {
+            _isActive = true
+            _lastBufferAt = Date()
+        }
+        installConfigurationChangeObserver(generation: generation)
+        startStallCheck(generation: generation)
         return stream
+    }
+
+    private func isCurrent(_ generation: Int) -> Bool {
+        locked { _isActive && _generation == generation }
     }
 
     /// Synchronous engine bring-up; runs off the main actor (see `start`).
     private func configureAndStart(selection: InputDeviceSelection) throws {
         let (device, followsDefault) = AudioDevices.resolve(selection)
         guard let device else { throw AudioCaptureError.noInputDevice }
-        activeDevice = device
+        locked { _activeDevice = device }
         followsSystemDefault = followsDefault
 
         // A fresh engine per capture: after a configuration change or an
         // error the old graph can be left in a state where re-installing a
         // tap traps inside AVFoundation. Engines are cheap.
-        engine = AVAudioEngine()
-        let input = engine.inputNode
+        let newEngine = AVAudioEngine()
+        let input = newEngine.inputNode
         if !followsDefault {
             try Self.pin(device: device, to: input)
         }
-        try installTap(on: input, deviceName: device.name)
+        let format = try installTap(on: input, deviceName: device.name)
 
-        engine.prepare()
+        newEngine.prepare()
         do {
-            try engine.start()
+            try newEngine.start()
         } catch {
             input.removeTap(onBus: 0)
             throw AudioCaptureError.engineStartFailed(error.localizedDescription)
         }
-        captureLog.info("capture started on \"\(device.name, privacy: .public)\" (\(device.isBuiltIn ? "built-in" : device.isBluetooth ? "bluetooth" : "other", privacy: .public), pinned: \(!followsDefault)) at \(self.inputFormat?.sampleRate ?? 0, privacy: .public) Hz / \(self.inputFormat?.channelCount ?? 0, privacy: .public) ch")
+        engine = newEngine
+        inputFormat = format
+        captureLog.info("capture started on \"\(device.name, privacy: .public)\" (\(device.isBuiltIn ? "built-in" : device.isBluetooth ? "bluetooth" : "other", privacy: .public), pinned: \(!followsDefault)) at \(format.sampleRate, privacy: .public) Hz / \(format.channelCount, privacy: .public) ch")
     }
 
     /// Bind the engine's input AudioUnit to one specific device so it stops
@@ -163,7 +191,11 @@ final class AudioCapture: @unchecked Sendable {
         }
     }
 
-    private func installTap(on input: AVAudioInputNode, deviceName: String) throws {
+    /// Installs the tap and returns the input format it was installed with.
+    /// The converter and target format are captured by the tap closure as
+    /// constants -- the real-time thread never reads a field that
+    /// stop()/reconfigure could be replacing.
+    private func installTap(on input: AVAudioInputNode, deviceName: String) throws -> AVAudioFormat {
         let inputFormat = input.outputFormat(forBus: 0)
         // A device mid-transition (Bluetooth profile switch, just-plugged USB
         // mic) can report 0 Hz / 0 channels. Installing a tap with that
@@ -181,12 +213,10 @@ final class AudioCapture: @unchecked Sendable {
               let converter = AVAudioConverter(from: inputFormat, to: targetFormat) else {
             throw AudioCaptureError.converterCreationFailed
         }
-        self.inputFormat = inputFormat
-        self.targetFormat = targetFormat
-        self.converter = converter
+        let continuation = self.continuation
 
         input.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
-            guard let self, let converter = self.converter, let targetFormat = self.targetFormat else { return }
+            guard let self else { return }
             let ratio = Self.targetSampleRate / inputFormat.sampleRate
             let capacity = AVAudioFrameCount((Double(buffer.frameLength) * ratio).rounded(.up) + 32)
             guard let out = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else { return }
@@ -205,16 +235,21 @@ final class AudioCapture: @unchecked Sendable {
             guard status != .error, error == nil, out.frameLength > 0,
                   let channel = out.floatChannelData?[0] else { return }
             let samples = Array(UnsafeBufferPointer(start: channel, count: Int(out.frameLength)))
-            self.capturedSeconds += Double(samples.count) / Self.targetSampleRate
-            self.buffersDelivered += 1
-            self.lastBufferAt = Date()
-            self.continuation?.yield(samples)
+            self.locked {
+                self._capturedSeconds += Double(samples.count) / Self.targetSampleRate
+                self._buffersDelivered += 1
+                self._lastBufferAt = Date()
+            }
+            // Yielding to a finished continuation is a documented no-op, so
+            // a tap that outlives stop() by a callback is harmless.
+            continuation?.yield(samples)
         }
+        return inputFormat
     }
 
     // MARK: - Configuration changes (device switched / format changed)
 
-    private func installConfigurationChangeObserver() {
+    private func installConfigurationChangeObserver(generation: Int) {
         if let configObserver { NotificationCenter.default.removeObserver(configObserver) }
         // queue: nil -- handle on the posting thread. Routing through the
         // main queue would make recovery depend on the main run loop being
@@ -225,44 +260,68 @@ final class AudioCapture: @unchecked Sendable {
             object: engine,
             queue: nil
         ) { [weak self] _ in
-            self?.handleConfigurationChange(reason: "AVAudioEngineConfigurationChange")
+            self?.handleConfigurationChange(reason: "AVAudioEngineConfigurationChange", generation: generation)
         }
     }
 
     /// AVAudioEngine has stopped itself because the input device's
-    /// configuration changed under it. Rebuild the tap against the current
-    /// format and start again, feeding the same continuation. In "system
-    /// default" mode the current device may now be a different one (AirPods
-    /// just took over); in pinned mode it's the same device with a new
-    /// format (or gone entirely, in which case we fall back to the default
-    /// selection rules so the dictation survives).
-    private func handleConfigurationChange(reason: String) {
-        guard isActive else { return }
-        reconfigureCount += 1
-        let attempt = reconfigureCount
-        captureLog.error("input configuration changed mid-recording (\(reason, privacy: .public)); rebuilding capture (attempt \(attempt))")
-        guard attempt <= 3 else {
-            captureLog.error("giving up after \(attempt) reconfigure attempts; stream will end at stop()")
+    /// configuration changed under it (or the stall watchdog saw no buffers).
+    /// Rebuild the tap against the current format and start again, feeding
+    /// the same continuation. In "system default" mode the current device may
+    /// now be a different one (AirPods just took over); in pinned mode it's
+    /// the same device with a new format (or gone entirely, in which case we
+    /// fall back to the default selection rules so the dictation survives).
+    ///
+    /// Re-entrancy: the notification and the stall timer can both fire for
+    /// one event, from different threads. `_isReconfiguring` makes the
+    /// second caller a no-op; the generation check makes a rebuild that
+    /// finishes after stop() undo itself.
+    private func handleConfigurationChange(reason: String, generation: Int) {
+        let attempt: Int? = locked {
+            guard _isActive, _generation == generation, !_isReconfiguring else { return nil }
+            guard _reconfigureCount < Self.maxReconfigures else { return nil }
+            _isReconfiguring = true
+            _reconfigureCount += 1
+            return _reconfigureCount
+        }
+        guard let attempt else {
+            captureLog.error("input configuration change (\(reason, privacy: .public)) ignored: inactive, superseded, already rebuilding, or \(Self.maxReconfigures) attempts used")
             return
         }
+        captureLog.error("input configuration changed mid-recording (\(reason, privacy: .public)); rebuilding capture (attempt \(attempt))")
         let previousUID = activeDevice?.uid
+        let selection: InputDeviceSelection = followsSystemDefault
+            ? .systemDefault
+            : (previousUID.map { .device(uid: $0) } ?? .builtIn)
+
         Task.detached(priority: .userInitiated) { [self] in
+            defer { locked { _isReconfiguring = false } }
             // Tear down the old graph fully; a tap left on a stopped engine
             // after a device change is the state that traps on reinstall.
-            engine.inputNode.removeTap(onBus: 0)
-            engine.stop()
-            // Re-resolve: pinned device may have vanished (AirPods removed
-            // while pinned to them), default may have moved.
-            let selection: InputDeviceSelection = followsSystemDefault
-                ? .systemDefault
-                : (previousUID.map { .device(uid: $0) } ?? .builtIn)
+            let old = engine
+            old.inputNode.removeTap(onBus: 0)
+            old.stop()
+            guard isCurrent(generation) else { return }
             do {
                 try configureAndStart(selection: selection)
-                installConfigurationChangeObserver()
-                lastBufferAt = Date()
-                stallLogged = false
+                // stop() may have run while the engine was coming up. The
+                // new engine is then a zombie with a live mic: kill it.
+                guard isCurrent(generation) else {
+                    engine.inputNode.removeTap(onBus: 0)
+                    engine.stop()
+                    captureLog.info("reconfigure finished after stop(); torn down again")
+                    return
+                }
+                installConfigurationChangeObserver(generation: generation)
+                locked {
+                    _lastBufferAt = Date()
+                    _stallLogged = false
+                }
                 captureLog.info("capture resumed after configuration change on \"\(self.activeDevice?.name ?? "?", privacy: .public)\"")
             } catch {
+                // Let the stall timer try again on its next tick (bounded by
+                // maxReconfigures), instead of latching the watchdog shut.
+                locked { _stallLogged = false }
                 captureLog.error("could not resume capture after configuration change: \(error.localizedDescription, privacy: .public)")
             }
         }
@@ -270,40 +329,45 @@ final class AudioCapture: @unchecked Sendable {
 
     // MARK: - Stall watchdog
 
-    private func startStallCheck() {
+    private func startStallCheck(generation: Int) {
         let startedAt = Date()
-        lastBufferAt = startedAt
         stallCheckTimer?.invalidate()
         let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
-            guard let self, self.isActive else { return }
-            let gap = Date().timeIntervalSince(self.lastBufferAt ?? startedAt)
-            if gap > Self.stallThreshold {
-                let recordedFor = Date().timeIntervalSince(startedAt)
-                if !self.stallLogged {
-                    self.stallLogged = true
-                    captureLog.error("mic tap stalled: no buffer for \(String(format: "%.2f", gap), privacy: .public)s (recording for \(String(format: "%.2f", recordedFor), privacy: .public)s total, device \"\(self.activeDevice?.name ?? "?", privacy: .public)\", engine running: \(self.engine.isRunning)); attempting restart")
-                    // A stall with no configuration-change notification
-                    // still means the engine isn't feeding us. Treat it the
-                    // same way rather than sitting on a dead tap.
-                    self.handleConfigurationChange(reason: "tap stall \(String(format: "%.1f", gap))s")
-                }
+            guard let self else { return }
+            let (gap, shouldAct): (TimeInterval, Bool) = self.locked {
+                guard self._isActive, self._generation == generation else { return (0, false) }
+                let gap = Date().timeIntervalSince(self._lastBufferAt ?? startedAt)
+                guard gap > Self.stallThreshold, !self._stallLogged else { return (gap, false) }
+                self._stallLogged = true
+                return (gap, true)
             }
+            guard shouldAct else { return }
+            let recordedFor = Date().timeIntervalSince(startedAt)
+            captureLog.error("mic tap stalled: no buffer for \(String(format: "%.2f", gap), privacy: .public)s (recording for \(String(format: "%.2f", recordedFor), privacy: .public)s total, device \"\(self.activeDevice?.name ?? "?", privacy: .public)\", engine running: \(self.engine.isRunning)); attempting restart")
+            // A stall with no configuration-change notification still means
+            // the engine isn't feeding us. Treat it the same way rather than
+            // sitting on a dead tap.
+            self.handleConfigurationChange(reason: "tap stall \(String(format: "%.1f", gap))s", generation: generation)
         }
         stallCheckTimer = timer
         RunLoop.main.add(timer, forMode: .common)
     }
 
     func stop() {
-        isActive = false
+        locked {
+            _isActive = false
+            _generation += 1   // invalidates any in-flight reconfigure
+        }
         if let configObserver {
             NotificationCenter.default.removeObserver(configObserver)
             self.configObserver = nil
         }
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
+        // Finish, don't nil: the tap thread may still be inside one last
+        // callback holding this continuation, and yielding to a finished
+        // continuation is a no-op. start() replaces it.
         continuation?.finish()
-        continuation = nil
-        converter = nil
         stallCheckTimer?.invalidate()
         stallCheckTimer = nil
     }
