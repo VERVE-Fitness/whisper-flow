@@ -48,6 +48,13 @@ enum WhisperFlowMain {
             }
             exit(runCLISystemAudioTapTest(seconds: seconds, transcribe: !args.contains("--no-stt")))
         }
+        if let idx = args.firstIndex(of: "--transcribe-meeting") {
+            guard idx + 1 < args.count else {
+                FileHandle.standardError.write(Data("error: --transcribe-meeting requires a meeting id\n".utf8))
+                exit(2)
+            }
+            exit(runCLITranscribeMeeting(id: args[idx + 1]))
+        }
         if let idx = args.firstIndex(of: "--record-test") {
             guard idx + 1 < args.count, let seconds = Double(args[idx + 1]) else {
                 FileHandle.standardError.write(Data("error: --record-test requires a duration in seconds\n".utf8))
@@ -474,6 +481,29 @@ private func runCLIRecordTest(seconds: Double) -> Int32 {
             let done = await recorder.stop()
             print("folder: \(MeetingStore.directory(for: rec.id).path)")
             print("track A: \(String(format: "%.2f", done?.trackASeconds ?? 0))s   track B: \(String(format: "%.2f", done?.trackBSeconds ?? 0))s")
+        } catch {
+            FileHandle.standardError.write(Data("error: \(error.localizedDescription)\n".utf8))
+            exitCode = 1
+        }
+        finished = true
+    }
+    while !finished { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
+    return exitCode
+}
+
+/// Batch-transcribes an already-recorded meeting: Parakeet over both tracks,
+/// the offline diariser over the far side, then prints the Markdown that was
+/// written next to the audio.
+private func runCLITranscribeMeeting(id: String) -> Int32 {
+    var finished = false
+    var exitCode: Int32 = 0
+    Task {
+        do {
+            let transcriber = MeetingTranscriber(backend: ParakeetBackend()) { status in print("  \(status)") }
+            let t0 = Date()
+            let transcript = try await transcriber.transcribe(meetingID: id)
+            print("transcribed in \(String(format: "%.1f", Date().timeIntervalSince(t0)))s: \(transcript.segments.count) segments, speakers: \(Set(transcript.segments.map(\.speakerId)).sorted())")
+            print(try String(contentsOf: MeetingStore.transcriptMarkdownURL(id), encoding: .utf8))
         } catch {
             FileHandle.standardError.write(Data("error: \(error.localizedDescription)\n".utf8))
             exitCode = 1

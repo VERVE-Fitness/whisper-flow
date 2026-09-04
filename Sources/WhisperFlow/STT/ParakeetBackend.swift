@@ -121,6 +121,28 @@ final class ParakeetBackend: TranscriptionBackend, @unchecked Sendable {
         return (result.text, result.confidence)
     }
 
+    /// Long-form batch transcription straight from a WAV on disk (memory-
+    /// mapped and chunked inside FluidAudio, so an hour-long track is fine).
+    /// Returns the text plus per-token timings when the library provides
+    /// them; the meeting transcriber needs the timings to place words against
+    /// the diariser's speaker spans.
+    func transcribeLong(url: URL) async throws -> (text: String, tokens: [(token: String, start: Double, end: Double)]) {
+        guard let manager = batchManager else { throw TranscriptionError.notPrepared }
+        var decoderState = TdtDecoderState.make(decoderLayers: await manager.decoderLayerCount)
+        let result = try await manager.transcribeDiskBacked(url, decoderState: &decoderState)
+        let tokens = (result.tokenTimings ?? []).compactMap { t -> (token: String, start: Double, end: Double)? in
+            guard !t.token.isEmpty, t.token != "<blank>", t.token != "<pad>" else { return nil }
+            // FluidAudio 0.15.6 marks a word boundary with a LEADING SPACE
+            // (" Hi", " N", "at", "han", ","), not the SentencePiece "▁"
+            // that TranscriptBuilder groups on. Normalise here, at the
+            // library boundary, so the transcript grouper keeps one
+            // convention and stays independent of the ASR package.
+            let token = t.token.hasPrefix(" ") ? "\u{2581}" + t.token.dropFirst() : t.token
+            return (token: token, start: t.startTime, end: t.endTime)
+        }
+        return (result.text, tokens)
+    }
+
     // MARK: - Helpers
 
     private static func makeBuffer(from samples: [Float]) -> AVAudioPCMBuffer? {
