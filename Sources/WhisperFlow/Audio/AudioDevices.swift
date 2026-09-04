@@ -1,6 +1,7 @@
 import Foundation
 import CoreAudio
 import AudioToolbox
+import IOKit
 
 /// One capture-capable audio device as CoreAudio reports it.
 struct AudioInputDevice: Equatable, Identifiable {
@@ -106,6 +107,36 @@ enum AudioDevices {
         allInputDevices().first { $0.isBuiltIn }
     }
 
+    /// True when a MacBook's lid is shut (clamshell mode on an external
+    /// display). macOS disables the built-in microphone in that state: it
+    /// still enumerates and still delivers buffers, but every sample is
+    /// exactly zero. Pinning it would make every dictation "Didn't catch
+    /// that", so `.builtIn` falls back to the system default while the lid
+    /// is closed. Read from IOPMrootDomain's AppleClamshellState; absent on
+    /// desktops, which is treated as "open".
+    static func isLidClosed() -> Bool {
+        guard let value = clamshellValue() else { return false }
+        if let b = value as? Bool { return b }
+        if let n = value as? NSNumber { return n.boolValue }
+        return CFGetTypeID(value) == CFBooleanGetTypeID() && CFBooleanGetValue(value as! CFBoolean)
+    }
+
+    /// Diagnostics: what IOKit actually returned for the clamshell key.
+    static func rawClamshellDescription() -> String {
+        guard let value = clamshellValue() else { return "nil" }
+        return "\(value) (\(CFCopyTypeIDDescription(CFGetTypeID(value)) as String? ?? "?"))"
+    }
+
+    private static func clamshellValue() -> CFTypeRef? {
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+        guard service != 0 else { return nil }
+        defer { IOObjectRelease(service) }
+        guard let unmanaged = IORegistryEntryCreateCFProperty(service, "AppleClamshellState" as CFString, kCFAllocatorDefault, 0) else {
+            return nil
+        }
+        return unmanaged.takeRetainedValue()
+    }
+
     /// Resolve a selection to a concrete device, with the fallbacks the
     /// selection's doc comment promises. Returns nil only when the machine
     /// has no input device at all.
@@ -114,7 +145,7 @@ enum AudioDevices {
         case .systemDefault:
             return (defaultInputDevice(), true)
         case .builtIn:
-            if let mic = builtInMicrophone() { return (mic, false) }
+            if let mic = builtInMicrophone(), !isLidClosed() { return (mic, false) }
             return (defaultInputDevice(), true)
         case .device(let uid):
             if let dev = allInputDevices().first(where: { $0.uid == uid }) { return (dev, false) }

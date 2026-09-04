@@ -151,6 +151,9 @@ final class AppState: ObservableObject {
     var activeMicrophoneName: String {
         let (device, follows) = AudioDevices.resolve(inputSelection)
         guard let device else { return "no microphone found" }
+        if follows, inputSelection == .builtIn, AudioDevices.isLidClosed() {
+            return "\(device.name) (lid closed, using system default)"
+        }
         return follows ? "\(device.name) (system default)" : device.name
     }
 

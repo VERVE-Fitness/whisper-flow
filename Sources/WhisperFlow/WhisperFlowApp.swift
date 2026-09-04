@@ -229,6 +229,7 @@ private func runCLIListInputDevices() -> Int32 {
     let def = AudioDevices.defaultInputDevice()
     let builtIn = AudioDevices.builtInMicrophone()
     print("saved selection: \(InputDeviceSelection.saved)")
+    print("lid closed:      \(AudioDevices.isLidClosed()) (raw: \(AudioDevices.rawClamshellDescription()))")
     print("system default:  \(def?.name ?? "none") [\(def?.uid ?? "-")]")
     print("built-in mic:    \(builtIn?.name ?? "none") [\(builtIn?.uid ?? "-")]")
     print("all input devices:")

@@ -5,6 +5,12 @@ import os
 
 private let captureLog = Logger(subsystem: "com.niallwogan.whisperflow", category: "audio-capture")
 
+/// Mirror of the important capture events to stderr, so the `--capture-test`
+/// CLI and a Terminal launch show them without needing Console.app.
+private func captureNote(_ message: String) {
+    FileHandle.standardError.write(Data("[capture] \(message)\n".utf8))
+}
+
 enum AudioCaptureError: Error, LocalizedError {
     case noInputDevice
     case invalidInputFormat(device: String, sampleRate: Double, channels: UInt32)
@@ -70,6 +76,7 @@ final class AudioCapture: @unchecked Sendable {
     private var _generation = 0
     private var _isReconfiguring = false
     private var _reconfigureCount = 0
+    private var _lastReconfigureAt: Date?
     private var _stallLogged = false
     private var _capturedSeconds: Double = 0
     private var _buffersDelivered = 0
@@ -98,7 +105,14 @@ final class AudioCapture: @unchecked Sendable {
     /// user paused speaking. When that happens we try an engine restart
     /// rather than only logging it.
     private static let stallThreshold: TimeInterval = 2.0
+    /// Rebuild budget: at most this many rebuilds per `reconfigureCooldown`
+    /// window. A closed-lid MacBook whose default input changes fires a
+    /// BURST of configuration changes (observed: four in under a second);
+    /// a hard lifetime cap of three was exhausted by the burst and the
+    /// capture stayed dead. With a cooldown, the 1 s stall timer gets to
+    /// try again once the storm has passed.
     private static let maxReconfigures = 3
+    private static let reconfigureCooldown: TimeInterval = 5.0
 
     /// Start capturing from the device `selection` resolves to. Returns a
     /// stream of 16 kHz mono Float32 chunks.
@@ -170,6 +184,7 @@ final class AudioCapture: @unchecked Sendable {
         }
         engine = newEngine
         inputFormat = format
+        captureNote("started on \"\(device.name)\" pinned=\(!followsDefault) \(Int(format.sampleRate)) Hz \(format.channelCount) ch")
         captureLog.info("capture started on \"\(device.name, privacy: .public)\" (\(device.isBuiltIn ? "built-in" : device.isBluetooth ? "bluetooth" : "other", privacy: .public), pinned: \(!followsDefault)) at \(format.sampleRate, privacy: .public) Hz / \(format.channelCount, privacy: .public) ch")
     }
 
@@ -277,18 +292,37 @@ final class AudioCapture: @unchecked Sendable {
     /// second caller a no-op; the generation check makes a rebuild that
     /// finishes after stop() undo itself.
     private func handleConfigurationChange(reason: String, generation: Int) {
+        // A PINNED engine receives AVAudioEngineConfigurationChange when the
+        // system default input changes even though its own device did not,
+        // and it keeps running. Rebuilding on that is worse than useless:
+        // each rebuild loses ~0.3 s of audio and the replacement engine gets
+        // the same notification again (observed: 3 rebuilds per device
+        // switch, then a dead capture). Only a stopped engine needs a
+        // rebuild; a running one is left alone, with the stall watchdog as
+        // the safety net if it turns out to be running but silent.
+        if reason == "AVAudioEngineConfigurationChange", engine.isRunning, isCurrent(generation) {
+            captureNote("configuration change while engine still running; keeping current capture")
+            return
+        }
         let attempt: Int? = locked {
             guard _isActive, _generation == generation, !_isReconfiguring else { return nil }
-            guard _reconfigureCount < Self.maxReconfigures else { return nil }
+            if _reconfigureCount >= Self.maxReconfigures {
+                guard let last = _lastReconfigureAt,
+                      Date().timeIntervalSince(last) > Self.reconfigureCooldown else { return nil }
+                _reconfigureCount = 0
+            }
             _isReconfiguring = true
             _reconfigureCount += 1
+            _lastReconfigureAt = Date()
             return _reconfigureCount
         }
         guard let attempt else {
+            captureNote("configuration change (\(reason)) ignored: inactive, superseded, already rebuilding, or \(Self.maxReconfigures) attempts used in the last \(Int(Self.reconfigureCooldown))s")
             captureLog.error("input configuration change (\(reason, privacy: .public)) ignored: inactive, superseded, already rebuilding, or \(Self.maxReconfigures) attempts used")
             return
         }
         captureLog.error("input configuration changed mid-recording (\(reason, privacy: .public)); rebuilding capture (attempt \(attempt))")
+        captureNote("configuration changed (\(reason)); rebuilding, attempt \(attempt)")
         let previousUID = activeDevice?.uid
         let selection: InputDeviceSelection = followsSystemDefault
             ? .systemDefault
@@ -322,6 +356,7 @@ final class AudioCapture: @unchecked Sendable {
                 // Let the stall timer try again on its next tick (bounded by
                 // maxReconfigures), instead of latching the watchdog shut.
                 locked { _stallLogged = false }
+                captureNote("could not resume: \(error.localizedDescription)")
                 captureLog.error("could not resume capture after configuration change: \(error.localizedDescription, privacy: .public)")
             }
         }
