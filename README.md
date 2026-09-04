@@ -55,7 +55,9 @@ WhisperFlow.app/Contents/MacOS/WhisperFlow --capture-test 6 [--input builtin|def
 
 Whisper Flow records from the **Mac's built-in microphone by default, even when AirPods or another Bluetooth headset are connected**. Opening a Bluetooth mic forces the headset from A2DP down to the Hands-Free Profile: a 1–3 s switch during which the input delivers silence or changes format, narrowband audio that Parakeet transcribes worse, and phone-quality playback for the duration. The engine input is pinned via `kAudioOutputUnitProperty_CurrentDevice` so a headset connecting mid-dictation cannot yank it. The menu's **Microphone** submenu offers "System default (follows AirPods / headsets)" and every input device by name; the choice is stored in `UserDefaults` (`inputDeviceSelection`) by device UID.
 
-If the device configuration still changes under a running capture (`AVAudioEngineConfigurationChange`, or no buffer for 2 s), `AudioCapture` tears the engine down and rebuilds it on the same output stream, up to three times per dictation, logging to the `audio-capture` category of `com.niallwogan.whisperflow` in Console.
+**Lid closed:** macOS switches the built-in mic off in clamshell mode (it still enumerates and still delivers buffers, all exactly zero). `AudioDevices.resolve(.builtIn)` reads `AppleClamshellState` from IOPMrootDomain and falls back to the system default while the lid is shut; the menu says "lid closed, using system default".
+
+If the engine actually stops under a running capture (`AVAudioEngineConfigurationChange` with `isRunning == false`, or no buffer for 2 s), `AudioCapture` tears it down and rebuilds it on the same output stream, at most three times per 5 s window. A pinned engine also receives that notification when the *system default* changes, without stopping; those are ignored (rebuilding on them caused a rebuild storm and a dead capture). Events are logged to the `audio-capture` category of `com.niallwogan.whisperflow` and mirrored to stderr as `[capture] …`.
 
 ## Permissions (first launch)
 
