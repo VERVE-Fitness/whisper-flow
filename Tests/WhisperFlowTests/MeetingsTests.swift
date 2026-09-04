@@ -75,3 +75,19 @@ final class MeetingStoreTests: XCTestCase {
         XCTAssertEqual(MeetingStore.summaryURL(r1.id).lastPathComponent, "summary.md")
     }
 }
+
+final class ConsentGateTests: XCTestCase {
+    func testWordingCarriesTheFourPromises() {
+        let w = ConsentGate.wording(managerName: "Nathan Hall")
+        XCTAssertEqual(ConsentGate.wordingVersion, "consent-v1")
+        XCTAssertTrue(w.body.contains("Tell everyone on the call first"))
+        XCTAssertTrue(w.body.contains("your manager, Nathan Hall, can play it back"))
+        XCTAssertTrue(w.body.contains("deleted after 90 days"))
+        XCTAssertTrue(w.body.contains("delete either at any time"))
+        XCTAssertEqual(w.confirm, "I've told everyone and they're OK with it")
+    }
+
+    func testWordingWithoutManagerNameStillMentionsManager() {
+        XCTAssertTrue(ConsentGate.wording(managerName: nil).body.contains("your manager can play it back"))
+    }
+}
