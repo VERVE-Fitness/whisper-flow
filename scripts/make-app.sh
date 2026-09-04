@@ -66,30 +66,49 @@ else
 fi
 
 echo "==> Codesigning…"
-# Stable identity keeps TCC (Accessibility/Microphone) grants valid across
-# rebuilds. Falls back to ad-hoc when the cert isn't present (other machines).
-CODESIGN_ID="${CODESIGN_ID:-A289D6D61201940E4DA8BC484D7B2935A23558B4}"
+# Identity: prefer the Developer ID Application certificate (Gatekeeper
+# accepts it once notarised, so first launch is one click). Fall back to the
+# Apple Development cert for local builds on a Mac without it, then ad-hoc.
+# NOTE: switching identity changes the code-signing designated requirement,
+# so TCC (Microphone / Accessibility) asks once more after the first
+# Developer ID build.
+DEV_ID_HASH="$(security find-identity -v -p codesigning | grep 'Developer ID Application: VERVE Fitness Equipment Pty Ltd' | head -1 | awk '{print $2}')"
+if [[ -n "${CODESIGN_ID:-}" ]]; then
+  :
+elif [[ -n "$DEV_ID_HASH" ]]; then
+  CODESIGN_ID="$DEV_ID_HASH"; NOTARIZE=1
+else
+  CODESIGN_ID="A289D6D61201940E4DA8BC484D7B2935A23558B4"
+fi
+NOTARIZE="${NOTARIZE:-0}"
+ENTITLEMENTS="$REPO_DIR/Resources/WhisperFlow.entitlements"
+# Hardened runtime + secure timestamp are both required for notarisation.
+# The embedded Ollama/llama binaries are signed the same way (no
+# entitlements: they are plain servers, not mic users).
+SIGN_OPTS=(--force --options runtime --timestamp)
 # Nested executables must be signed before the outer bundle -- codesign on
 # the .app only seals what's already validly signed underneath it. Sign
 # every embedded Mach-O binary individually (ollama, llama-server,
-# llama-quantize), not just the top-level one.
+# llama-quantize, dylibs), not just the top-level one.
 if [[ -d "$APP_DIR/Contents/Resources/ollama-bin" ]]; then
   while IFS= read -r -d '' bin; do
-    codesign --force --sign "$CODESIGN_ID" "$bin" || codesign --force --sign - "$bin"
-  done < <(find "$APP_DIR/Contents/Resources/ollama-bin" -type f -perm -u+x -print0)
+    if file "$bin" | grep -q "Mach-O"; then
+      codesign "${SIGN_OPTS[@]}" --sign "$CODESIGN_ID" "$bin" || codesign --force --sign - "$bin"
+    fi
+  done < <(find "$APP_DIR/Contents/Resources/ollama-bin" -type f -print0)
 fi
-codesign --force --sign "$CODESIGN_ID" "$APP_DIR" || codesign --force --sign - "$APP_DIR"
-codesign --verify --deep --strict "$APP_DIR"
 
-# Stamp the git commit into the bundle so the menu bar can show exactly which
-# build a colleague is running (the release tag stopped matching contents
-# once assets were rebuilt in place).
+# Stamp the git commit into the bundle BEFORE the final seal so the menu bar
+# can show exactly which build a colleague is running (the release tag
+# stopped matching contents once assets were rebuilt in place).
 GIT_SHA="$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 /usr/libexec/PlistBuddy -c "Add :WFGitCommit string $GIT_SHA" "$APP_DIR/Contents/Info.plist" 2>/dev/null \
   || /usr/libexec/PlistBuddy -c "Set :WFGitCommit $GIT_SHA" "$APP_DIR/Contents/Info.plist"
-# PlistBuddy edits the sealed Info.plist, so seal again.
-codesign --force --sign "$CODESIGN_ID" "$APP_DIR" || codesign --force --sign - "$APP_DIR"
+
+codesign "${SIGN_OPTS[@]}" --entitlements "$ENTITLEMENTS" --sign "$CODESIGN_ID" "$APP_DIR" \
+  || codesign --force --entitlements "$ENTITLEMENTS" --sign - "$APP_DIR"
 codesign --verify --deep --strict "$APP_DIR"
+codesign -dv "$APP_DIR" 2>&1 | grep -E "^Authority=" | head -1
 
 # Release archive, built OUTSIDE the OneDrive-synced repo. ditto (not zip)
 # so the archive carries no __MACOSX junk and preserves the bundle
@@ -97,6 +116,20 @@ codesign --verify --deep --strict "$APP_DIR"
 ZIP="$SCRATCH/WhisperFlow.zip"
 rm -f "$ZIP"
 ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$ZIP"
+
+# Notarise when signed with Developer ID: submit the zip, wait, staple the
+# ticket to the .app, then re-zip so the download carries the staple and
+# Gatekeeper passes it offline on first launch. Credentials come from the
+# notarytool keychain profile created with the App Store Connect API key
+# (see README "Release").
+if [[ "$NOTARIZE" == "1" ]]; then
+  echo "==> Notarising (this takes 1-5 minutes)…"
+  xcrun notarytool submit "$ZIP" --keychain-profile "${NOTARY_PROFILE:-whisperflow-notary}" --wait --timeout 30m
+  xcrun stapler staple "$APP_DIR"
+  rm -f "$ZIP"
+  ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$ZIP"
+  spctl --assess --type execute -vv "$APP_DIR" 2>&1 | head -2
+fi
 echo "==> Done: $APP_DIR"
 echo "==> Release zip: $ZIP"
 echo "    version $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_DIR/Contents/Info.plist") commit $GIT_SHA"
