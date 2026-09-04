@@ -179,3 +179,66 @@ final class MeetingRecorderTests: XCTestCase {
         XCTAssertEqual(try MeetingStore.load(id: started.id).status, .recorded)
     }
 }
+
+final class SpeakerNamingTests: XCTestCase {
+    private let t = Transcript(meetingID: "m", segments: [
+        TranscriptSegment(speakerId: "owner", start: 0, end: 1, text: "Morning"),
+        TranscriptSegment(speakerId: "speaker_1", start: 1.5, end: 3, text: "Morning Niall"),
+        TranscriptSegment(speakerId: "speaker_0", start: 3.5, end: 5, text: "Hi both"),
+        TranscriptSegment(speakerId: "speaker_1", start: 5.5, end: 6, text: "So"),
+    ], speakerNames: [:])
+
+    func testNamesByFirstSpeechOrderAndFallsBackToNumbering() {
+        let names = SpeakerNaming.proposeNames(for: t, ownerName: "Niall Wogan", attendees: ["Nathan Hall"])
+        XCTAssertEqual(names["owner"], "Niall Wogan")
+        XCTAssertEqual(names["speaker_1"], "Nathan Hall")   // spoke first among the others
+        XCTAssertEqual(names["speaker_0"], "Speaker 2")     // no attendee left
+    }
+
+    func testProposeNeverOverwritesExistingNames() {
+        var named = t; named.speakerNames = ["speaker_0": "Damian"]
+        let names = SpeakerNaming.proposeNames(for: named, ownerName: "Niall Wogan", attendees: ["Nathan Hall"])
+        XCTAssertEqual(names["speaker_0"], "Damian")
+        XCTAssertEqual(names["speaker_1"], "Nathan Hall")
+    }
+
+    func testRenameAndReassign() {
+        let renamed = SpeakerNaming.renamed(t, speakerId: "speaker_0", to: "Giuseppe Tappi")
+        XCTAssertEqual(renamed.speakerNames["speaker_0"], "Giuseppe Tappi")
+        let reassigned = SpeakerNaming.reassigned(t, segmentIndex: 3, to: "speaker_0")
+        XCTAssertEqual(reassigned.segments[3].speakerId, "speaker_0")
+        XCTAssertEqual(reassigned.segments[1].speakerId, "speaker_1")
+    }
+}
+
+final class MeetingSummariserTests: XCTestCase {
+    func testPromptContainsTranscriptAndAsksForJSON() {
+        let t = Transcript(meetingID: "m", segments: [TranscriptSegment(speakerId: "owner", start: 0, end: 1, text: "Send the Clayton quote Wednesday")],
+                           speakerNames: ["owner": "Niall Wogan"])
+        let p = MeetingSummariser.prompt(for: t, title: "Clayton")
+        XCTAssertTrue(p.contains("Niall Wogan: Send the Clayton quote Wednesday"))
+        XCTAssertTrue(p.contains("\"decisions\""))
+        XCTAssertTrue(p.contains("Return only JSON"))
+    }
+
+    func testParseAcceptsFencedJSON() throws {
+        let text = """
+        ```json
+        {"summary":"Quote timing agreed.","decisions":["Quote goes Wednesday"],"actions":[{"text":"Send Clayton quote","owner":"Nathan Hall","due":"2026-09-09"}],"catch_up":"Nathan sends the Clayton quote Wednesday."}
+        ```
+        """
+        let s = try MeetingSummariser.parse(text)
+        XCTAssertEqual(s.decisions, ["Quote goes Wednesday"])
+        XCTAssertEqual(s.actions.first?.owner, "Nathan Hall")
+        XCTAssertEqual(s.catchUp, "Nathan sends the Clayton quote Wednesday.")
+    }
+
+    func testMarkdownSections() {
+        let s = MeetingSummary(summary: "S", decisions: ["D1"], actions: [MeetingAction(text: "A1", owner: "Niall", due: nil)], catchUp: "C")
+        let md = MeetingSummariser.markdown(s)
+        XCTAssertTrue(md.contains("## Summary\n\nS"))
+        XCTAssertTrue(md.contains("## Decisions\n\n- D1"))
+        XCTAssertTrue(md.contains("- A1 (Niall)"))
+        XCTAssertTrue(md.contains("## Catch-up\n\nC"))
+    }
+}
