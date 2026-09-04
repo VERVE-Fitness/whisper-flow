@@ -48,6 +48,13 @@ enum WhisperFlowMain {
             }
             exit(runCLISystemAudioTapTest(seconds: seconds, transcribe: !args.contains("--no-stt")))
         }
+        if let idx = args.firstIndex(of: "--record-test") {
+            guard idx + 1 < args.count, let seconds = Double(args[idx + 1]) else {
+                FileHandle.standardError.write(Data("error: --record-test requires a duration in seconds\n".utf8))
+                exit(2)
+            }
+            exit(runCLIRecordTest(seconds: seconds))
+        }
         if let idx = args.firstIndex(of: "--dual-test") {
             guard idx + 1 < args.count, let seconds = Double(args[idx + 1]) else {
                 FileHandle.standardError.write(Data("error: --dual-test requires a duration in seconds\n".utf8))
@@ -446,5 +453,33 @@ private func runCLIDualCaptureTest(seconds: Double) -> Int32 {
     while !finished {
         RunLoop.main.run(until: Date().addingTimeInterval(0.05))
     }
+    return exitCode
+}
+
+// MARK: - Meeting recorder harness (CLI)
+
+/// Records a meeting for `seconds` through the real MeetingRecorder (mic +
+/// system tap), then prints the folder and track lengths. Spins the main run
+/// loop like --capture-test so the AudioCapture watchdog timer runs.
+private func runCLIRecordTest(seconds: Double) -> Int32 {
+    var finished = false
+    var exitCode: Int32 = 0
+    Task { @MainActor in
+        let recorder = MeetingRecorder()
+        do {
+            let consent = MeetingConsent(confirmedAt: Date(), wordingVersion: ConsentGate.wordingVersion)
+            let rec = try await recorder.start(title: "CLI record test", attendees: [], consent: consent)
+            print("recording \(rec.id) for \(seconds)s …")
+            try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            let done = await recorder.stop()
+            print("folder: \(MeetingStore.directory(for: rec.id).path)")
+            print("track A: \(String(format: "%.2f", done?.trackASeconds ?? 0))s   track B: \(String(format: "%.2f", done?.trackBSeconds ?? 0))s")
+        } catch {
+            FileHandle.standardError.write(Data("error: \(error.localizedDescription)\n".utf8))
+            exitCode = 1
+        }
+        finished = true
+    }
+    while !finished { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
     return exitCode
 }

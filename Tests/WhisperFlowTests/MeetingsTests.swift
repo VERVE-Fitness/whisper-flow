@@ -151,3 +151,31 @@ final class TranscriptBuilderTests: XCTestCase {
         XCTAssertTrue(md.contains("**[01:05] Nathan Hall:** Can we do Wednesday"))
     }
 }
+
+final class MeetingRecorderTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        MeetingStore.rootOverride = FileManager.default.temporaryDirectory
+            .appendingPathComponent("meetings-rec-\(UUID().uuidString)")
+    }
+    override func tearDown() {
+        if let root = MeetingStore.rootOverride { try? FileManager.default.removeItem(at: root) }
+        MeetingStore.rootOverride = nil
+        super.tearDown()
+    }
+
+    @MainActor
+    func testStartWithoutHardwareCreatesRecordAndStopFinalisesIt() async throws {
+        let recorder = MeetingRecorder(captureFactory: { MeetingRecorder.Captures(mic: nil, system: nil) })
+        let consent = MeetingConsent(confirmedAt: Date(), wordingVersion: ConsentGate.wordingVersion)
+        let started = try await recorder.start(title: "Test", attendees: ["Nathan Hall"], consent: consent)
+        XCTAssertEqual(started.status, .recording)
+        XCTAssertTrue(recorder.isRecording)
+        let stopped = await recorder.stop()
+        XCTAssertEqual(stopped?.status, .recorded)
+        XCTAssertNotNil(stopped?.endedAt)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: MeetingStore.trackAURL(started.id).path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: MeetingStore.trackBURL(started.id).path))
+        XCTAssertEqual(try MeetingStore.load(id: started.id).status, .recorded)
+    }
+}
