@@ -12,12 +12,21 @@ enum PillState: Equatable {
     /// decoder's own confidence on the re-checked batch pass was too low to
     /// trust (see AppState.stopRecording's silence/confidence gates).
     case discarded
+    /// Something went wrong and nothing was typed. Previously the pill just
+    /// vanished on error, which read as "it stalled" -- the reason was only
+    /// in the menu bar dropdown nobody opens.
+    case failed(String)
 
     var isTerminal: Bool {
         switch self {
-        case .inserted, .copiedOnly, .discarded: return true
+        case .inserted, .copiedOnly, .discarded, .failed: return true
         default: return false
         }
+    }
+
+    var isFailure: Bool {
+        if case .failed = self { return true }
+        return false
     }
 }
 
@@ -52,6 +61,11 @@ private struct PillContentView: View {
                 Image(systemName: "questionmark.circle")
                     .foregroundStyle(.secondary)
                 Text("Didn't catch that")
+            case .failed(let why):
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.yellow)
+                Text("Didn't work: \(trailing(why, 70))")
+                    .lineLimit(1)
             }
         }
         .font(.system(size: 12, weight: .medium))
@@ -99,7 +113,7 @@ final class StatusPillController {
                 self?.hide()
             }
             autoHideWorkItem = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: work)
+            DispatchQueue.main.asyncAfter(deadline: .now() + (state.isFailure ? 3.5 : 1.0), execute: work)
         }
     }
 

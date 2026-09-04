@@ -16,7 +16,6 @@ struct CleanupRouter: Sendable {
     private let foundation = FoundationModelsCleanup()
     private let ollama = OllamaCleanup()
     private let passthrough = PassthroughCleanup()
-    private let timeoutSeconds: UInt64 = 10
 
     /// Resolve which backend would be used right now (for UI status display).
     func resolveBackend() async -> any CleanupBackend {
@@ -57,6 +56,7 @@ struct CleanupRouter: Sendable {
         }
 
         do {
+            let timeoutSeconds = await backend.suggestedTimeoutSeconds()
             let cleaned = try await withTimeout(seconds: timeoutSeconds) {
                 try await backend.clean(raw, dictionary: dictionary, context: context)
             }
@@ -217,7 +217,8 @@ struct CleanupRouter: Sendable {
             // suffix word) is unambiguous regardless of context, but a cue
             // with arbitrary trailing content only reads as a correction
             // when there's something in scope for it to replace.
-            if !kept.isEmpty, let remainder = cueLedRemainder(body) {
+            if !kept.isEmpty, let remainder = cueLedRemainder(body),
+               cueLedRemainderReplacesWholeSentence(remainder: remainder, previous: kept[kept.count - 1]) {
                 _ = kept.popLast()
                 kept.append(capitalizeFirstLetter(remainder) + terminator)
                 continue
@@ -230,6 +231,25 @@ struct CleanupRouter: Sendable {
         }
         guard kept != sentences else { return text }
         return kept.joined(separator: " ")
+    }
+
+    /// Whole-sentence cue-led replacement deletes the ENTIRE previous
+    /// sentence, so it must only fire when the remainder is plausibly a
+    /// replacement for that whole sentence -- roughly comparable in length.
+    /// Observed failure (4 Sep 2026, passthrough mode on a Mac without the
+    /// LLM): "Hi Nathan, can you send the Tori functional trainer quote to
+    /// the Clayton gym by Tuesday? Actually make that Wednesday, thanks."
+    /// came out as "Wednesday thanks." -- a two-word swap ("Tuesday" ->
+    /// "Wednesday") was treated as replacing a 17-word sentence. A short
+    /// remainder against a long previous sentence is a word-level
+    /// correction this mechanical pass cannot place safely, so the text is
+    /// left untouched (a visible "actually make that" beats a lost
+    /// sentence). The LLM path, when present, still handles the swap.
+    static func cueLedRemainderReplacesWholeSentence(remainder: String, previous: String) -> Bool {
+        let remainderWords = words(remainder).count
+        let previousWords = words(previous).count
+        guard previousWords > 0 else { return true }
+        return remainderWords * 2 >= previousWords
     }
 
     /// Splits a sentence body (terminator already stripped by stripTerminator)

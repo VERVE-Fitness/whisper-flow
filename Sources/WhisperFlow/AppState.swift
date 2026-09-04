@@ -51,6 +51,8 @@ final class AppState: ObservableObject {
     /// default is the built-in mic, not the system default).
     @Published var inputSelection: InputDeviceSelection = InputDeviceSelection.saved
     @Published var inputDevices: [AudioInputDevice] = []
+    /// Non-nil when GitHub has a newer build than this one (see UpdateCheck).
+    @Published var updateAvailable: UpdateCheck.Result?
 
     let accessibility = AccessibilityPermission()
 
@@ -97,6 +99,20 @@ final class AppState: ObservableObject {
     /// write lands, both can pass. This flag is set unconditionally as the
     /// very first statement, before any other work, closing that window.
     private var isStopping = false
+    /// Identifies the stop in flight so the watchdog below only fires for
+    /// the dictation it was armed for.
+    private var stopGeneration: UUID?
+    /// Hard cap on how long the app may sit in "Cleaning…". finishStream,
+    /// the batch re-check and the LLM all have their own timeouts, but a
+    /// hang anywhere in that chain used to leave the pill up and the state
+    /// machine wedged until the app was force-quit. After this long the UI
+    /// is reset so the next dictation works; the wedged task, if it ever
+    /// completes, is ignored.
+    private static let cleaningWatchdogSeconds: UInt64 = 45
+    /// Keep the mic open this long after the key is released: people let go
+    /// of the key on the last syllable, and the sliding-window decoder
+    /// needs the trailing silence to commit the final word.
+    private static let releaseTailNanoseconds: UInt64 = 250_000_000
 
     var isRecording: Bool { phase == .recording }
     var canRecord: Bool { phase == .idle || phase == .done }
@@ -105,6 +121,10 @@ final class AppState: ObservableObject {
 
     /// "v2026.9.4 (a1b2c3d)" -- what the menu bar shows so a colleague can
     /// tell you which build they're running.
+    static var currentCommit: String? {
+        Bundle.main.infoDictionary?["WFGitCommit"] as? String
+    }
+
     static var versionLabel: String {
         let info = Bundle.main.infoDictionary ?? [:]
         let version = info["CFBundleShortVersionString"] as? String ?? "dev"
@@ -175,6 +195,7 @@ final class AppState: ObservableObject {
 
         accessibility.checkAndPromptIfNeeded()
         refreshInputDevices()
+        startUpdateChecks()
 
         pill.onTapStop = { [weak self] in
             guard let self, self.currentMode != .window else { return }
@@ -212,6 +233,20 @@ final class AppState: ObservableObject {
                 self.phase = .error("model load failed: \(error.localizedDescription)")
             }
         }
+    }
+
+    private func startUpdateChecks() {
+        Task { [weak self] in
+            while !Task.isCancelled {
+                let result = await UpdateCheck.check(currentCommit: Self.currentCommit)
+                await MainActor.run { self?.updateAvailable = result }
+                try? await Task.sleep(nanoseconds: UInt64(UpdateCheck.interval) * 1_000_000_000)
+            }
+        }
+    }
+
+    func copyDiagnostics() {
+        Diagnostics.copyToClipboard(state: self)
     }
 
     /// Called by EmbeddedOllama as the local LLM comes up / pulls its model.
@@ -296,7 +331,7 @@ final class AppState: ObservableObject {
                 if phase == .recording {
                     phase = .error(error.localizedDescription)
                     if mode != .window {
-                        pill.hide()
+                        pill.show(.failed(error.localizedDescription))
                         hotkeys.reset()
                     }
                 }
@@ -332,7 +367,7 @@ final class AppState: ObservableObject {
                     phase = .error(error.localizedDescription)
                     capture.stop()
                     if mode != .window {
-                        pill.hide()
+                        pill.show(.failed(error.localizedDescription))
                         hotkeys.reset()
                     }
                 }
@@ -379,12 +414,27 @@ final class AppState: ObservableObject {
             pill.update(.cleaning)
         }
 
+        let generation = UUID()
+        stopGeneration = generation
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: Self.cleaningWatchdogSeconds * 1_000_000_000)
+            guard let self, self.stopGeneration == generation, self.phase == .cleaning else { return }
+            FileHandle.standardError.write(Data("[stop] watchdog: still cleaning after \(Self.cleaningWatchdogSeconds)s; resetting so the next dictation works\n".utf8))
+            self.phase = .error("Cleanup took too long; please try again")
+            self.isStopping = false
+            if mode != .window {
+                self.pill.show(.failed("took too long, try again"))
+                self.hotkeys.reset()
+            }
+        }
+
         Task {
             defer { isStopping = false }
             // Let the engine finish coming up (or fail) before tearing it
             // down; see captureStartTask's doc comment.
             _ = try? await captureStartTask?.value
             captureStartTask = nil
+            try? await Task.sleep(nanoseconds: Self.releaseTailNanoseconds)
             let audioSeconds = capture.capturedSeconds
             let deviceName = capture.activeDevice?.name ?? "?"
             capture.stop()
@@ -415,7 +465,7 @@ final class AppState: ObservableObject {
                                     rawChars: raw.count, cleanedChars: 0,
                                     sttMs: sttMs, cleanupMs: 0, cleanupBackend: "-",
                                     rawText: raw, cleanedText: "",
-                                    rms: Double(rms), outcome: "discard_silence")
+                                    rms: Double(rms), inputDevice: deviceName, outcome: "discard_silence")
                     return
                 }
 
@@ -443,7 +493,7 @@ final class AppState: ObservableObject {
                                             sttMs: sttMs, cleanupMs: 0, cleanupBackend: "-",
                                             rawText: batch.text, cleanedText: "",
                                             sttConfidence: sttConfidence, rms: Double(rms),
-                                            outcome: "discard_low_confidence")
+                                            inputDevice: deviceName, outcome: "discard_low_confidence")
                             return
                         }
                         // The re-check exists to gate CONFIDENCE, not to
@@ -501,7 +551,7 @@ final class AppState: ObservableObject {
                                     sttMs: sttMs, cleanupMs: 0, cleanupBackend: "snippet",
                                     rawText: raw, cleanedText: snippetText,
                                     sttConfidence: sttConfidence, rms: Double(rms),
-                                    outcome: "snippet")
+                                    inputDevice: deviceName, outcome: "snippet")
                     return
                 }
 
@@ -545,11 +595,12 @@ final class AppState: ObservableObject {
                                 cleanedText: cleanedText,
                                 sttConfidence: sttConfidence,
                                 rms: Double(rms),
+                                inputDevice: deviceName,
                                 outcome: loggedOutcome)
             } catch {
                 phase = .error(error.localizedDescription)
                 if mode != .window {
-                    pill.hide()
+                    pill.show(.failed(error.localizedDescription))
                     hotkeys.reset()
                 }
             }

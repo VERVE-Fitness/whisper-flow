@@ -241,3 +241,24 @@ final class CleanupRouterCorrectionTests: XCTestCase {
         XCTAssertEqual(result, "2 and 40.")
     }
 }
+
+
+final class CueLedReplacementScopeTests: XCTestCase {
+    func testShortSwapDoesNotDeleteLongPreviousSentence() {
+        // Passthrough-mode regression seen 4 Sep 2026: this came out as
+        // "Wednesday thanks." The two-word remainder is a word swap, not a
+        // sentence replacement, so the text must be left alone.
+        let raw = "Hi Nathan, can you send the Tori functional trainer quote to the Clayton gym by Tuesday? Actually make that Wednesday, thanks."
+        XCTAssertEqual(CleanupRouter.stripStandaloneCorrections(raw), raw)
+    }
+
+    func testComparableLengthRemainderStillReplaces() {
+        let raw = "Tune and forty five. No scratch that two and forty."
+        XCTAssertEqual(CleanupRouter.stripStandaloneCorrections(raw), "Two and forty.")
+    }
+
+    func testRatioHelper() {
+        XCTAssertTrue(CleanupRouter.cueLedRemainderReplacesWholeSentence(remainder: "two and forty", previous: "Tune and forty five."))
+        XCTAssertFalse(CleanupRouter.cueLedRemainderReplacesWholeSentence(remainder: "Wednesday thanks", previous: "Hi Nathan, can you send the quote to the Clayton gym by Tuesday?"))
+    }
+}

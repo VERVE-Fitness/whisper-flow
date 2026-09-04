@@ -7,7 +7,7 @@ let package = Package(
         .macOS(.v14)
     ],
     dependencies: [
-        .package(url: "https://github.com/FluidInference/FluidAudio", exact: "0.15.4")
+        .package(url: "https://github.com/FluidInference/FluidAudio", exact: "0.15.6")
     ],
     targets: [
         .executableTarget(

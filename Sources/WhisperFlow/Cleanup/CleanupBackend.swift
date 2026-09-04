@@ -84,6 +84,10 @@ protocol CleanupBackend: Sendable {
     var name: String { get }
     /// Cheap availability probe; must not throw.
     func isAvailable() async -> Bool
+    /// How long CleanupRouter should wait for `clean` before falling back to
+    /// the raw transcript. Backends whose first request after idle is slow
+    /// (Ollama loading a 2GB model from disk on an M1) can ask for more.
+    func suggestedTimeoutSeconds() async -> UInt64
     /// - Parameters:
     ///   - raw: the raw transcript to clean.
     ///   - dictionary: personal-dictionary terms to spell-correct near-misses to.
@@ -99,4 +103,8 @@ extension CleanupBackend {
     func clean(_ raw: String) async throws -> String {
         try await clean(raw, dictionary: [], context: nil)
     }
+}
+
+extension CleanupBackend {
+    func suggestedTimeoutSeconds() async -> UInt64 { 10 }
 }

@@ -25,6 +25,12 @@ struct MenuBarContent: View {
         .padding(.vertical, 2)
         .onAppear { state.refreshInputDevices() }
 
+        if let update = state.updateAvailable {
+            Button("Update available (\(update.tag)) — download…") {
+                NSWorkspace.shared.open(update.downloadPage)
+            }
+        }
+
         Divider()
 
         // Microphone picker. Default is the built-in mic even when AirPods
@@ -50,6 +56,10 @@ struct MenuBarContent: View {
 
         Button("Show Transcript Window") {
             openTranscriptWindow()
+        }
+
+        Button("Copy diagnostics") {
+            state.copyDiagnostics()
         }
 
         Toggle("Start at Login", isOn: Binding(

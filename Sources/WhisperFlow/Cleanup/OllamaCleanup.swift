@@ -8,7 +8,28 @@ struct OllamaCleanup: CleanupBackend {
     let name = "ollama"
     let model = EmbeddedOllama.model
     private let baseURL = EmbeddedOllama.baseURL
-    private let requestTimeout: TimeInterval = 10
+    /// Generous: CleanupRouter's own timeout (see suggestedTimeoutSeconds) is
+    /// what actually bounds the wait; this only stops a dead socket hanging.
+    private let requestTimeout: TimeInterval = 40
+
+    /// 10 s when the model is already resident, 25 s when Ollama has to load
+    /// it first. Measured: a warm llama3.2:3b cleanup is 0.3-4 s on an M4
+    /// Pro; the first request after a 30-minute idle on an 8 GB M1 spends
+    /// most of 10 s just paging the weights in and used to time out into a
+    /// raw (un-punctuated) insert every time.
+    func suggestedTimeoutSeconds() async -> UInt64 {
+        await isModelLoaded() ? 10 : 25
+    }
+
+    private func isModelLoaded() async -> Bool {
+        var req = URLRequest(url: baseURL.appendingPathComponent("api/ps"))
+        req.timeoutInterval = 2
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let models = obj["models"] as? [[String: Any]] else { return false }
+        return models.compactMap { $0["name"] as? String }.contains { $0 == model || $0.hasPrefix(model) }
+    }
 
     func isAvailable() async -> Bool {
         // Server up AND the model present.

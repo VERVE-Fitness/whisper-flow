@@ -17,6 +17,8 @@ enum UsageLog {
         /// diagnosed after the fact instead of guessed at from char counts.
         let raw_text: String
         let cleaned_text: String
+        /// Microphone the dictation was captured from (nil for file mode).
+        let input_device: String?
         /// Optional fields for the silence/short-clip/low-confidence guards.
         /// Swift's synthesized `Encodable` conformance calls
         /// `encodeIfPresent` for `Optional` stored properties, so these are
@@ -66,13 +68,14 @@ enum UsageLog {
                        sttMs: Int, cleanupMs: Int, cleanupBackend: String,
                        rawText: String = "", cleanedText: String = "",
                        sttConfidence: Double? = nil, rms: Double? = nil,
-                       outcome: String = "inserted") {
+                       inputDevice: String? = nil, outcome: String = "inserted") {
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let entry = Entry(ts: iso.string(from: Date()), mode: mode, audio_seconds: audioSeconds,
                           raw_chars: rawChars, cleaned_chars: cleanedChars,
                           stt_ms: sttMs, cleanup_ms: cleanupMs, cleanup_backend: cleanupBackend,
                           raw_text: String(rawText.prefix(200)), cleaned_text: String(cleanedText.prefix(200)),
+                          input_device: inputDevice,
                           stt_confidence: sttConfidence, rms: rms, outcome: outcome)
         do {
             let dir = logURL.deletingLastPathComponent()

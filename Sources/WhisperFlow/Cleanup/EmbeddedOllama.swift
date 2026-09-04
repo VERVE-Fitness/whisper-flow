@@ -109,6 +109,7 @@ enum EmbeddedOllama {
             await MainActor.run { onStatus(.checkingModel) }
             if await hasModel() {
                 await MainActor.run { onStatus(.ready) }
+                await warmUp()
                 return
             }
             FileHandle.standardError.write(Data("[ollama] model \(model) not present; pulling\n".utf8))
@@ -118,6 +119,7 @@ enum EmbeddedOllama {
                 }
                 let present = await hasModel()
                 await MainActor.run { onStatus(present ? .ready : .unavailable("model pull finished but model still missing")) }
+                if present { await warmUp() }
             } catch {
                 FileHandle.standardError.write(Data("[ollama] model pull failed: \(error)\n".utf8))
                 await MainActor.run { onStatus(.unavailable("model download failed")) }
@@ -197,6 +199,24 @@ enum EmbeddedOllama {
             kill(task.processIdentifier, SIGKILL)
         }
         process = nil
+    }
+
+    /// Load the model into memory now (an empty generate with keep_alive)
+    /// so the FIRST dictation of the session isn't the one that pays the
+    /// several-second weights-from-disk cost and trips the cleanup timeout.
+    private static func warmUp() async {
+        var request = URLRequest(url: baseURL.appendingPathComponent("api/generate"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 60
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["model": model, "keep_alive": "30m"])
+        let t0 = Date()
+        if let (_, response) = try? await URLSession.shared.data(for: request),
+           (response as? HTTPURLResponse)?.statusCode == 200 {
+            FileHandle.standardError.write(Data("[ollama] model warmed in \(Int(Date().timeIntervalSince(t0) * 1000)) ms\n".utf8))
+        } else {
+            FileHandle.standardError.write(Data("[ollama] warm-up request failed (non-fatal)\n".utf8))
+        }
     }
 
     private static func isAlreadyListening() async -> Bool {
