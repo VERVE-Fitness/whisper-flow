@@ -262,3 +262,16 @@ final class CueLedReplacementScopeTests: XCTestCase {
         XCTAssertFalse(CleanupRouter.cueLedRemainderReplacesWholeSentence(remainder: "Wednesday thanks", previous: "Hi Nathan, can you send the quote to the Clayton gym by Tuesday?"))
     }
 }
+
+
+final class DroppedQuestionWithCorrectionTests: XCTestCase {
+    func testCorrectionThatRemovesTheQuestionMarkIsNotFlagged() {
+        let raw = "Hi Nathan, can you send the quote to the Clayton gym by Tuesday? Actually make that Wednesday, thanks."
+        let cleaned = "Hi Nathan, can you send the quote to the Clayton gym by Wednesday, thanks."
+        XCTAssertFalse(CleanupRouter.droppedQuestion(raw: raw, cleaned: cleaned))
+    }
+
+    func testPlainDroppedQuestionStillFlagged() {
+        XCTAssertTrue(CleanupRouter.droppedQuestion(raw: "Is Friday realistic?", cleaned: "Yes, Friday is realistic."))
+    }
+}

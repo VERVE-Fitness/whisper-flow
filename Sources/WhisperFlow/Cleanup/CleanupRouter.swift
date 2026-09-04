@@ -607,6 +607,13 @@ struct CleanupRouter: Sendable {
     /// through instead -- exactly the "two hundred and forty. No scratch
     /// that, right? two hundred and forty five." case that motivated it.
     static func droppedQuestion(raw: String, cleaned: String) -> Bool {
+        // A spoken correction legitimately rewrites the sentence that carried
+        // the "?" ("…by Tuesday? Actually make that Wednesday, thanks." ->
+        // "…by Wednesday, thanks."). The retention guard still applies to
+        // such utterances (at its correction-aware threshold), so skipping
+        // this punctuation check for them does not open the answered-
+        // question hole it exists to close.
+        if containsCorrectionCue(raw) { return false }
         let strippedRaw = stripStandaloneCorrections(raw)
         return strippedRaw.contains("?") && !cleaned.contains("?")
     }
