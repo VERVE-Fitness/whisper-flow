@@ -41,6 +41,20 @@ enum WhisperFlowMain {
             }
             exit(runCLICaptureTest(seconds: seconds, selection: selection, transcribe: !args.contains("--no-stt")))
         }
+        if let idx = args.firstIndex(of: "--tap-test") {
+            guard idx + 1 < args.count, let seconds = Double(args[idx + 1]) else {
+                FileHandle.standardError.write(Data("error: --tap-test requires a duration in seconds\n".utf8))
+                exit(2)
+            }
+            exit(runCLISystemAudioTapTest(seconds: seconds, transcribe: !args.contains("--no-stt")))
+        }
+        if let idx = args.firstIndex(of: "--dual-test") {
+            guard idx + 1 < args.count, let seconds = Double(args[idx + 1]) else {
+                FileHandle.standardError.write(Data("error: --dual-test requires a duration in seconds\n".utf8))
+                exit(2)
+            }
+            exit(runCLIDualCaptureTest(seconds: seconds))
+        }
         WhisperFlowApp.main()
     }
 }
@@ -286,6 +300,139 @@ private func runCLICaptureTest(seconds: Double, selection: InputDeviceSelection,
                 print("TRANSCRIPT (confidence \(String(format: "%.2f", confidence))): \(text)")
             }
         } catch {
+            FileHandle.standardError.write(Data("error: \(error.localizedDescription)\n".utf8))
+            exitCode = 1
+        }
+        finished = true
+    }
+
+    while !finished {
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+    }
+    return exitCode
+}
+
+// MARK: - System audio tap diagnostics (CLI)
+
+/// Records `seconds` of the Mac's OUTPUT audio through SystemAudioTap -- the
+/// same path a meeting recording will use for the far side of a call -- prints
+/// buffer counts and RMS, then (optionally) batch-transcribes what it heard.
+/// Play something while it runs (`say -v Karen "..."`, a Teams call, a YouTube
+/// tab): buffer counts climbing with rms ~0 means the tap exists but the
+/// System Audio Recording permission is missing, and the tap says so on stderr.
+private func runCLISystemAudioTapTest(seconds: Double, transcribe: Bool) -> Int32 {
+    guard #available(macOS 14.2, *) else {
+        FileHandle.standardError.write(Data("error: \(SystemAudioTapError.unsupportedOS.localizedDescription)\n".utf8))
+        return 1
+    }
+    // Not a semaphore: keep the main run loop being serviced, exactly as
+    // --capture-test does, so timers and CoreAudio notifications still fire.
+    var finished = false
+    var exitCode: Int32 = 0
+
+    Task {
+        let tap = SystemAudioTap()
+        do {
+            let t0 = Date()
+            let stream = try tap.start()
+            print("system audio tap started in \(String(format: "%.0f", Date().timeIntervalSince(t0) * 1000)) ms, native format \(tap.nativeFormatDescription)")
+            let collector = Task { () -> [Float] in
+                var all: [Float] = []
+                for await chunk in stream { all.append(contentsOf: chunk) }
+                return all
+            }
+            let ticker = Task {
+                var last = 0
+                while !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    let n = tap.buffersDelivered
+                    print("  t+\(String(format: "%.0f", Date().timeIntervalSince(t0)))s  buffers=\(n) (+\(n - last))  audio=\(String(format: "%.2f", tap.capturedSeconds))s")
+                    last = n
+                }
+            }
+            try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            ticker.cancel()
+            tap.stop()
+            let samples = await collector.value
+            let rms = samples.isEmpty ? 0 : (samples.reduce(Float(0)) { $0 + $1 * $1 } / Float(samples.count)).squareRoot()
+            print("captured \(samples.count) samples (\(String(format: "%.2f", Double(samples.count) / SystemAudioTap.targetSampleRate))s), \(tap.buffersDelivered) buffers, rms=\(rms)")
+            if transcribe, samples.count > 4_800 {
+                let backend = ParakeetBackend()
+                try await backend.prepare()
+                let (text, confidence) = try await backend.transcribeFileWithConfidence(samples: samples)
+                print("TRANSCRIPT (confidence \(String(format: "%.2f", confidence))): \(text)")
+            }
+        } catch {
+            tap.stop()
+            FileHandle.standardError.write(Data("error: \(error.localizedDescription)\n".utf8))
+            exitCode = 1
+        }
+        finished = true
+    }
+
+    while !finished {
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+    }
+    return exitCode
+}
+
+/// Runs the microphone (AudioCapture, built-in mic) and the system-audio tap
+/// AT THE SAME TIME for `seconds`, which is the state every meeting recording
+/// will be in: our voice from the mic, the far side from the output tap. Prints
+/// both buffer counts each second and both final RMS values, so a regression
+/// where one path starves the other is visible immediately.
+private func runCLIDualCaptureTest(seconds: Double) -> Int32 {
+    guard #available(macOS 14.2, *) else {
+        FileHandle.standardError.write(Data("error: \(SystemAudioTapError.unsupportedOS.localizedDescription)\n".utf8))
+        return 1
+    }
+    var finished = false
+    var exitCode: Int32 = 0
+
+    Task {
+        let mic = AudioCapture()
+        let tap = SystemAudioTap()
+        do {
+            let t0 = Date()
+            let micStream = try await mic.start(selection: .builtIn)
+            let tapStream = try tap.start()
+            print("mic on \"\(mic.activeDevice?.name ?? "?")\", system audio tap native format \(tap.nativeFormatDescription)")
+            let micCollector = Task { () -> [Float] in
+                var all: [Float] = []
+                for await chunk in micStream { all.append(contentsOf: chunk) }
+                return all
+            }
+            let tapCollector = Task { () -> [Float] in
+                var all: [Float] = []
+                for await chunk in tapStream { all.append(contentsOf: chunk) }
+                return all
+            }
+            let ticker = Task {
+                var lastMic = 0
+                var lastTap = 0
+                while !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    let m = mic.buffersDelivered
+                    let s = tap.buffersDelivered
+                    print("  t+\(String(format: "%.0f", Date().timeIntervalSince(t0)))s  mic=\(m) (+\(m - lastMic))  system=\(s) (+\(s - lastTap))")
+                    lastMic = m
+                    lastTap = s
+                }
+            }
+            try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            ticker.cancel()
+            mic.stop()
+            tap.stop()
+            let micSamples = await micCollector.value
+            let tapSamples = await tapCollector.value
+            func rms(_ s: [Float]) -> Float {
+                s.isEmpty ? 0 : (s.reduce(Float(0)) { $0 + $1 * $1 } / Float(s.count)).squareRoot()
+            }
+            print("mic:    \(micSamples.count) samples (\(String(format: "%.2f", Double(micSamples.count) / AudioCapture.targetSampleRate))s), \(mic.buffersDelivered) buffers, rms=\(rms(micSamples))")
+            print("system: \(tapSamples.count) samples (\(String(format: "%.2f", Double(tapSamples.count) / SystemAudioTap.targetSampleRate))s), \(tap.buffersDelivered) buffers, rms=\(rms(tapSamples))")
+        } catch {
+            mic.stop()
+            tap.stop()
             FileHandle.standardError.write(Data("error: \(error.localizedDescription)\n".utf8))
             exitCode = 1
         }

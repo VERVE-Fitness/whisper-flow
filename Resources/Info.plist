@@ -26,6 +26,8 @@
 	<true/>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>Whisper Flow records the other side of your meetings from the Mac's audio output when you start a meeting recording.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Whisper Flow needs microphone access to transcribe your speech into text.</string>
 </dict>
