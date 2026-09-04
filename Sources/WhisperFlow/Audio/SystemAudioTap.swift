@@ -138,11 +138,23 @@ final class SystemAudioTap: @unchecked Sendable {
     // -- everything below is guarded by stateLock --
     private var _isRunning = false
     private var _capturedSeconds: Double = 0
+    /// Seconds the tap actually delivered, EXCLUDING the zero-fill below.
+    /// The missing-permission check has to use this: a call that opens with
+    /// three seconds of real silence would otherwise be reported as a
+    /// permission failure the moment the gap-fill crossed `silenceWindow`.
+    private var _realAudioSeconds: Double = 0
+    private var _gapSecondsFilled: Double = 0
     private var _buffersDelivered = 0
     private var _nonZeroSamples = 0
     private var _silenceReported = false
     private var _nativeSampleRate: Double = 0
     private var _nativeChannels: UInt32 = 0
+    /// `mach_absolute_time()` at the moment `AudioDeviceStart` succeeded, so
+    /// the first callback's `mHostTime` says how much silence preceded it.
+    private var _startHostTime: UInt64 = 0
+    /// Native-rate frame position the next callback is expected to begin at.
+    /// Negative until the first callback arrives.
+    private var _expectedNextSampleTime: Double = -1
 
     private func locked<T>(_ body: () -> T) -> T {
         stateLock.lock(); defer { stateLock.unlock() }
@@ -154,6 +166,10 @@ final class SystemAudioTap: @unchecked Sendable {
     /// Total buffers delivered across the current capture (diagnostics, and
     /// the `--tap-test` / `--dual-test` CLI modes).
     var buffersDelivered: Int { locked { _buffersDelivered } }
+    /// Seconds of digital silence this class synthesised to stand in for the
+    /// stretches where the Mac played nothing and the HAL therefore called
+    /// nobody. Diagnostics only: `capturedSeconds` already includes it.
+    var gapSecondsFilled: Double { locked { _gapSecondsFilled } }
     /// True once at least one non-zero sample has arrived, i.e. the TCC
     /// permission is really granted and the Mac really is playing something.
     var hasRealAudio: Bool { locked { _nonZeroSamples > 0 } }
@@ -189,9 +205,13 @@ final class SystemAudioTap: @unchecked Sendable {
 
         locked {
             _capturedSeconds = 0
+            _realAudioSeconds = 0
+            _gapSecondsFilled = 0
             _buffersDelivered = 0
             _nonZeroSamples = 0
             _silenceReported = false
+            _startHostTime = 0
+            _expectedNextSampleTime = -1
         }
 
         let description = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
@@ -258,9 +278,10 @@ final class SystemAudioTap: @unchecked Sendable {
 
         var newProcID: AudioDeviceIOProcID?
         let procStatus = AudioDeviceCreateIOProcIDWithBlock(&newProcID, newAggregateID, ioQueue) {
-            [weak self] _, inInputData, _, _, _ in
+            [weak self] _, inInputData, inInputTime, _, _ in
             guard let self else { return }
             self.handle(inputData: inInputData,
+                        inputTime: inInputTime,
                         tapFormat: tapFormat,
                         targetFormat: targetFormat,
                         converter: converter,
@@ -274,6 +295,10 @@ final class SystemAudioTap: @unchecked Sendable {
         }
         ioProcID = newProcID
 
+        // Anchor the gap-fill clock before the first callback can possibly
+        // run: everything the first buffer's mHostTime is ahead of this is
+        // silence the tap will never deliver.
+        locked { _startHostTime = mach_absolute_time() }
         let startStatus = AudioDeviceStart(newAggregateID, newProcID)
         guard startStatus == noErr else {
             AudioDeviceDestroyIOProcID(newAggregateID, newProcID)
@@ -305,13 +330,18 @@ final class SystemAudioTap: @unchecked Sendable {
         }
         ioProcID = nil
         teardownCoreAudio()
+        // A meeting that ends in silence ends with no callbacks either, so
+        // pad the tail out to the moment of stop() before closing the
+        // stream. Without this the far-side WAV is short by however long
+        // nobody spoke at the end, and the two tracks stop lining up.
+        if wasRunning, let fill = tailFill() { continuation?.yield(fill) }
         // Finish, don't nil: the IO queue may still be inside one last
         // callback holding this continuation, and yielding to a finished
         // continuation is a documented no-op. start() replaces it.
         continuation?.finish()
         if wasRunning {
-            let (seconds, buffers) = locked { (_capturedSeconds, _buffersDelivered) }
-            tapNote("tap stopped after \(String(format: "%.2f", seconds))s / \(buffers) buffers")
+            let (seconds, buffers, filled) = locked { (_capturedSeconds, _buffersDelivered, _gapSecondsFilled) }
+            tapNote("tap stopped after \(String(format: "%.2f", seconds))s / \(buffers) buffers (\(String(format: "%.2f", filled))s of that was silence gap-filled)")
         }
     }
 
@@ -337,15 +367,26 @@ final class SystemAudioTap: @unchecked Sendable {
 
     // MARK: - IOProc
 
-    /// One IOProc callback: wrap the tap's buffer list, convert to 16 kHz
-    /// mono, yield. Runs on `ioQueue`.
+    /// One IOProc callback: stand in for whatever silence the HAL skipped,
+    /// then wrap the tap's buffer list, convert to 16 kHz mono and yield.
+    /// Runs on `ioQueue`.
     private func handle(inputData: UnsafePointer<AudioBufferList>,
+                        inputTime: UnsafePointer<AudioTimeStamp>,
                         tapFormat: AVAudioFormat,
                         targetFormat: AVAudioFormat,
                         converter: AVAudioConverter,
                         continuation: AsyncStream<[Float]>.Continuation) {
         guard let input = AVAudioPCMBuffer(pcmFormat: tapFormat, bufferListNoCopy: inputData),
               input.frameLength > 0 else { return }
+
+        // Timeline before audio: the zero-fill has to be yielded BEFORE this
+        // buffer's samples, or the stream's ordering no longer matches the
+        // clock it is being aligned to.
+        if let fill = gapFill(before: inputTime.pointee,
+                              frames: input.frameLength,
+                              nativeRate: tapFormat.sampleRate) {
+            continuation.yield(fill)
+        }
 
         let ratio = Self.targetSampleRate / tapFormat.sampleRate
         let capacity = AVAudioFrameCount((Double(input.frameLength) * ratio).rounded(.up) + 32)
@@ -368,11 +409,13 @@ final class SystemAudioTap: @unchecked Sendable {
         let nonZero = samples.reduce(into: 0) { count, sample in if sample != 0 { count += 1 } }
 
         let reportSilence: Bool = locked {
-            _capturedSeconds += Double(samples.count) / Self.targetSampleRate
+            let seconds = Double(samples.count) / Self.targetSampleRate
+            _capturedSeconds += seconds
+            _realAudioSeconds += seconds
             _buffersDelivered += 1
             _nonZeroSamples += nonZero
             guard !_silenceReported, _nonZeroSamples == 0,
-                  _capturedSeconds >= Self.silenceWindow else { return false }
+                  _realAudioSeconds >= Self.silenceWindow else { return false }
             _silenceReported = true
             return true
         }
@@ -381,6 +424,98 @@ final class SystemAudioTap: @unchecked Sendable {
             tapLog.error("system audio tap delivering pure silence for the first \(Self.silenceWindow, privacy: .public)s; likely missing System Audio Recording permission")
         }
         continuation.yield(samples)
+    }
+
+    // MARK: - Gap filling
+
+    /// `mach_absolute_time()` ticks to seconds. The timebase is fixed for the
+    /// life of the process, so read it once.
+    private static let hostTickSeconds: Double = {
+        var info = mach_timebase_info_data_t()
+        guard mach_timebase_info(&info) == KERN_SUCCESS, info.denom > 0 else { return 0 }
+        return Double(info.numer) / Double(info.denom) / 1_000_000_000
+    }()
+
+    private static func hostSeconds(_ ticks: UInt64) -> Double {
+        Double(ticks) * hostTickSeconds
+    }
+
+    /// The digital silence that belongs in front of this buffer, if any.
+    ///
+    /// The tap delivers NOTHING while the Mac is playing nothing (Task 1:
+    /// ten seconds of wall clock containing four seconds of speech produced
+    /// four seconds of buffers), so simply concatenating the callbacks
+    /// compresses the timeline and every timestamp downstream of it is
+    /// wrong -- including the diariser's, and including the alignment
+    /// between this track and the microphone track recorded alongside it.
+    ///
+    /// The IOProc's own input timestamp carries the true position:
+    /// `mSampleTime` is a frame counter at the tap's native rate, so the
+    /// frames between where the last buffer ended and where this one starts
+    /// are exactly what was skipped. The first callback is anchored against
+    /// the `mach_absolute_time()` recorded in `start()` instead, since there
+    /// is no previous buffer to measure from.
+    ///
+    /// Two guards keep a bogus timestamp from allocating hundreds of MB of
+    /// zeros: a gap of one buffer or less is ignored as ordinary jitter, and
+    /// the fill can never take `capturedSeconds` past the wall-clock time
+    /// that has really elapsed since `start()`.
+    private func gapFill(before timestamp: AudioTimeStamp,
+                         frames: AVAudioFrameCount,
+                         nativeRate: Double) -> [Float]? {
+        guard nativeRate > 0 else { return nil }
+        let sampleTimeValid = timestamp.mFlags.contains(.sampleTimeValid)
+        let hostTimeValid = timestamp.mFlags.contains(.hostTimeValid)
+
+        let fillSamples: Int = locked {
+            var gapSeconds: Double = 0
+            if _expectedNextSampleTime < 0 {
+                // First callback (or a device that reports no sample time at
+                // all): measure from start() with the host clock.
+                if hostTimeValid, _startHostTime > 0, timestamp.mHostTime > _startHostTime {
+                    gapSeconds = Self.hostSeconds(timestamp.mHostTime - _startHostTime)
+                }
+            } else if sampleTimeValid {
+                let skipped = timestamp.mSampleTime - _expectedNextSampleTime
+                if skipped > Double(frames) { gapSeconds = skipped / nativeRate }
+            }
+            if sampleTimeValid {
+                _expectedNextSampleTime = timestamp.mSampleTime + Double(frames)
+            }
+            if hostTimeValid, _startHostTime > 0, timestamp.mHostTime > _startHostTime {
+                let elapsed = Self.hostSeconds(timestamp.mHostTime - _startHostTime)
+                gapSeconds = min(gapSeconds, max(0, elapsed - _capturedSeconds))
+            }
+            guard gapSeconds > 0 else { return 0 }
+            let count = Int((gapSeconds * Self.targetSampleRate).rounded())
+            guard count > 0 else { return 0 }
+            let filled = Double(count) / Self.targetSampleRate
+            _capturedSeconds += filled
+            _gapSecondsFilled += filled
+            return count
+        }
+        guard fillSamples > 0 else { return nil }
+        return [Float](repeating: 0, count: fillSamples)
+    }
+
+    /// The silence between the last buffer and `stop()`. Same reasoning as
+    /// `gapFill`, at the other end of the recording.
+    private func tailFill() -> [Float]? {
+        let now = mach_absolute_time()
+        let fillSamples: Int = locked {
+            guard _startHostTime > 0, now > _startHostTime else { return 0 }
+            let missing = Self.hostSeconds(now - _startHostTime) - _capturedSeconds
+            // 10 ms: below that it is scheduling noise, not silence.
+            guard missing > 0.01 else { return 0 }
+            let count = Int((missing * Self.targetSampleRate).rounded())
+            guard count > 0 else { return 0 }
+            let filled = Double(count) / Self.targetSampleRate
+            _capturedSeconds += filled
+            _gapSecondsFilled += filled
+            return count
+        }
+        guard fillSamples > 0 else { return nil }
+        return [Float](repeating: 0, count: fillSamples)
     }
 
     // MARK: - Property helpers

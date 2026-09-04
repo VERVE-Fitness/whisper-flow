@@ -356,6 +356,10 @@ private func runCLISystemAudioTapTest(seconds: Double, transcribe: Bool) -> Int3
             let samples = await collector.value
             let rms = samples.isEmpty ? 0 : (samples.reduce(Float(0)) { $0 + $1 * $1 } / Float(samples.count)).squareRoot()
             print("captured \(samples.count) samples (\(String(format: "%.2f", Double(samples.count) / SystemAudioTap.targetSampleRate))s), \(tap.buffersDelivered) buffers, rms=\(rms)")
+            // capturedSeconds should now track wall clock, not speech time:
+            // gapSecondsFilled is the synthesised silence that makes up the
+            // difference (see SystemAudioTap.gapFill).
+            print("capturedSeconds=\(String(format: "%.2f", tap.capturedSeconds))s  gapSecondsFilled=\(String(format: "%.2f", tap.gapSecondsFilled))s  wallClock=\(String(format: "%.2f", Date().timeIntervalSince(t0)))s")
             if transcribe, samples.count > 4_800 {
                 let backend = ParakeetBackend()
                 try await backend.prepare()
