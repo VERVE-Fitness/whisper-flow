@@ -91,3 +91,63 @@ final class ConsentGateTests: XCTestCase {
         XCTAssertTrue(ConsentGate.wording(managerName: nil).body.contains("your manager can play it back"))
     }
 }
+
+final class TranscriptBuilderTests: XCTestCase {
+    // Parakeet emits SentencePiece tokens: "▁" marks the start of a word.
+    func testWordsGroupSentencePieceTokens() {
+        let tokens: [(token: String, start: Double, end: Double)] = [
+            ("▁The", 0.10, 0.20), ("▁Tor", 0.25, 0.35), ("i", 0.35, 0.40), ("▁trainer", 0.45, 0.80),
+            (",", 0.80, 0.82), ("▁ships", 0.90, 1.10),
+        ]
+        let words = TranscriptBuilder.words(fromTokens: tokens)
+        XCTAssertEqual(words.map(\.text), ["The", "Tori", "trainer,", "ships"])
+        XCTAssertEqual(words[1].start, 0.25); XCTAssertEqual(words[1].end, 0.40)
+    }
+
+    func testSegmentsSplitOnSilenceGap() {
+        let words = [TimedWord(text: "Hi", start: 0, end: 0.3), TimedWord(text: "Nathan", start: 0.35, end: 0.7),
+                     TimedWord(text: "Next", start: 2.0, end: 2.3), TimedWord(text: "item", start: 2.35, end: 2.6)]
+        let segs = TranscriptBuilder.segments(words: words, speakerId: "owner")
+        XCTAssertEqual(segs.count, 2)
+        XCTAssertEqual(segs[0].text, "Hi Nathan"); XCTAssertEqual(segs[0].start, 0); XCTAssertEqual(segs[0].end, 0.7)
+        XCTAssertEqual(segs[1].text, "Next item"); XCTAssertEqual(segs[1].speakerId, "owner")
+    }
+
+    func testAssignWordsToSpeakerSpansByMidpointAndGroupTurns() {
+        let words = [TimedWord(text: "Yes", start: 0.0, end: 0.3), TimedWord(text: "agreed", start: 0.4, end: 0.9),
+                     TimedWord(text: "But", start: 3.0, end: 3.2), TimedWord(text: "when", start: 3.3, end: 3.6),
+                     TimedWord(text: "Wednesday", start: 5.0, end: 5.6)]
+        let spans = [SpeakerSpan(speakerId: "speaker_0", start: 0, end: 1.0),
+                     SpeakerSpan(speakerId: "speaker_1", start: 2.8, end: 3.7),
+                     SpeakerSpan(speakerId: "speaker_0", start: 4.9, end: 6.0)]
+        let segs = TranscriptBuilder.assign(words: words, to: spans)
+        XCTAssertEqual(segs.map(\.speakerId), ["speaker_0", "speaker_1", "speaker_0"])
+        XCTAssertEqual(segs.map(\.text), ["Yes agreed", "But when", "Wednesday"])
+    }
+
+    func testAssignWordOutsideAnySpanGoesToNearestSpanWithinOneSecondElseUnknown() {
+        let words = [TimedWord(text: "late", start: 1.2, end: 1.4), TimedWord(text: "lost", start: 9.0, end: 9.2)]
+        let spans = [SpeakerSpan(speakerId: "speaker_0", start: 0, end: 1.0)]
+        let segs = TranscriptBuilder.assign(words: words, to: spans)
+        XCTAssertEqual(segs.map(\.speakerId), ["speaker_0", "speaker_unknown"])
+    }
+
+    func testMergeInterleavesByStartTime() {
+        let a = [TranscriptSegment(speakerId: "owner", start: 0, end: 1, text: "Morning"),
+                 TranscriptSegment(speakerId: "owner", start: 4, end: 5, text: "Wednesday works")]
+        let b = [TranscriptSegment(speakerId: "speaker_0", start: 1.5, end: 3.5, text: "Can we do Wednesday")]
+        let merged = TranscriptBuilder.merge(a, b)
+        XCTAssertEqual(merged.map(\.text), ["Morning", "Can we do Wednesday", "Wednesday works"])
+    }
+
+    func testMarkdownUsesNamesAndTimestamps() {
+        let t = Transcript(meetingID: "m", segments: [
+            TranscriptSegment(speakerId: "owner", start: 0, end: 1, text: "Morning"),
+            TranscriptSegment(speakerId: "speaker_0", start: 65.2, end: 67, text: "Can we do Wednesday"),
+        ], speakerNames: ["owner": "Niall Wogan", "speaker_0": "Nathan Hall"])
+        let md = TranscriptBuilder.markdown(t, title: "Clayton lease", startedAt: Date(timeIntervalSince1970: 0))
+        XCTAssertTrue(md.hasPrefix("# Clayton lease"))
+        XCTAssertTrue(md.contains("**[00:00] Niall Wogan:** Morning"))
+        XCTAssertTrue(md.contains("**[01:05] Nathan Hall:** Can we do Wednesday"))
+    }
+}
