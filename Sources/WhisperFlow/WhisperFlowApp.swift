@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import AppKit
 import UserNotifications
 
 @main
@@ -181,6 +182,7 @@ struct WhisperFlowApp: App {
 
     static let transcriptWindowID = "transcript"
     static let meetingWindowID = "meeting"
+    static let settingsWindowID = "settings"
 
     var body: some Scene {
         // `body` is evaluated while SwiftUI builds the scene graph, which
@@ -197,7 +199,8 @@ struct WhisperFlowApp: App {
             MenuBarContent(accessibility: state.accessibility,
                            meetings: state.meetings,
                            openTranscriptWindow: { openWindow(id: Self.transcriptWindowID) },
-                           openMeetingWindow: { openWindow(id: Self.meetingWindowID) })
+                           openMeetingWindow: { openWindow(id: Self.meetingWindowID) },
+                           openSettingsWindow: { bringToFront(); openWindow(id: Self.settingsWindowID) })
             .environmentObject(state)
         } label: {
             Image(systemName: "mic.circle")
@@ -218,6 +221,23 @@ struct WhisperFlowApp: App {
                 .environmentObject(state)
         }
         .windowResizability(.contentSize)
+
+        // Settings. A plain Window rather than the Settings scene: this app is
+        // LSUIElement, so it owns no application menu for macOS to hang a
+        // Settings item off, and openWindow(id:) is the one route that works
+        // from a menu bar item. Cmd+, is on the menu item itself.
+        Window("Whisper Flow Settings", id: Self.settingsWindowID) {
+            SettingsWindow()
+                .environmentObject(state)
+        }
+        .windowResizability(.contentSize)
+        .defaultSize(width: 940, height: 640)
+    }
+
+    /// An accessory app is not frontmost when its menu is clicked, so a window
+    /// it opens can appear behind whatever the person was working in.
+    private func bringToFront() {
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     private func bindDelegate() {
@@ -680,6 +700,7 @@ private func runCLIMeetingTest(seconds: Double, attendees: [String], upload: Boo
                     if let me {
                         VoiceProfileCache.save(me.profiles)
                         PhraseStore.shared.replace(me.phrases)
+                        SnippetStore.shared.replace(me.snippets)
                     }
                     let profiles = me?.profiles ?? VoiceProfileCache.load()
                     let uploader = MeetingUploader(flow: flow) { progress in print("  \(progress.text)") }

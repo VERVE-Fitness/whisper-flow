@@ -10,6 +10,7 @@ struct MenuBarContent: View {
     @ObservedObject var meetings: MeetingRecorder
     var openTranscriptWindow: () -> Void
     var openMeetingWindow: () -> Void
+    var openSettingsWindow: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -100,7 +101,9 @@ struct MenuBarContent: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
-        Button("Whisper Flow settings…") { state.openFlowSettings() }
+        Button("Whisper Flow settings…") { openSettingsWindow() }
+            .keyboardShortcut(",", modifiers: [.command])
+        Button("Open Flow settings page") { state.openFlowSettings() }
 
         Divider()
 
