@@ -13,6 +13,10 @@ final class StubURLProtocol: URLProtocol {
 
     nonisolated(unsafe) private static var replies: [String: Reply] = [:]
     nonisolated(unsafe) private(set) static var seenRequests: [URLRequest] = []
+    /// URLSession moves a request's httpBody into httpBodyStream by the time
+    /// a URLProtocol sees it, so the body of the last request is read off the
+    /// stream here rather than left for the test to dig out.
+    nonisolated(unsafe) private(set) static var lastBody: Data?
     private static let lock = NSLock()
 
     /// `pathAndQuery` is matched exactly, e.g. "/api/public/whisper/bots?active=1".
@@ -30,6 +34,7 @@ final class StubURLProtocol: URLProtocol {
         lock.lock(); defer { lock.unlock() }
         replies = [:]
         seenRequests = []
+        lastBody = nil
     }
 
     static func session() -> URLSession {
@@ -48,8 +53,10 @@ final class StubURLProtocol: URLProtocol {
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
+        let body = request.httpBody ?? Self.readStream(request.httpBodyStream)
         Self.lock.lock()
         Self.seenRequests.append(request)
+        if let body { Self.lastBody = body }
         let reply = Self.replies[Self.key(for: request)]
         Self.lock.unlock()
 
@@ -69,6 +76,20 @@ final class StubURLProtocol: URLProtocol {
     }
 
     override func stopLoading() {}
+
+    private static func readStream(_ stream: InputStream?) -> Data? {
+        guard let stream else { return nil }
+        stream.open()
+        defer { stream.close() }
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        while stream.hasBytesAvailable {
+            let read = stream.read(&buffer, maxLength: buffer.count)
+            if read <= 0 { break }
+            data.append(contentsOf: buffer[0..<read])
+        }
+        return data.isEmpty ? nil : data
+    }
 }
 
 /// The client half of the week 3 contract: the two GETs, their headers, and
