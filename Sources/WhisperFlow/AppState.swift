@@ -204,7 +204,23 @@ final class AppState: ObservableObject {
         let info = Bundle.main.infoDictionary ?? [:]
         let version = info["CFBundleShortVersionString"] as? String ?? "dev"
         let sha = info["WFGitCommit"] as? String
-        return "v\(version)" + (sha.map { " (\($0))" } ?? "")
+        let built = (info["WFBuildDate"] as? String).flatMap { Self.buildDateLabel($0) }
+        let detail = [sha, built].compactMap { $0 }.joined(separator: ", ")
+        return "v\(version)" + (detail.isEmpty ? "" : " (\(detail))")
+    }
+
+    /// "built 5 Sep 2026, 3:19 pm" from the UTC stamp make-app.sh writes,
+    /// shown in the Mac's local time zone so the time matches the clock the
+    /// person is looking at. A stamp that does not parse is left out.
+    nonisolated static func buildDateLabel(_ iso: String, timeZone: TimeZone = .current) -> String? {
+        let parser = ISO8601DateFormatter()
+        parser.formatOptions = [.withInternetDateTime]
+        guard let date = parser.date(from: iso) else { return nil }
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_AU")
+        f.timeZone = timeZone
+        f.dateFormat = "d MMM yyyy, h:mm a"
+        return "built " + f.string(from: date).replacingOccurrences(of: "AM", with: "am").replacingOccurrences(of: "PM", with: "pm")
     }
 
     /// Name of the microphone the current selection resolves to right now.
