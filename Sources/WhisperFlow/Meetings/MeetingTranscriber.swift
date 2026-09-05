@@ -8,8 +8,19 @@ import FluidAudio
 final class MeetingTranscriber {
     private let backend: ParakeetBackend
     private let onStatus: (@Sendable (String) -> Void)?
-    private let diarizer = OfflineDiarizerManager(config: .default)
+    /// `exposeChunkEmbeddings` is what makes voice memory possible: it hands
+    /// back the 256-dim embedding behind every chunk, which VoiceMatcher
+    /// averages per speaker and compares with the profiles Flow holds. It
+    /// costs one or two MB of memory an hour and nothing in accuracy.
+    private let diarizer = OfflineDiarizerManager(
+        config: OfflineDiarizerConfig(exposeChunkEmbeddings: true))
     private var diarizerReady = false
+
+    /// Chunk embeddings from the last run, track A ("owner") and track B
+    /// (the diariser's own "S1", "S2", …) together. Read by the uploader to
+    /// build the manifest; not written into transcript.json, which stays a
+    /// readable text artefact.
+    private(set) var lastChunks: [SpeakerChunk] = []
 
     init(backend: ParakeetBackend, onStatus: (@Sendable (String) -> Void)? = nil) {
         self.backend = backend
@@ -20,6 +31,7 @@ final class MeetingTranscriber {
         var record = try MeetingStore.load(id: meetingID)
         record.status = .transcribing
         try MeetingStore.save(record)
+        lastChunks = []
         do {
             onStatus?("Loading speech model…")
             try await backend.prepare()
@@ -29,6 +41,22 @@ final class MeetingTranscriber {
             let a = try await backend.transcribeLong(url: MeetingStore.trackAURL(meetingID))
             let aSegments = segmentsForSingleSpeaker(a, speakerId: TranscriptBuilder.ownerSpeakerId)
 
+            // Track A again, through the diariser, purely for the owner's
+            // voice embedding. One person, but the diariser can still split a
+            // cough or a bleed-through off into a second cluster, so the
+            // cluster that did most of the talking is the one taken.
+            if record.trackASeconds > 2.0 {
+                onStatus?("Reading your voice…")
+                let ownerChunks = (try? await diarise(url: MeetingStore.trackAURL(meetingID)).chunks) ?? []
+                if let dominant = VoiceMatcher.dominantSpeaker(in: ownerChunks) {
+                    lastChunks += ownerChunks
+                        .filter { $0.speakerId == dominant }
+                        .map { SpeakerChunk(speakerId: TranscriptBuilder.ownerSpeakerId,
+                                            start: $0.start, end: $0.end, embedding: $0.embedding) }
+                    FileHandle.standardError.write(Data("[meeting] track A: owner voice from cluster \(dominant) (\(lastChunks.count) chunks)\n".utf8))
+                }
+            }
+
             // Track B: everyone else. Skip an empty track (no system audio).
             var bSegments: [TranscriptSegment] = []
             if record.trackBSeconds > 1.0 {
@@ -36,7 +64,11 @@ final class MeetingTranscriber {
                 let b = try await backend.transcribeLong(url: MeetingStore.trackBURL(meetingID))
                 if !b.text.isEmpty {
                     onStatus?("Separating speakers…")
-                    let spans = try await diarise(url: MeetingStore.trackBURL(meetingID))
+                    let diarised = try await diarise(url: MeetingStore.trackBURL(meetingID))
+                    let spans = diarised.spans
+                    // Track B chunk times stay on track B's own clock here;
+                    // the uploader only ever uses them to weight the mean.
+                    lastChunks += diarised.chunks
                     let words = TranscriptBuilder.words(fromTokens: b.tokens)
                     if words.isEmpty || spans.isEmpty {
                         // No timings or no speakers found: one block for "them",
@@ -81,7 +113,7 @@ final class MeetingTranscriber {
         return TranscriptBuilder.segments(words: words, speakerId: speakerId)
     }
 
-    private func diarise(url: URL) async throws -> [SpeakerSpan] {
+    private func diarise(url: URL) async throws -> (spans: [SpeakerSpan], chunks: [SpeakerChunk]) {
         if !diarizerReady {
             // First run downloads the diariser models (~100 MB) into the
             // same cache the speech model uses.
@@ -94,9 +126,10 @@ final class MeetingTranscriber {
         let result = try await diarizer.process(url) { done, total in
             onStatus?("Separating speakers… \(total > 0 ? Int(Double(done) / Double(total) * 100) : 0)%")
         }
-        return result.segments.map {
+        let spans = result.segments.map {
             SpeakerSpan(speakerId: $0.speakerId, start: Double($0.startTimeSeconds), end: Double($0.endTimeSeconds))
         }
+        return (spans, (result.chunkEmbeddings ?? []).map(SpeakerChunk.init))
     }
 
     func write(_ transcript: Transcript, record: MeetingRecord) throws {
