@@ -258,6 +258,7 @@ final class AppState: ObservableObject {
         refreshInputDevices()
         startUpdateChecks()
         refreshFlowIdentity()
+        resumePendingUploads()
 
         pill.onTapStop = { [weak self] in
             guard let self else { return }
@@ -784,17 +785,75 @@ final class AppState: ObservableObject {
                 try MeetingStore.save(updated)
                 try transcriber.write(transcript, record: updated)
 
-                pill.update(.meetingProcessing("Summarising…"))
-                meetingStatus = "Summarising…"
-                let summary = try await MeetingSummariser.summarise(meetingID: rec.id)
-                meetingStatus = summary == nil ? "Saved (no summary: no Anthropic key on this Mac)" : "Saved"
-                pill.show(.inserted)   // reuses the green tick, auto-hides
-                NSWorkspace.shared.open(MeetingStore.directory(for: rec.id))
+                // Week 2: the summary is written by Flow, not on this Mac.
+                // Everything from here is match, encode, upload, wait.
+                try await uploadMeeting(id: rec.id, transcript: transcript, chunks: transcriber.lastChunks)
             } catch {
                 meetingStatus = "Failed: \(error.localizedDescription)"
                 pill.show(.failed(error.localizedDescription))
             }
         }
+    }
+
+    /// The Flow half of Stop: refresh the voice profiles, match, encode,
+    /// upload, wait for the summary. A failure here leaves the meeting on
+    /// disk with a pending `upload-state.json`, which the next launch or the
+    /// next connect picks up.
+    private func uploadMeeting(id: String, transcript: Transcript, chunks: [SpeakerChunk]) async throws {
+        guard flow.isConnected else {
+            meetingStatus = "Saved on this Mac. Connect to Flow to upload it."
+            pill.show(.failed("not connected to Flow"))
+            return
+        }
+        // Fresh profiles at every Stop, so a colleague confirmed this morning
+        // is recognised this afternoon without a relaunch.
+        var profiles = VoiceProfileCache.load()
+        var owner = flowMe
+        if let me = try? await flow.me() {
+            applyFlowIdentity(me)
+            owner = me
+            profiles = me.profiles
+            VoiceProfileCache.save(me.profiles)
+        }
+
+        let uploader = MeetingUploader(flow: flow) { [weak self] progress in
+            Task { @MainActor in
+                guard let self else { return }
+                self.meetingStatus = progress.text
+                if progress == .done {
+                    self.pill.show(.inserted)
+                } else {
+                    self.pill.update(.meetingProcessing(progress.text))
+                }
+            }
+        }
+        pill.update(.meetingProcessing("Preparing the audio…"))
+        meetingStatus = "Preparing the audio…"
+        try uploader.prepare(meetingID: id, transcript: transcript, chunks: chunks,
+                             profiles: profiles, owner: owner)
+        _ = try await uploader.ship(meetingID: id)
+    }
+
+    /// Anything that did not finish uploading: run at launch and every time
+    /// this Mac connects. Quiet, because a Mac that was offline all weekend
+    /// should catch up without a stack of alerts.
+    func resumePendingUploads() {
+        guard flow.isConnected else { return }
+        Task {
+            let uploader = MeetingUploader(flow: flow) { [weak self] progress in
+                Task { @MainActor in self?.meetingStatus = progress.text }
+            }
+            await uploader.resumePending()
+        }
+    }
+
+    /// The recording's page in Flow.
+    func flowRecordingURL(_ id: String) -> URL {
+        URL(string: flow.serverBase + "/meetings/recording/" + id) ?? flowSettingsURL
+    }
+
+    func openInFlow(_ id: String) {
+        NSWorkspace.shared.open(flowRecordingURL(id))
     }
 
     // MARK: - Flow connection
@@ -815,6 +874,8 @@ final class AppState: ObservableObject {
                 let who = me.name.isEmpty ? me.email : me.name
                 flowStatus = "Connected as \(who)"
                 pill.show(.flowConnected(name: who))
+                VoiceProfileCache.save(me.profiles)
+                resumePendingUploads()
                 FileHandle.standardError.write(Data("[flow] connected as \(me.email) to \(flow.serverBase), recognise_me=\(me.recogniseMe), \(me.profiles.count) voice profiles\n".utf8))
             } catch {
                 flowMe = nil
@@ -845,6 +906,7 @@ final class AppState: ObservableObject {
     private func applyFlowIdentity(_ me: FlowMe) {
         flowMe = me
         UserDefaults.standard.set(me.recogniseMe, forKey: Self.recogniseMeDefaultsKey)
+        VoiceProfileCache.save(me.profiles)
     }
 
     func openFlowSettings() {

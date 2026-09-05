@@ -12,6 +12,8 @@ struct MeetingWindow: View {
     /// Names being typed. Kept apart from `transcript` so the files are
     /// rewritten when the field is committed, not on every keystroke.
     @State private var editedNames: [String: String] = [:]
+    /// Where the upload got to, read from `upload-state.json`.
+    @State private var uploadState: UploadState?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -21,6 +23,10 @@ struct MeetingWindow: View {
             summarySection
             Spacer(minLength: 0)
             HStack {
+                if let id = record?.id {
+                    Button("Open in Flow") { state.openInFlow(id) }
+                        .disabled(uploadState?.phase != .complete)
+                }
                 Button("Open folder") { if let id = record?.id { state.openMeetingFolder(id) } }
                 Button("Reload") { load() }
                 Spacer()
@@ -42,6 +48,9 @@ struct MeetingWindow: View {
             Text("\(record.status.rawValue) · your side \(Int(record.trackASeconds))s · their side \(Int(record.trackBSeconds))s · their side shifted +\(String(format: "%.1f", record.trackBOffsetSeconds))s")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            Text(uploadLine)
+                .font(.caption)
+                .foregroundStyle(.secondary)
             // The single most common cause of a bad meeting transcript: with
             // the far side coming out of the laptop speakers, the microphone
             // hears it too, so both tracks carry the same words and the
@@ -56,6 +65,22 @@ struct MeetingWindow: View {
             Text("Menu bar → Record meeting… Everything is saved into one folder per meeting.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+        }
+    }
+
+    /// Plain English for the upload, so nobody has to open a JSON file to
+    /// find out whether their meeting reached Flow.
+    private var uploadLine: String {
+        guard let uploadState else {
+            return state.flow.isConnected ? "Not uploaded yet" : "Not uploaded: this Mac is not connected to Flow"
+        }
+        switch uploadState.phase {
+        case .complete:
+            return "In Flow. Speaker names below are the ones Flow settled on."
+        case .pending:
+            return "Uploading: \(uploadState.files.count) file(s) sent so far. It will finish on its own."
+        case .failed:
+            return "Upload failed, will retry: \(uploadState.error ?? "no reason recorded")"
         }
     }
 
@@ -131,5 +156,6 @@ struct MeetingWindow: View {
             .flatMap { try? JSONDecoder().decode(Transcript.self, from: $0) }
         editedNames = transcript?.speakerNames ?? [:]
         summary = (try? String(contentsOf: MeetingStore.summaryURL(id), encoding: .utf8)) ?? ""
+        uploadState = MeetingUploader.readState(meetingID: id)
     }
 }

@@ -96,6 +96,16 @@ enum MeetingStore {
     static func transcriptJSONURL(_ id: String) -> URL { directory(for: id).appendingPathComponent("transcript.json") }
     static func transcriptMarkdownURL(_ id: String) -> URL { directory(for: id).appendingPathComponent("transcript.md") }
     static func summaryURL(_ id: String) -> URL { directory(for: id).appendingPathComponent("summary.md") }
+    /// The two encoded tracks that go to Flow. The WAVs stay on this Mac.
+    static func trackAM4AURL(_ id: String) -> URL { directory(for: id).appendingPathComponent("track-a.m4a") }
+    static func trackBM4AURL(_ id: String) -> URL { directory(for: id).appendingPathComponent("track-b.m4a") }
+    /// Speaker embeddings and the match decisions, kept so a resumed upload
+    /// never has to run the diariser again.
+    static func voicesURL(_ id: String) -> URL { directory(for: id).appendingPathComponent("voices.json") }
+    /// The manifest as it will be POSTed, written before the first byte goes
+    /// up so a resume ships exactly what the first attempt would have.
+    static func manifestURL(_ id: String) -> URL { directory(for: id).appendingPathComponent("manifest.json") }
+    static func uploadStateURL(_ id: String) -> URL { directory(for: id).appendingPathComponent("upload-state.json") }
     private static func recordURL(_ id: String) -> URL { directory(for: id).appendingPathComponent("meeting.json") }
 
     private static var encoder: JSONEncoder {
