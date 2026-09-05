@@ -107,9 +107,8 @@ struct MeetingUploader: Sendable {
 
     /// What a resume still has to send.
     static func remainingFiles(planned: [String], state: UploadState?) -> [String] {
-        guard let state, state.phase != .complete else {
-            return state?.phase == .complete ? [] : planned
-        }
+        guard let state else { return planned }
+        guard state.phase != .complete else { return [] }
         let done = Set(state.files)
         return planned.filter { !done.contains($0) }
     }
