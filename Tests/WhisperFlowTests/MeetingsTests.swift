@@ -56,7 +56,7 @@ final class MeetingStoreTests: XCTestCase {
     }
 
     func testSaveLoadRoundTripAndListNewestFirst() throws {
-        let consent = MeetingConsent(confirmedAt: Date(timeIntervalSince1970: 1_800_000_000), wordingVersion: "consent-v1")
+        let consent = MeetingConsent(confirmedAt: Date(timeIntervalSince1970: 1_800_000_000), wordingVersion: "consent-v2")
         var r1 = MeetingRecord(id: "2026-09-05-0900-aaaaaaaa", startedAt: Date(timeIntervalSince1970: 1_800_000_000),
                                endedAt: nil, title: "Clayton lease", attendees: ["Nathan Hall"], consent: consent,
                                status: .recording, failureReason: nil, trackASeconds: 0, trackBSeconds: 0, speakerNames: [:])
@@ -77,18 +77,29 @@ final class MeetingStoreTests: XCTestCase {
 }
 
 final class ConsentGateTests: XCTestCase {
-    func testWordingCarriesTheFourPromises() {
-        let w = ConsentGate.wording(managerName: "Nathan Hall")
-        XCTAssertEqual(ConsentGate.wordingVersion, "consent-v1")
+    func testWordingCarriesEveryPromiseVersionTwoMakes() {
+        let w = ConsentGate.wording()
+        XCTAssertEqual(ConsentGate.wordingVersion, "consent-v2")
+        XCTAssertEqual(w.title, "Record this meeting?")
         XCTAssertTrue(w.body.contains("Tell everyone on the call first"))
-        XCTAssertTrue(w.body.contains("your manager, Nathan Hall, can play it back"))
+        XCTAssertTrue(w.body.contains("I'm recording this for notes, is that OK with everyone?"))
+        // Week 2: the recording leaves the Mac, and the wording has to say so.
+        XCTAssertTrue(w.body.contains("saved to VERVE's system (Flow)"))
+        XCTAssertTrue(w.body.contains("You and your manager can play it back"))
         XCTAssertTrue(w.body.contains("deleted after 90 days"))
-        XCTAssertTrue(w.body.contains("delete either at any time"))
+        XCTAssertTrue(w.body.contains("transcript and summary are kept"))
+        XCTAssertTrue(w.body.contains("delete either at any time from Flow"))
         XCTAssertEqual(w.confirm, "I've told everyone and they're OK with it")
+        XCTAssertEqual(w.cancel, "Cancel")
     }
 
-    func testWordingWithoutManagerNameStillMentionsManager() {
-        XCTAssertTrue(ConsentGate.wording(managerName: nil).body.contains("your manager can play it back"))
+    /// No em or en dashes anywhere in the wording a person reads.
+    func testWordingHasNoEmOrEnDashes() {
+        let w = ConsentGate.wording()
+        for text in [w.title, w.body, w.confirm, w.cancel] {
+            XCTAssertFalse(text.contains("\u{2014}"), "em dash in: \(text)")
+            XCTAssertFalse(text.contains("\u{2013}"), "en dash in: \(text)")
+        }
     }
 }
 
@@ -250,7 +261,7 @@ final class TrackBAlignmentTests: XCTestCase {
         let json = """
         {
           "attendees" : ["Nathan Hall"],
-          "consent" : { "confirmedAt" : "2026-09-05T00:00:00Z", "wordingVersion" : "consent-v1" },
+          "consent" : { "confirmedAt" : "2026-09-05T00:00:00Z", "wordingVersion" : "consent-v2" },
           "id" : "2026-09-05-0900-aaaaaaaa",
           "speakerNames" : {},
           "startedAt" : "2026-09-05T00:00:00Z",
@@ -275,7 +286,7 @@ final class TrackBAlignmentTests: XCTestCase {
             if let root = MeetingStore.rootOverride { try? FileManager.default.removeItem(at: root) }
             MeetingStore.rootOverride = nil
         }
-        let consent = MeetingConsent(confirmedAt: Date(timeIntervalSince1970: 1_800_000_000), wordingVersion: "consent-v1")
+        let consent = MeetingConsent(confirmedAt: Date(timeIntervalSince1970: 1_800_000_000), wordingVersion: "consent-v2")
         let record = MeetingRecord(id: "2026-09-05-1100-cccccccc", startedAt: Date(timeIntervalSince1970: 1_800_000_000),
                                    endedAt: nil, title: "", attendees: [], consent: consent, status: .recorded,
                                    failureReason: nil, trackASeconds: 30, trackBSeconds: 28.9,

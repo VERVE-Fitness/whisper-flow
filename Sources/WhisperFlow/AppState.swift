@@ -741,7 +741,15 @@ final class AppState: ObservableObject {
     func startMeeting() {
         guard !meetings.isRecording else { return }
         Task {
-            guard let consent = await ConsentGate.present(managerName: nil) else {
+            // The consent wording promises the recording reaches VERVE's
+            // system. On a Mac with no token it would not, so there is no
+            // path from here to a recording that cannot be uploaded.
+            guard flow.isConnected else {
+                meetingStatus = "Not recorded: connect this Mac to Flow first"
+                ConsentGate.presentNotConnected(settingsURL: flowSettingsURL)
+                return
+            }
+            guard let consent = await ConsentGate.present() else {
                 meetingStatus = "Cancelled, nothing recorded"
                 return
             }
