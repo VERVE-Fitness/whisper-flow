@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import UserNotifications
 
 @main
 enum WhisperFlowMain {
@@ -98,7 +99,7 @@ enum WhisperFlowMain {
 /// Drives launch-time setup. An accessory (LSUIElement) app has no window to
 /// hang `.onAppear` off reliably, so `applicationDidFinishLaunching` is the
 /// dependable hook for `AppState.onLaunch()`.
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     var state: AppState?
 
     /// The `whisperflow://connect?token=…` handler. SwiftUI's `onOpenURL`
@@ -113,6 +114,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             andSelector: #selector(handleGetURLEvent(_:withReplyEvent:)),
             forEventClass: AEEventClass(kInternetEventClass),
             andEventID: AEEventID(kAEGetURL))
+        // Before anything asks for permission, and long before a prompt is
+        // posted: an LSUIElement app with no delegate delivers the person's
+        // answer nowhere. Skipped in the CLI harnesses, which have no bundle
+        // and would trap on UNUserNotificationCenter.current().
+        if Bundle.main.bundleIdentifier != nil {
+            UNUserNotificationCenter.current().delegate = self
+        }
+    }
+
+    /// The meeting prompt is worth seeing even when Whisper Flow happens to
+    /// be the active app, which for a menu bar app is most of the time it is
+    /// doing anything at all.
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                willPresent notification: UNNotification) async
+    -> UNNotificationPresentationOptions {
+        [.banner, .sound]
+    }
+
+    /// Record or Not this one, from the meeting prompt.
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                didReceive response: UNNotificationResponse) async {
+        let userInfo = response.notification.request.content.userInfo
+        let action = response.actionIdentifier
+        await MainActor.run { [weak self] in
+            self?.state?.handleMeetingPromptResponse(actionIdentifier: action, userInfo: userInfo)
+        }
     }
 
     @objc func handleGetURLEvent(_ event: NSAppleEventDescriptor, withReplyEvent reply: NSAppleEventDescriptor) {

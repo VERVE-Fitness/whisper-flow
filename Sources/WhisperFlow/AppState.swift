@@ -78,6 +78,18 @@ final class AppState: ObservableObject {
     @Published var flowStatus: String?
     let flow = FlowClient.shared
 
+    // MARK: - Calendar prompts
+
+    /// Asks about a meeting a minute before it starts. Menu toggle, on by
+    /// default, kept in UserDefaults so it survives a relaunch.
+    @Published var meetingPromptsEnabled: Bool = CalendarPrompter.promptsEnabled()
+    let meetingPrompts = MeetingPromptNotifier()
+    private var promptPoller: Task<Void, Never>?
+    /// The poll stops while the Mac is asleep: a machine that wakes at 4pm
+    /// must not fire a stack of prompts for meetings that already happened.
+    private var isSystemAsleep = false
+    private var sleepObservers: [NSObjectProtocol] = []
+
     /// Remembered across launches so the menu can say "connected" before the
     /// first `me()` of the session comes back.
     static let recogniseMeDefaultsKey = "flowRecogniseMe"
@@ -259,6 +271,7 @@ final class AppState: ObservableObject {
         startUpdateChecks()
         refreshFlowIdentity()
         resumePendingUploads()
+        startCalendarPrompts()
 
         pill.onTapStop = { [weak self] in
             guard let self else { return }
@@ -939,6 +952,111 @@ final class AppState: ObservableObject {
         flowMe = me
         UserDefaults.standard.set(me.recogniseMe, forKey: Self.recogniseMeDefaultsKey)
         VoiceProfileCache.save(me.profiles)
+        // First connect of this launch is where the notification permission
+        // is asked for. Nothing is asked on a Mac that never connects.
+        Task { await meetingPrompts.requestAuthorisationOnce() }
+    }
+
+    // MARK: - Calendar prompts
+
+    /// Reads the calendar every minute while this Mac is connected, is not
+    /// recording, and is awake. Started once at launch; the guards inside the
+    /// tick are what turn it on and off, so there is one timer for the life
+    /// of the app rather than one per connect.
+    func startCalendarPrompts() {
+        guard promptPoller == nil else { return }
+        observeSleep()
+        promptPoller = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64(CalendarPrompter.pollSeconds * 1_000_000_000))
+                guard let self else { return }
+                await self.pollCalendarOnce()
+            }
+        }
+    }
+
+    private func observeSleep() {
+        let centre = NSWorkspace.shared.notificationCenter
+        sleepObservers.append(centre.addObserver(forName: NSWorkspace.willSleepNotification,
+                                                object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in
+                self?.isSystemAsleep = true
+                CalendarPrompter.log("the Mac is going to sleep, pausing the calendar poll")
+            }
+        })
+        sleepObservers.append(centre.addObserver(forName: NSWorkspace.didWakeNotification,
+                                                object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in
+                self?.isSystemAsleep = false
+                CalendarPrompter.log("the Mac is awake, resuming the calendar poll")
+            }
+        })
+    }
+
+    /// One tick. Every reason to do nothing is checked here rather than in
+    /// the timer, so turning prompts off or starting a recording takes effect
+    /// at the next tick without restarting anything.
+    private func pollCalendarOnce() async {
+        guard !isSystemAsleep, flow.isConnected, !meetings.isRecording,
+              CalendarPrompter.promptsEnabled() else { return }
+        let upcoming: FlowUpcoming
+        do {
+            upcoming = try await flow.upcoming()
+        } catch {
+            CalendarPrompter.logPollFailed(error)
+            return
+        }
+        let now = Date()
+        let alreadyPrompted = PromptedEventStore.prompted(on: now)
+        let due = CalendarPrompter.eventsToPrompt(events: upcoming.events, now: now,
+                                                  alreadyPrompted: alreadyPrompted,
+                                                  promptsEnabled: true)
+        CalendarPrompter.logPoll(events: upcoming.events, due: due, now: now,
+                                 alreadyPrompted: alreadyPrompted)
+        for event in due {
+            // Remembered before it is shown, so a notification that fails to
+            // post is still not asked again a minute later.
+            PromptedEventStore.remember(event.id, on: now)
+            let outcome = await meetingPrompts.prompt(event: event)
+            if outcome == .record {
+                startMeetingFromPrompt(eventId: event.id,
+                                       subject: CalendarPrompter.subject(of: event),
+                                       attendees: event.attendees)
+            }
+            // Only one meeting can be recorded at a time, so stop after the
+            // first one the person said yes to.
+            if outcome == .record || meetings.isRecording { break }
+        }
+    }
+
+    /// The normal consent gate, with the meeting's own title and attendees
+    /// already filled in and the calendar event id attached so Flow can link
+    /// the recording to the event.
+    func startMeetingFromPrompt(eventId: String, subject: String, attendees: [String]) {
+        CalendarPrompter.log("recording \(subject) from the prompt")
+        startMeeting(title: subject, attendees: attendees, calendarEventId: eventId)
+    }
+
+    /// What the person tapped on the notification. Called by the app
+    /// delegate, which is where UNUserNotificationCenter delivers it.
+    func handleMeetingPromptResponse(actionIdentifier: String, userInfo: [AnyHashable: Any]) {
+        let subject = userInfo[MeetingPromptNotifier.subjectKey] as? String ?? "this meeting"
+        guard actionIdentifier == MeetingPromptNotifier.recordAction else {
+            CalendarPrompter.log("left \(subject) unrecorded (\(actionIdentifier))")
+            return
+        }
+        guard let eventId = userInfo[MeetingPromptNotifier.eventIdKey] as? String else {
+            CalendarPrompter.log("a prompt answer arrived without an event id, ignoring it")
+            return
+        }
+        let attendees = userInfo[MeetingPromptNotifier.attendeesKey] as? [String] ?? []
+        startMeetingFromPrompt(eventId: eventId, subject: subject, attendees: attendees)
+    }
+
+    func setMeetingPrompts(_ on: Bool) {
+        CalendarPrompter.setPromptsEnabled(on)
+        meetingPromptsEnabled = on
+        CalendarPrompter.log(on ? "meeting prompts on" : "meeting prompts off")
     }
 
     func openFlowSettings() {
