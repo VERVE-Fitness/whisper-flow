@@ -156,6 +156,36 @@ final class ManifestBuildingTests: XCTestCase {
         XCTAssertEqual(manifest.speakers[1].name, "Damian")
     }
 
+    /// A word the diariser could not place carries "speaker_unknown". The
+    /// server keeps only segments whose speaker is in the speakers list, so an
+    /// unplaced segment is handed to the speaker who spoke just before it, and
+    /// to the first known speaker when it comes before anyone known.
+    func testUnplacedWordsGoToTheNeighbouringSpeaker() {
+        let interrupted = Transcript(meetingID: "2026-09-05-1432-3fa9c2d1", segments: [
+            TranscriptSegment(speakerId: "owner", start: 0.4, end: 3.9, text: "Morning Nathan."),
+            TranscriptSegment(speakerId: "speaker_unknown", start: 4.0, end: 4.1, text: "yeah"),
+            TranscriptSegment(speakerId: "S1", start: 4.2, end: 6.0, text: "Morning."),
+        ], speakerNames: ["owner": "Niall Wogan", "S1": "Nathan Hall"])
+        let known = voices([speaker("owner", matched: true, email: "niall.wogan@vervefitness.com.au", name: "Niall Wogan"),
+                            speaker("S1", matched: true, email: "nathan.hall@vervefitness.com.au", name: "Nathan Hall")])
+
+        let manifest = MeetingUploader.buildManifest(record: meetingRecord(), transcript: interrupted, voices: known)
+        XCTAssertEqual(manifest.segments.count, 3)
+        XCTAssertEqual(manifest.segments.map(\.speakerId), ["A", "A", "S1"])
+        XCTAssertEqual(manifest.segments.map(\.text), ["Morning Nathan.", "yeah", "Morning."])
+        let onTheWire = Set(manifest.speakers.map(\.speakerId))
+        XCTAssertTrue(manifest.segments.allSatisfy { onTheWire.contains($0.speakerId) })
+
+        // Nobody has spoken yet, so the first known speaker takes it.
+        let opensUnknown = Transcript(meetingID: "2026-09-05-1432-3fa9c2d1", segments: [
+            TranscriptSegment(speakerId: "speaker_unknown", start: 0.1, end: 0.3, text: "so"),
+            TranscriptSegment(speakerId: "S1", start: 0.4, end: 2.0, text: "Morning."),
+        ], speakerNames: ["S1": "Nathan Hall"])
+        let opening = MeetingUploader.buildManifest(record: meetingRecord(), transcript: opensUnknown, voices: known)
+        XCTAssertEqual(opening.segments.map(\.speakerId), ["S1", "S1"])
+        XCTAssertEqual(opening.segments.map(\.text), ["so", "Morning."])
+    }
+
     func testManifestRoundTripsThroughTheFileTheResumeReads() throws {
         let manifest = MeetingUploader.buildManifest(
             record: meetingRecord(), transcript: transcript,
