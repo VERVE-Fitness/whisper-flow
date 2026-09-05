@@ -339,8 +339,28 @@ struct MeetingManifest: Codable, Equatable {
     var trackBOffsetSeconds: Double
     var attendees: [String]
     var consent: Consent
+    /// Set only when the recording was started from a calendar prompt.
+    /// Omitted from the JSON when nil, so a hand-started recording sends the
+    /// same manifest it always did.
+    var calendarEventId: String?
     var speakers: [Speaker]
     var segments: [Segment]
+
+    init(title: String, startedAt: Date, endedAt: Date?, trackASeconds: Double, trackBSeconds: Double,
+         trackBOffsetSeconds: Double, attendees: [String], consent: Consent,
+         calendarEventId: String? = nil, speakers: [Speaker], segments: [Segment]) {
+        self.title = title
+        self.startedAt = startedAt
+        self.endedAt = endedAt
+        self.trackASeconds = trackASeconds
+        self.trackBSeconds = trackBSeconds
+        self.trackBOffsetSeconds = trackBOffsetSeconds
+        self.attendees = attendees
+        self.consent = consent
+        self.calendarEventId = calendarEventId
+        self.speakers = speakers
+        self.segments = segments
+    }
 }
 
 struct FlowCompleteResponse: Codable, Equatable {

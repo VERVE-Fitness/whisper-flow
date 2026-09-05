@@ -32,6 +32,10 @@ struct MeetingRecord: Codable, Equatable {
     var trackBOffsetSeconds: Double = 0
     /// Diariser speaker id ("S1", "S2", …) -> display name after naming/rename.
     var speakerNames: [String: String]
+    /// The Outlook event this recording belongs to, when the recording was
+    /// started from a calendar prompt. Nil for a recording started by hand.
+    /// It rides the manifest so Flow can hang the recording off the event.
+    var calendarEventId: String?
 
     /// Hand-written so a `meeting.json` recorded before `trackBOffsetSeconds`
     /// existed still loads (as 0, which is what those recordings assumed).
@@ -49,12 +53,13 @@ struct MeetingRecord: Codable, Equatable {
         trackBSeconds = try c.decode(Double.self, forKey: .trackBSeconds)
         trackBOffsetSeconds = try c.decodeIfPresent(Double.self, forKey: .trackBOffsetSeconds) ?? 0
         speakerNames = try c.decode([String: String].self, forKey: .speakerNames)
+        calendarEventId = try c.decodeIfPresent(String.self, forKey: .calendarEventId)
     }
 
     init(id: String, startedAt: Date, endedAt: Date?, title: String, attendees: [String],
          consent: MeetingConsent, status: MeetingStatus, failureReason: String?,
          trackASeconds: Double, trackBSeconds: Double, trackBOffsetSeconds: Double = 0,
-         speakerNames: [String: String]) {
+         speakerNames: [String: String], calendarEventId: String? = nil) {
         self.id = id
         self.startedAt = startedAt
         self.endedAt = endedAt
@@ -67,6 +72,7 @@ struct MeetingRecord: Codable, Equatable {
         self.trackBSeconds = trackBSeconds
         self.trackBOffsetSeconds = trackBOffsetSeconds
         self.speakerNames = speakerNames
+        self.calendarEventId = calendarEventId
     }
 }
 

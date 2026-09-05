@@ -200,6 +200,7 @@ struct MeetingUploader: Sendable {
             attendees: record.attendees,
             consent: MeetingManifest.Consent(confirmedAt: record.consent.confirmedAt,
                                              wordingVersion: record.consent.wordingVersion),
+            calendarEventId: record.calendarEventId,
             speakers: speakers,
             segments: segments)
     }

@@ -83,13 +83,15 @@ final class MeetingRecorder: ObservableObject {
                         systemStartOffset: offset)
     }
 
-    func start(title: String, attendees: [String], consent: MeetingConsent) async throws -> MeetingRecord {
+    func start(title: String, attendees: [String], consent: MeetingConsent,
+               calendarEventId: String? = nil) async throws -> MeetingRecord {
         guard !isRecording else { throw MeetingError.alreadyRecording }
         let now = Date()
         var rec = MeetingRecord(id: MeetingStore.newMeetingID(at: now), startedAt: now, endedAt: nil,
                                 title: title, attendees: attendees, consent: consent, status: .recording,
                                 failureReason: nil, trackASeconds: 0, trackBSeconds: 0,
-                                trackBOffsetSeconds: 0, speakerNames: [:])
+                                trackBOffsetSeconds: 0, speakerNames: [:],
+                                calendarEventId: calendarEventId)
         try MeetingStore.save(rec)
         // Both WAVs always exist, even if a capture is missing, so the
         // transcriber never has to special-case an absent file.

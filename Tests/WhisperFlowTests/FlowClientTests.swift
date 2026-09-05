@@ -93,6 +93,26 @@ final class MeetingManifestEncodingTests: XCTestCase {
         XCTAssertEqual(s2["sampleFile"] as? String, "speaker-S2.m4a")
     }
 
+    /// A recording started by hand carries no event, and the key must not
+    /// appear at all: the server tells "not from a calendar" from "the app
+    /// sent an empty string" by the key being absent.
+    func testCalendarEventIdIsAbsentWhenTheRecordingWasStartedByHand() throws {
+        let obj = try encodedObject()
+        XCTAssertFalse(obj.keys.contains("calendarEventId"))
+    }
+
+    func testCalendarEventIdRidesTheManifestWhenTheRecordingCameFromAPrompt() throws {
+        var m = manifest()
+        m.calendarEventId = "AAMkADRlYzk="
+        let data = try FlowClient.encodeManifest(m)
+        let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(obj["calendarEventId"] as? String, "AAMkADRlYzk=")
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        XCTAssertEqual(try decoder.decode(MeetingManifest.self, from: data).calendarEventId, "AAMkADRlYzk=")
+    }
+
     func testManifestRoundTripsThroughItsOwnDecoder() throws {
         let data = try FlowClient.encodeManifest(manifest())
         let decoder = JSONDecoder()
