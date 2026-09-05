@@ -171,9 +171,24 @@ struct MeetingUploader: Sendable {
                 embedding: speaker.embedding,
                 sampleFile: speaker.sampleFile)
         }
-        let segments = transcript.segments.map {
-            MeetingManifest.Segment(speakerId: wireSpeakerId($0.speakerId),
-                                    start: $0.start, end: $0.end, text: $0.text)
+        // A word the diariser could not place carries the "speaker_unknown" label. The
+        // server only keeps segments whose speaker is in the speakers list, so those words
+        // would vanish from the transcript. Hand them to the speaker who spoke just before
+        // (or, at the very start, just after) so nothing said is lost.
+        let known = Set(voices.speakers.map(\.speakerId))
+        var lastKnown: String? = nil
+        var resolved: [String] = []
+        for seg in transcript.segments {
+            if known.contains(seg.speakerId) { lastKnown = seg.speakerId }
+            resolved.append(known.contains(seg.speakerId) ? seg.speakerId : (lastKnown ?? ""))
+        }
+        if let firstKnown = resolved.first(where: { !$0.isEmpty }) {
+            for i in resolved.indices where resolved[i].isEmpty { resolved[i] = firstKnown }
+        }
+        let segments = zip(transcript.segments, resolved).compactMap { seg, id -> MeetingManifest.Segment? in
+            guard !id.isEmpty else { return nil }
+            return MeetingManifest.Segment(speakerId: wireSpeakerId(id),
+                                           start: seg.start, end: seg.end, text: seg.text)
         }
         return MeetingManifest(
             title: record.title,
