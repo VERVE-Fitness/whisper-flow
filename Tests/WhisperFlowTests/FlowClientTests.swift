@@ -168,3 +168,47 @@ final class FlowClientWiringTests: XCTestCase {
         XCTAssertNil(pending.summary)
     }
 }
+
+final class FlowConnectURLTests: XCTestCase {
+    func testParsesTokenAndServer() throws {
+        let url = URL(string: "whisperflow://connect?token=abc123&server=https%3A%2F%2Fflow.vervefitness.ai")!
+        let connect = try XCTUnwrap(FlowConnectURL.parse(url))
+        XCTAssertEqual(connect.token, "abc123")
+        XCTAssertEqual(connect.server, "https://flow.vervefitness.ai")
+    }
+
+    func testMissingServerMeansProduction() throws {
+        let connect = try XCTUnwrap(FlowConnectURL.parse(URL(string: "whisperflow://connect?token=abc123")!))
+        XCTAssertNil(connect.server)
+    }
+
+    func testAcceptsTheSlashedFormAndTrimsATrailingSlash() throws {
+        let url = URL(string: "whisperflow:///connect?token=abc&server=http://127.0.0.1:8788/")!
+        let connect = try XCTUnwrap(FlowConnectURL.parse(url))
+        XCTAssertEqual(connect.token, "abc")
+        XCTAssertEqual(connect.server, "http://127.0.0.1:8788")
+    }
+
+    /// A link that names a server we would not talk to is treated as if it
+    /// named none, rather than pointing the app at something odd.
+    func testNonHTTPServerIsIgnored() throws {
+        let url = URL(string: "whisperflow://connect?token=abc&server=file:///etc")!
+        XCTAssertNil(try XCTUnwrap(FlowConnectURL.parse(url)).server)
+    }
+
+    func testRejectsWrongSchemeWrongActionAndEmptyToken() {
+        XCTAssertNil(FlowConnectURL.parse(URL(string: "https://connect?token=abc")!))
+        XCTAssertNil(FlowConnectURL.parse(URL(string: "whisperflow://something-else?token=abc")!))
+        XCTAssertNil(FlowConnectURL.parse(URL(string: "whisperflow://connect?token=")!))
+        XCTAssertNil(FlowConnectURL.parse(URL(string: "whisperflow://connect")!))
+    }
+
+    /// Nothing that reaches stderr may carry the token.
+    func testRedactionHidesTheToken() {
+        let url = URL(string: "whisperflow://connect?token=super-secret&server=https://flow.vervefitness.ai")!
+        let line = FlowConnectURL.redacted(url)
+        XCTAssertFalse(line.contains("super-secret"))
+        XCTAssertTrue(line.contains("token=(hidden)"))
+        XCTAssertTrue(line.contains("https://flow.vervefitness.ai"))
+    }
+}

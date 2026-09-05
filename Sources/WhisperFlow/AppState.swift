@@ -69,6 +69,33 @@ final class AppState: ObservableObject {
     @Published var lastMeetingID: String?
     private var meetingTicker: AnyCancellable?
 
+    // MARK: - Flow connection
+
+    /// Who this Mac is connected to Flow as, once `me()` has answered. Nil
+    /// means either no token or a token Flow has not confirmed this launch.
+    @Published var flowMe: FlowMe?
+    /// Last thing the connection did, for the menu ("Connecting…", an error).
+    @Published var flowStatus: String?
+    let flow = FlowClient.shared
+
+    /// Remembered across launches so the menu can say "connected" before the
+    /// first `me()` of the session comes back.
+    static let recogniseMeDefaultsKey = "flowRecogniseMe"
+    var flowRecogniseMe: Bool { UserDefaults.standard.bool(forKey: Self.recogniseMeDefaultsKey) }
+
+    /// One line for the menu. Never shows the token.
+    var flowMenuLine: String {
+        if let flowMe {
+            let who = flowMe.name.isEmpty ? flowMe.email : flowMe.name
+            return "Flow: connected as \(who)"
+        }
+        return flow.isConnected ? "Flow: connected" : "Flow: not connected"
+    }
+
+    var flowSettingsURL: URL {
+        URL(string: flow.serverBase + "/whisper-settings") ?? URL(string: "https://flow.vervefitness.ai/whisper-settings")!
+    }
+
     /// Concrete, not the `TranscriptionBackend` protocol: MeetingTranscriber
     /// needs `transcribeLong(url:)`, which only Parakeet has (it is the
     /// disk-backed long-form path, and there is no second backend shipping).
@@ -230,6 +257,7 @@ final class AppState: ObservableObject {
         accessibility.checkAndPromptIfNeeded()
         refreshInputDevices()
         startUpdateChecks()
+        refreshFlowIdentity()
 
         pill.onTapStop = { [weak self] in
             guard let self else { return }
@@ -767,6 +795,60 @@ final class AppState: ObservableObject {
                 pill.show(.failed(error.localizedDescription))
             }
         }
+    }
+
+    // MARK: - Flow connection
+
+    /// Handles `whisperflow://connect?token=…&server=…`: stores the token in
+    /// the keychain, asks Flow who it belongs to, and says so on the pill.
+    func handleFlowURL(_ url: URL) {
+        guard let connect = FlowConnectURL.parse(url) else {
+            flowStatus = "That link was not a Whisper Flow connection link"
+            pill.show(.failed("that link did not carry a connection"))
+            return
+        }
+        flowStatus = "Connecting to Flow…"
+        Task {
+            do {
+                let me = try await flow.connect(token: connect.token, server: connect.server)
+                applyFlowIdentity(me)
+                let who = me.name.isEmpty ? me.email : me.name
+                flowStatus = "Connected as \(who)"
+                pill.show(.flowConnected(name: who))
+                FileHandle.standardError.write(Data("[flow] connected as \(me.email) to \(flow.serverBase), recognise_me=\(me.recogniseMe), \(me.profiles.count) voice profiles\n".utf8))
+            } catch {
+                flowMe = nil
+                flowStatus = "Could not connect: \(error.localizedDescription)"
+                pill.show(.failed(error.localizedDescription))
+                FileHandle.standardError.write(Data("[flow] connect failed: \(error.localizedDescription)\n".utf8))
+            }
+        }
+    }
+
+    /// Confirms the stored token at launch, quietly. A failure here is not
+    /// worth a pill: the menu line says "not connected" and that is enough.
+    func refreshFlowIdentity() {
+        guard flow.isConnected else { return }
+        Task {
+            do {
+                applyFlowIdentity(try await flow.me())
+            } catch {
+                FileHandle.standardError.write(Data("[flow] could not confirm the stored token: \(error.localizedDescription)\n".utf8))
+                if let flowError = error as? FlowError, flowError == .unauthorised {
+                    flowMe = nil
+                    flowStatus = "This Mac was disconnected in Flow; connect it again"
+                }
+            }
+        }
+    }
+
+    private func applyFlowIdentity(_ me: FlowMe) {
+        flowMe = me
+        UserDefaults.standard.set(me.recogniseMe, forKey: Self.recogniseMeDefaultsKey)
+    }
+
+    func openFlowSettings() {
+        NSWorkspace.shared.open(flowSettingsURL)
     }
 
     func openMeetingFolder(_ id: String) {

@@ -78,6 +78,20 @@ struct MenuBarContent: View {
 
         Divider()
 
+        // Flow connection. A meeting cannot be recorded until this says
+        // connected, because the consent wording promises the audio reaches
+        // VERVE's system and it only does once a token is on this Mac.
+        Text(state.flowMenuLine)
+            .foregroundStyle(.secondary)
+        if let status = state.flowStatus {
+            Text(status)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        Button("Whisper Flow settings…") { state.openFlowSettings() }
+
+        Divider()
+
         Button("Show Transcript Window") {
             openTranscriptWindow()
         }

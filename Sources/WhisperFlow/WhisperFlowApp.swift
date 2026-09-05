@@ -100,6 +100,31 @@ enum WhisperFlowMain {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var state: AppState?
 
+    /// The `whisperflow://connect?token=…` handler. SwiftUI's `onOpenURL`
+    /// needs a window in the responder chain to fire reliably, and this is an
+    /// LSUIElement app whose only UI at launch is a menu bar item, so the URL
+    /// is taken straight off the Apple Event instead. Registered in
+    /// `willFinishLaunching`, which is before the system delivers a GetURL
+    /// event to an app it launched to open a link.
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        NSAppleEventManager.shared().setEventHandler(
+            self,
+            andSelector: #selector(handleGetURLEvent(_:withReplyEvent:)),
+            forEventClass: AEEventClass(kInternetEventClass),
+            andEventID: AEEventID(kAEGetURL))
+    }
+
+    @objc func handleGetURLEvent(_ event: NSAppleEventDescriptor, withReplyEvent reply: NSAppleEventDescriptor) {
+        guard let string = event.paramDescriptor(forKeyword: keyDirectObject)?.stringValue,
+              let url = URL(string: string) else {
+            FileHandle.standardError.write(Data("[flow] a URL arrived that could not be read\n".utf8))
+            return
+        }
+        // The token is never printed, here or anywhere else.
+        FileHandle.standardError.write(Data("[flow] opened \(FlowConnectURL.redacted(url))\n".utf8))
+        Task { @MainActor [weak self] in self?.state?.handleFlowURL(url) }
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Own the local LLM cleanup backend end-to-end: start it here,
         // stop it in applicationWillTerminate below, so WhisperFlow never

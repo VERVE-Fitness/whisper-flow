@@ -21,15 +21,18 @@ enum PillState: Equatable {
     /// meeting that runs for an hour with a dictation that runs for ten
     /// seconds -- and so nobody assumes Right Option will stop it.
     case meeting(elapsed: Double)
-    /// Post-meeting work: transcribing, separating speakers, summarising.
-    /// The payload is whatever MeetingTranscriber last reported, including
-    /// the diariser's percentage, because the first run of that model
-    /// downloads 22 MB and an unlabelled spinner reads as a hang.
+    /// Post-meeting work: transcribing, separating speakers, uploading,
+    /// waiting on the summary. The payload is whatever the transcriber or the
+    /// uploader last reported, including the diariser's percentage, because
+    /// the first run of that model downloads 22 MB and an unlabelled spinner
+    /// reads as a hang.
     case meetingProcessing(String)
+    /// This Mac just connected to Flow. Terminal, so it auto-hides.
+    case flowConnected(name: String)
 
     var isTerminal: Bool {
         switch self {
-        case .inserted, .copiedOnly, .discarded, .failed: return true
+        case .inserted, .copiedOnly, .discarded, .failed, .flowConnected: return true
         default: return false
         }
     }
@@ -86,6 +89,11 @@ private struct PillContentView: View {
                 ProgressView()
                     .controlSize(.small)
                 Text(status)
+                    .lineLimit(1)
+            case .flowConnected(let name):
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+                Text("Connected to Flow as \(name)")
                     .lineLimit(1)
             }
         }
