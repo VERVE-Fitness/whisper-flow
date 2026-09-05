@@ -203,6 +203,36 @@ final class SelfUpdaterTests: XCTestCase {
         }
     }
 
+    // MARK: - The pill the copy comes back with
+
+    func testTheCopyAnUpdateStartedSaysWhatItIsNow() {
+        XCTAssertEqual(SelfUpdater.launchPill(didSelfUpdate: true, accessibilityReask: false, version: "2026.9.10"),
+                       .updated(version: "2026.9.10"))
+        XCTAssertNil(SelfUpdater.launchPill(didSelfUpdate: false, accessibilityReask: false, version: "2026.9.10"))
+    }
+
+    /// macOS drops the Accessibility grant when the signed binary changes, so
+    /// a self-update is exactly the case that costs it. That ask wins the
+    /// pill: "Updated to v..." is news, "grant Accessibility again" is a job.
+    func testTheAccessibilityAskWinsThePillAfterAnUpdate() {
+        XCTAssertEqual(SelfUpdater.launchPill(didSelfUpdate: true, accessibilityReask: true, version: "2026.9.10"),
+                       .accessibilityAfterUpdate)
+        XCTAssertEqual(SelfUpdater.launchPill(didSelfUpdate: false, accessibilityReask: true, version: "2026.9.10"),
+                       .accessibilityAfterUpdate)
+    }
+
+    /// The re-ask runs off the stored version key, which nothing in the
+    /// update path writes, so a self-update from 2026.9.9 to 2026.9.10 still
+    /// looks like a new version to it.
+    func testASelfUpdateStillTriggersTheAccessibilityReask() {
+        XCTAssertTrue(AccessibilityPermission.shouldReaskAfterUpdate(
+            currentVersion: "2026.9.10", lastCheckedVersion: "2026.9.9", isTrusted: false))
+        // And a relaunch that changed nothing but the folder (a move) is not
+        // a new version, so it does not ask.
+        XCTAssertFalse(AccessibilityPermission.shouldReaskAfterUpdate(
+            currentVersion: "2026.9.10", lastCheckedVersion: "2026.9.10", isTrusted: false))
+    }
+
     // MARK: - The pill
 
     func testTheDownloadPillStaysUpAndTheOthersHideThemselves() {

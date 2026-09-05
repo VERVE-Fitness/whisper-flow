@@ -296,10 +296,17 @@ final class AppState: ObservableObject {
         // An update replaces the signed binary and macOS drops the
         // Accessibility grant with it, which reads as "the app stopped
         // typing". Ask again, once per new version, and say why.
-        if accessibility.handleVersionChange() {
-            pill.show(.accessibilityAfterUpdate)
-        } else {
-            accessibility.checkAndPromptIfNeeded()
+        let accessibilityReask = accessibility.handleVersionChange()
+        if !accessibilityReask { accessibility.checkAndPromptIfNeeded() }
+        // A one-click update restarts the app, and the copy that comes back
+        // says so. If the same update also cost the Accessibility grant, that
+        // ask wins the pill: it is the one message that needs something done
+        // about it.
+        if let launchPill = SelfUpdater.launchPill(
+            didSelfUpdate: SelfUpdater.didSelfUpdate(arguments: CommandLine.arguments),
+            accessibilityReask: accessibilityReask,
+            version: AccessibilityPermission.currentVersion) {
+            pill.show(launchPill)
         }
         refreshInputDevices()
         // A copy left in Downloads or run off a disk image loses its macOS
