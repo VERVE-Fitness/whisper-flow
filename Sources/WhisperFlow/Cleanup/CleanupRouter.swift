@@ -27,15 +27,21 @@ struct CleanupRouter: Sendable {
     /// - Parameter context: recent document text before the caret, captured
     ///   once at recording start; passed through to the LLM backend for
     ///   spelling reference only (feature: context-aware spelling).
-    func clean(_ raw: String, context: String? = nil) async -> CleanupResult {
+    func clean(_ rawInput: String, context: String? = nil) async -> CleanupResult {
         let start = Date()
         let backend = await resolveBackend()
         let phrases = PhraseStore.shared.phrases
-        // The phrase list rides in with the personal dictionary, so the LLM
-        // sees "VERVE Pulse" spelled the way the team spells it and stops
-        // inventing its own rendering; the deterministic pass in finalize()
-        // is what actually guarantees the spelling either way.
-        let dictionary = Self.dictionaryWithPhrases(UserLexicon.shared.dictionary, phrases: phrases)
+        // Phrases are applied BEFORE the LLM sees the text, deterministically,
+        // and are deliberately NOT handed to the model as vocabulary hints.
+        // Niall's first live test (5 Sep 2026): "the tory rack is on the truck"
+        // with fourteen team phrases in the prompt came back as "The VERVE Tori
+        // Functional Trainer on the truck." A small local model treats a list
+        // of product names as an invitation to use them. So the model gets
+        // text with the phrases already right, and the personal dictionary
+        // only; the invention guard below throws out any output that adds a
+        // phrase the speaker never said.
+        let raw = PhraseMatcher.applyLogging(rawInput, phrases: phrases)
+        let dictionary = UserLexicon.shared.dictionary
         let corrections = UserLexicon.shared.corrections
 
         func elapsedMs() -> Int { Int(Date().timeIntervalSince(start) * 1000) }
@@ -121,6 +127,14 @@ struct CleanupRouter: Sendable {
             // the request's words, passing retention, but adds its own framing).
             if Self.addsTooManyNewWords(raw: raw, cleaned: trimmed, dictionary: dictionary) {
                 FileHandle.standardError.write(Data("[cleanup] \(backend.name) introduced too many new words (looks like an answer, not a cleanup); using raw\n".utf8))
+                return finalize(raw, backendName: backend.name, fellBackToRaw: true)
+            }
+            // Invention guard: a team phrase in the output that the speaker
+            // never said is the model reaching for a product name it knows.
+            // The phrase pass already ran on the raw, so anything the raw
+            // does not contain was not said in any spelling.
+            if let invented = Self.inventedPhrase(raw: raw, cleaned: trimmed, phrases: phrases) {
+                FileHandle.standardError.write(Data("[cleanup] \(backend.name) introduced the phrase \"\(invented)\" that was not said; using raw\n".utf8))
                 return finalize(raw, backendName: backend.name, fellBackToRaw: true)
             }
             // Dropped-question guard: the retention and additions guards are
@@ -492,20 +506,27 @@ struct CleanupRouter: Sendable {
         return sentences
     }
 
-    /// The personal dictionary with the phrase list appended, de-duplicated
-    /// case-insensitively. The dictionary feeds the LLM prompt and the three
-    /// guard rails that treat a dictionary term as an expected correction
-    /// rather than an invention, and a phrase is exactly that.
-    static func dictionaryWithPhrases(_ dictionary: [String], phrases: [FlowPhrase]) -> [String] {
-        var merged = dictionary
-        for phrase in phrases {
-            let term = phrase.phrase.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !term.isEmpty else { continue }
-            if !merged.contains(where: { $0.caseInsensitiveCompare(term) == .orderedSame }) {
-                merged.append(term)
-            }
+    /// The first team phrase that appears (whole words, case-insensitive) in
+    /// the cleaned text but not in the raw the model was given. The raw has
+    /// already had the phrase pass, so a phrase absent from it was not said
+    /// in any spelling; its presence in the output is invention. Single-word
+    /// phrases that are also ordinary words are still caught: "Flow" in the
+    /// output when nobody said flow is exactly the failure this exists for.
+    static func inventedPhrase(raw: String, cleaned: String, phrases: [FlowPhrase]) -> String? {
+        guard !phrases.isEmpty else { return nil }
+        let rawWords = words(raw)
+        let cleanedWords = words(cleaned)
+        func contains(_ haystack: [String], _ needle: [String]) -> Bool {
+            guard !needle.isEmpty, haystack.count >= needle.count else { return false }
+            for i in 0...(haystack.count - needle.count) where Array(haystack[i..<(i + needle.count)]) == needle { return true }
+            return false
         }
-        return merged
+        for phrase in phrases {
+            let needle = words(phrase.phrase)
+            guard !needle.isEmpty else { continue }
+            if contains(cleanedWords, needle) && !contains(rawWords, needle) { return phrase.phrase }
+        }
+        return nil
     }
 
     /// Applies the deterministic misheard->corrected map, case-insensitive,
