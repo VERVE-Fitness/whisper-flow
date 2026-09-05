@@ -92,6 +92,11 @@ enum WhisperFlowMain {
             }
             exit(runCLIDualCaptureTest(seconds: seconds))
         }
+        // Before any window, hotkey or permission prompt exists: if another
+        // copy of this app is already running from a different folder, one of
+        // the two has to go, or both hold the same hotkey and every dictation
+        // arrives twice.
+        SingleInstance.enforceAtLaunch(arguments: args)
         WhisperFlowApp.main()
     }
 }
