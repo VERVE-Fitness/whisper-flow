@@ -273,7 +273,14 @@ final class AppState: ObservableObject {
                 if trusted { self?.installHotkeys() }
             }
 
-        accessibility.checkAndPromptIfNeeded()
+        // An update replaces the signed binary and macOS drops the
+        // Accessibility grant with it, which reads as "the app stopped
+        // typing". Ask again, once per new version, and say why.
+        if accessibility.handleVersionChange() {
+            pill.show(.accessibilityAfterUpdate)
+        } else {
+            accessibility.checkAndPromptIfNeeded()
+        }
         refreshInputDevices()
         startUpdateChecks()
         refreshFlowIdentity()
