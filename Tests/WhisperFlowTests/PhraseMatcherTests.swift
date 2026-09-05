@@ -225,11 +225,46 @@ final class PhraseCacheTests: XCTestCase {
 }
 
 final class PhraseWiringTests: XCTestCase {
-    /// Phrases must reach the LLM's dictionary hints as well as the
-    /// deterministic pass, and must not be listed twice.
-    func testThePhraseListJoinsTheDictionaryHints() {
-        let merged = CleanupRouter.dictionaryWithPhrases(["VERVE", "Tori"], phrases: vervePhrases)
-        XCTAssertEqual(merged, ["VERVE", "Tori", "VERVE Pulse", "functional trainer"])
+    /// Niall's first live dictation with the phrase list (5 Sep 2026):
+    /// "the tory rack is on the truck" came back from the cleanup model as
+    /// "The VERVE Tori Functional Trainer on the truck." The invention guard
+    /// must name the phrase the model added so the raw is used instead.
+    func testAPhraseTheSpeakerNeverSaidIsFlaggedAsInvented() {
+        let phrases = [FlowPhrase(phrase: "VERVE", heardAs: []),
+                       FlowPhrase(phrase: "Tori", heardAs: ["tory"]),
+                       FlowPhrase(phrase: "Functional Trainer", heardAs: [])]
+        let raw = PhraseMatcher.apply("the tory rack is on the truck", phrases: phrases).text
+        XCTAssertEqual(raw, "the Tori rack is on the truck")
+        let invented = CleanupRouter.inventedPhrase(raw: raw,
+                                                    cleaned: "The VERVE Tori Functional Trainer on the truck.",
+                                                    phrases: phrases)
+        XCTAssertEqual(invented, "VERVE")
+    }
+
+    /// A phrase that was said (in any spelling, since the phrase pass runs on
+    /// the raw first) is not an invention, and neither is ordinary cleanup.
+    func testAPhraseThatWasSaidIsNotAnInvention() {
+        let phrases = [FlowPhrase(phrase: "Tori", heardAs: ["tory"]),
+                       FlowPhrase(phrase: "VERVE Pulse", heardAs: ["verve pulls"])]
+        let raw = PhraseMatcher.apply("um the tory rack and verve pulls are live", phrases: phrases).text
+        XCTAssertNil(CleanupRouter.inventedPhrase(raw: raw,
+                                                  cleaned: "The Tori rack and VERVE Pulse are live.",
+                                                  phrases: phrases))
+        XCTAssertNil(CleanupRouter.inventedPhrase(raw: "nothing special here",
+                                                  cleaned: "Nothing special here.",
+                                                  phrases: phrases))
+    }
+
+    /// Multi-word phrases are matched as a whole: "Functional" alone in the
+    /// output is not the phrase "Functional Trainer".
+    func testOnlyTheWholePhraseCounts() {
+        let phrases = [FlowPhrase(phrase: "Functional Trainer", heardAs: [])]
+        XCTAssertNil(CleanupRouter.inventedPhrase(raw: "a functional design",
+                                                  cleaned: "A functional design.",
+                                                  phrases: phrases))
+        XCTAssertEqual(CleanupRouter.inventedPhrase(raw: "a functional design",
+                                                    cleaned: "A Functional Trainer design.",
+                                                    phrases: phrases), "Functional Trainer")
     }
 
     /// Every meeting segment goes through the same matcher before the
