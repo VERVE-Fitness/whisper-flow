@@ -1,6 +1,6 @@
 # Whisper Flow
 
-Fully local macOS voice dictation (privacy-first Wispr Flow clone). Menu-bar accessory app: mic → streaming Parakeet transcription (Core ML on the Neural Engine, via [FluidAudio](https://github.com/FluidInference/FluidAudio)) → LLM cleanup on stop → text inserted at the cursor in whatever app has focus. No audio or text ever leaves the machine. Network access: the one-time Parakeet model download from HuggingFace, the one-time `llama3.2:3b` pull through the embedded Ollama, calls to that Ollama on 127.0.0.1, and a request to the GitHub releases API every 6 h to show "Update available" in the menu.
+Fully local macOS voice dictation (privacy-first Wispr Flow clone). Menu-bar accessory app: mic → streaming Parakeet transcription (Core ML on the Neural Engine, via [FluidAudio](https://github.com/FluidInference/FluidAudio)) → LLM cleanup on stop → text inserted at the cursor in whatever app has focus. No audio or text ever leaves the machine. Network access: the one-time Parakeet model download from HuggingFace, the one-time `llama3.2:3b` pull through the embedded Ollama, calls to that Ollama on 127.0.0.1, a request to the GitHub releases API every 6 h to show "Update available" in the menu, and the release zip itself when somebody clicks that menu item.
 
 Requires Apple silicon and macOS 14 (Sonoma) or newer.
 
@@ -33,6 +33,23 @@ gh release create "$TAG" --title "Whisper Flow $TAG" --notes-file notes.md \
 ```
 
 The download page (`flow.vervefitness.ai/whisper`) links to `releases/latest/download/WhisperFlow.zip`, so it never needs editing for a new build. The in-app update check compares the latest tag's sha suffix with `WFGitCommit`, so tags must keep the `-<sha>` suffix and assets must not be rebuilt in place under an old tag.
+
+## Updating
+
+**Nothing has to be uninstalled first.** When a release is published, the menu bar shows **Update available (v...)**. Clicking it does the whole thing (Niall, 5 Sep 2026: "do I have to uninstall the old version before installing new versions, or can you make a fix so it isn't necessary?"):
+
+1. Downloads `releases/latest/download/WhisperFlow.zip`, with the pill showing "Downloading update 43%".
+2. Unpacks it with `ditto -x -k`.
+3. Checks the new copy with `spctl --assess --type exec`: it has to be accepted, and it has to be a Developer ID build.
+4. Checks the new copy's `WFGitCommit` against the sha in the release tag (`vYYYY.MM.DD-<sha>`), so an old asset re-uploaded under a new tag is refused.
+5. Moves the old copy to the Trash (not deleted: a bad build is one drag away from being undone) and moves the new one into place. A copy running from outside an Applications folder is installed to `/Applications` instead of being replaced where it stands.
+6. Restarts, and the copy that comes back says "Updated to v...".
+
+Every step writes one `[update] ...` line to stderr. Any failure leaves the running app untouched, puts "Update failed: `<reason>`, download from Flow" on the pill and opens the download page. Nothing happens without the click: there is no auto-install and no background download.
+
+**Manual path, still there.** **Download update from Flow…** in the same menu opens `flow.vervefitness.ai/whisper` as before: quit Whisper Flow, unzip, drag `WhisperFlow.app` into Applications and click Replace. Use it when the one-click install cannot finish, for example on a Mac where `/Applications` is not writable.
+
+**Two copies, and stale copies.** Only one Whisper Flow runs at a time. A launch that finds another copy of the same bundle identifier running from a different folder compares `WFBuildDate` (then `CFBundleVersion`): the newer build asks the older one to quit and forces it after 3 s, and an older build launching against a newer one quits itself. Decisions are logged as `[instance] ...`. A copy running from Downloads, the Desktop or a mounted disk image is offered a move on launch, once per place it is run from: "Move Whisper Flow to Applications?" with **Move** and **Not now**; the declined paths are remembered in `UserDefaults` under `declinedMoveToApplicationsPaths`.
 
 ## Run
 
@@ -273,6 +290,9 @@ The debug binary, `$HOME/.cache/whisperflow-build-scratch/debug/WhisperFlow`:
 7. Check stderr for the [stt] streaming N words, batch M words line on every dictation under two minutes.
 8. Dictate for three minutes: no batch pass, no eight second wait at Stop.
 9. Install a new build without granting Accessibility: the pill says "Update installed: grant Accessibility again", once.
+10. Click "Update available (v...)" on a Mac running an older release: the pill counts the download up, the app restarts by itself, and the copy that comes back says "Updated to v...".
+11. Run a second copy from Downloads while the one in Applications is running: one of the two quits, the newer one lives, and stderr says which and why.
+12. Launch a copy from Downloads: it offers to move to Applications; say "Not now" and it never asks about that copy again.
 ```
 
 ## Phrases and the last two seconds
@@ -324,4 +344,4 @@ Each dictation appends one JSONL line to `~/Library/Application Support/WhisperF
 ## Roadmap
 
 - **Developer ID signing + notarisation** so first launch is one click (needs the Account Holder to create the certificate).
-- **Sparkle-style in-app update** instead of "download again from the page".
+- ~~**Sparkle-style in-app update** instead of "download again from the page".~~ Done 5 Sep 2026: see **Updating**.
