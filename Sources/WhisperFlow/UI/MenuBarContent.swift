@@ -69,6 +69,10 @@ struct MenuBarContent: View {
             Text("meeting: \(status)")
                 .foregroundStyle(.secondary)
         }
+        Toggle("Meeting prompts", isOn: Binding(
+            get: { state.meetingPromptsEnabled },
+            set: { state.setMeetingPrompts($0) }
+        ))
         Button("Show last meeting…") {
             openMeetingWindow()
         }

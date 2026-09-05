@@ -133,6 +133,147 @@ struct FlowMe: Codable, Equatable {
     }
 }
 
+/// A meeting bot that Flow has on the way, or already in the room. The
+/// statuses are the server's: scheduled, joining, in_call, ingesting, done,
+/// failed.
+struct FlowActiveBot: Codable, Equatable {
+    let id: String
+    let title: String?
+    let meetingURL: String?
+    let startsAt: Date?
+    let status: String
+    let calendarEventId: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, title, status
+        case meetingURL = "meeting_url"
+        case startsAt = "starts_at"
+        case calendarEventId = "calendar_event_id"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        title = try c.decodeIfPresent(String.self, forKey: .title)
+        meetingURL = try c.decodeIfPresent(String.self, forKey: .meetingURL)
+        startsAt = try c.decodeIfPresent(Date.self, forKey: .startsAt)
+        status = try c.decodeIfPresent(String.self, forKey: .status) ?? ""
+        calendarEventId = try c.decodeIfPresent(String.self, forKey: .calendarEventId)
+    }
+
+    init(id: String, title: String? = nil, meetingURL: String? = nil, startsAt: Date? = nil,
+         status: String, calendarEventId: String? = nil) {
+        self.id = id
+        self.title = title
+        self.meetingURL = meetingURL
+        self.startsAt = startsAt
+        self.status = status
+        self.calendarEventId = calendarEventId
+    }
+}
+
+struct FlowActiveBots: Codable, Equatable {
+    let bots: [FlowActiveBot]
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        bots = try c.decodeIfPresent([FlowActiveBot].self, forKey: .bots) ?? []
+    }
+
+    init(bots: [FlowActiveBot]) { self.bots = bots }
+}
+
+/// The bot Flow has attached to one calendar event, if any.
+struct FlowEventBot: Codable, Equatable {
+    let id: String
+    let status: String
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(String.self, forKey: .id) ?? ""
+        status = try c.decodeIfPresent(String.self, forKey: .status) ?? ""
+    }
+
+    init(id: String, status: String) {
+        self.id = id
+        self.status = status
+    }
+}
+
+/// One row of the caller's Outlook calendar as Flow hands it over.
+/// `attendees` already excludes the caller, so "at least one other person on
+/// this call" is simply a non-empty list.
+struct FlowCalendarEvent: Codable, Equatable {
+    let id: String
+    let subject: String
+    let start: Date
+    let end: Date?
+    let isOnline: Bool
+    let joinURL: String?
+    let attendees: [String]
+    let organizer: String?
+    let response: String?
+    let bot: FlowEventBot?
+
+    enum CodingKeys: String, CodingKey {
+        case id, subject, start, end, attendees, organizer, response, bot
+        case isOnline = "is_online"
+        case joinURL = "join_url"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        subject = try c.decodeIfPresent(String.self, forKey: .subject) ?? ""
+        start = try c.decode(Date.self, forKey: .start)
+        end = try c.decodeIfPresent(Date.self, forKey: .end)
+        isOnline = try c.decodeIfPresent(Bool.self, forKey: .isOnline) ?? false
+        joinURL = try c.decodeIfPresent(String.self, forKey: .joinURL)
+        attendees = try c.decodeIfPresent([String].self, forKey: .attendees) ?? []
+        organizer = try c.decodeIfPresent(String.self, forKey: .organizer)
+        response = try c.decodeIfPresent(String.self, forKey: .response)
+        bot = try c.decodeIfPresent(FlowEventBot.self, forKey: .bot)
+    }
+
+    init(id: String, subject: String, start: Date, end: Date? = nil, isOnline: Bool = false,
+         joinURL: String? = nil, attendees: [String] = [], organizer: String? = nil,
+         response: String? = nil, bot: FlowEventBot? = nil) {
+        self.id = id
+        self.subject = subject
+        self.start = start
+        self.end = end
+        self.isOnline = isOnline
+        self.joinURL = joinURL
+        self.attendees = attendees
+        self.organizer = organizer
+        self.response = response
+        self.bot = bot
+    }
+}
+
+struct FlowUpcoming: Codable, Equatable {
+    /// off | declined | all. The app never sets it; it decides whether an
+    /// event is the bot's job or this Mac's.
+    let botMode: String
+    let events: [FlowCalendarEvent]
+
+    enum CodingKeys: String, CodingKey {
+        case events
+        case botMode = "bot_mode"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        botMode = try c.decodeIfPresent(String.self, forKey: .botMode) ?? "off"
+        events = try c.decodeIfPresent([FlowCalendarEvent].self, forKey: .events) ?? []
+    }
+
+    init(botMode: String, events: [FlowCalendarEvent]) {
+        self.botMode = botMode
+        self.events = events
+    }
+}
+
 /// The manifest POSTed to /api/public/whisper/recordings/{id}/complete.
 /// The key names and types here are the contract with the Flow function, so
 /// they are spelled out rather than derived: `startedAt` and `endedAt` are ISO
@@ -198,8 +339,28 @@ struct MeetingManifest: Codable, Equatable {
     var trackBOffsetSeconds: Double
     var attendees: [String]
     var consent: Consent
+    /// Set only when the recording was started from a calendar prompt.
+    /// Omitted from the JSON when nil, so a hand-started recording sends the
+    /// same manifest it always did.
+    var calendarEventId: String?
     var speakers: [Speaker]
     var segments: [Segment]
+
+    init(title: String, startedAt: Date, endedAt: Date?, trackASeconds: Double, trackBSeconds: Double,
+         trackBOffsetSeconds: Double, attendees: [String], consent: Consent,
+         calendarEventId: String? = nil, speakers: [Speaker], segments: [Segment]) {
+        self.title = title
+        self.startedAt = startedAt
+        self.endedAt = endedAt
+        self.trackASeconds = trackASeconds
+        self.trackBSeconds = trackBSeconds
+        self.trackBOffsetSeconds = trackBOffsetSeconds
+        self.attendees = attendees
+        self.consent = consent
+        self.calendarEventId = calendarEventId
+        self.speakers = speakers
+        self.segments = segments
+    }
 }
 
 struct FlowCompleteResponse: Codable, Equatable {
@@ -278,9 +439,16 @@ final class FlowClient: @unchecked Sendable {
     static let maxAttempts = 3
 
     private let session: URLSession
+    /// Tests hand a token straight in. An unsigned test binary has no
+    /// keychain of its own, so a real SecItemAdd from a test run either
+    /// blocks on a prompt or leaves a credential on the machine; neither is
+    /// something a test should do. Nil everywhere else, which is the
+    /// keychain path.
+    private let tokenOverride: String?
 
-    init(session: URLSession = .shared) {
+    init(session: URLSession = .shared, token: String? = nil) {
         self.session = session
+        self.tokenOverride = token
     }
 
     // MARK: Connection
@@ -292,7 +460,7 @@ final class FlowClient: @unchecked Sendable {
         return base.hasSuffix("/") ? String(base.dropLast()) : base
     }
 
-    var token: String? { FlowKeychain.read() }
+    var token: String? { tokenOverride ?? FlowKeychain.read() }
 
     var isConnected: Bool { token != nil }
 
@@ -362,6 +530,25 @@ final class FlowClient: @unchecked Sendable {
         return try decode(FlowRecordingStatus.self, from: data, label: "recording")
     }
 
+    /// The caller's calendar for the next two hours. One attempt: this runs
+    /// on a sixty second timer, so a poll that fails is simply the next
+    /// poll's problem and three retries would only stack up behind it.
+    func upcoming(timeout: TimeInterval = 15) async throws -> FlowUpcoming {
+        let data = try await send(path: "/api/public/whisper/upcoming", method: "GET", body: nil,
+                                  label: "upcoming", attempts: 1, timeout: timeout)
+        return try decode(FlowUpcoming.self, from: data, label: "upcoming")
+    }
+
+    /// The bots Flow has on the way or in a call right now. Called between
+    /// the Record click and the consent gate, so the budget is two seconds
+    /// and there is no retry: a slow or broken answer must never be the
+    /// reason a meeting was not recorded.
+    func activeBots(timeout: TimeInterval = 2) async throws -> [FlowActiveBot] {
+        let data = try await send(path: "/api/public/whisper/bots?active=1", method: "GET", body: nil,
+                                  label: "bots", attempts: 1, timeout: timeout)
+        return try decode(FlowActiveBots.self, from: data, label: "bots").bots
+    }
+
     // MARK: Encoding
 
     /// One encoder for the manifest so the shape cannot drift between the
@@ -383,27 +570,55 @@ final class FlowClient: @unchecked Sendable {
         try manifestEncoder().encode(manifest)
     }
 
+    /// Every date Flow sends is ISO 8601. Graph hands over "2026-09-05T04:32:10Z";
+    /// a timestamptz through PostgREST can arrive with fractional seconds or a
+    /// +00:00 offset instead of a Z. All three are read here rather than in
+    /// each wire type.
+    static func responseDecoder() -> JSONDecoder {
+        let d = JSONDecoder()
+        d.dateDecodingStrategy = .custom { decoder in
+            let c = try decoder.singleValueContainer()
+            let raw = try c.decode(String.self)
+            guard let date = parseISO8601(raw) else {
+                throw DecodingError.dataCorruptedError(in: c, debugDescription: "not an ISO 8601 date: \(raw)")
+            }
+            return date
+        }
+        return d
+    }
+
+    static func parseISO8601(_ raw: String) -> Date? {
+        let withFraction = ISO8601DateFormatter()
+        withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = withFraction.date(from: raw) { return date }
+        let plain = ISO8601DateFormatter()
+        plain.formatOptions = [.withInternetDateTime]
+        return plain.date(from: raw)
+    }
+
     static func contentType(forFileName name: String) -> String {
         name.hasSuffix(".m4a") ? "audio/mp4" : "application/json"
     }
 
     // MARK: Plumbing
 
-    private func request(path: String, method: String) throws -> URLRequest {
+    private func request(path: String, method: String, timeout: TimeInterval = 120) throws -> URLRequest {
         guard let token else { throw FlowError.notConnected }
         guard let url = URL(string: serverBase + path) else { throw FlowError.transport("bad server address") }
         var request = URLRequest(url: url)
         request.httpMethod = method
-        request.timeoutInterval = 120
+        request.timeoutInterval = timeout
         request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization")
         request.setValue(Self.appVersion, forHTTPHeaderField: "X-WhisperFlow-Version")
         return request
     }
 
-    private func send(path: String, method: String, body: Data?, label: String) async throws -> Data {
-        try await withRetries(label: label) { [weak self] in
+    private func send(path: String, method: String, body: Data?, label: String,
+                      attempts: Int = FlowClient.maxAttempts,
+                      timeout: TimeInterval = 120) async throws -> Data {
+        try await withRetries(label: label, attempts: attempts) { [weak self] in
             guard let self else { throw FlowError.notConnected }
-            var request = try self.request(path: path, method: method)
+            var request = try self.request(path: path, method: method, timeout: timeout)
             if let body {
                 request.httpBody = body
                 request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -462,21 +677,24 @@ final class FlowClient: @unchecked Sendable {
 
     private func decode<T: Decodable>(_ type: T.Type, from data: Data, label: String) throws -> T {
         do {
-            return try JSONDecoder().decode(type, from: data)
+            return try Self.responseDecoder().decode(type, from: data)
         } catch {
             throw FlowError.badResponse("\(label): \(error.localizedDescription)")
         }
     }
 
-    private func withRetries<T>(label: String, _ body: @Sendable @escaping () async throws -> T) async throws -> T {
+    private func withRetries<T>(label: String,
+                                attempts: Int = FlowClient.maxAttempts,
+                                _ body: @Sendable @escaping () async throws -> T) async throws -> T {
         var lastError: Error = FlowError.transport("no attempt was made")
-        for attempt in 1...Self.maxAttempts {
+        let budget = max(1, attempts)
+        for attempt in 1...budget {
             do {
                 return try await body()
             } catch {
                 lastError = error
                 let retryable = (error as? FlowError)?.isRetryable ?? true
-                guard retryable, attempt < Self.maxAttempts else {
+                guard retryable, attempt < budget else {
                     FileHandle.standardError.write(Data("[flow] \(label) failed: \(error.localizedDescription)\n".utf8))
                     throw error
                 }
