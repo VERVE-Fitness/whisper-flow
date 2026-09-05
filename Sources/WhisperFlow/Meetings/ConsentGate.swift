@@ -39,6 +39,23 @@ enum ConsentGate {
         return MeetingConsent(confirmedAt: Date(), wordingVersion: wordingVersion)
     }
 
+    /// Shown before the consent gate when Flow already has a bot on this
+    /// meeting (see BotAwareness). "Let the bot do it" is added first, so it
+    /// is the default button and doing nothing is what a stray Return does.
+    /// Returns true when the person chose to record here as well.
+    @MainActor
+    static func presentBotAlreadyRecording(title: String) async -> Bool {
+        let alert = NSAlert()
+        alert.messageText = "VERVE Notes is already recording \(title) into Flow. Recording here as well would give you two copies."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Let the bot do it")
+        alert.addButton(withTitle: "Record here anyway")
+        NSApp.activate(ignoringOtherApps: true)
+        let recordAnyway = alert.runModal() == .alertSecondButtonReturn
+        FileHandle.standardError.write(Data("[bot] the person chose \(recordAnyway ? "record here anyway" : "let the bot do it")\n".utf8))
+        return recordAnyway
+    }
+
     /// Shown instead of the consent gate when this Mac has no Flow token. The
     /// consent wording promises the recording reaches VERVE's system, so it
     /// must not be shown on a Mac where that cannot happen.

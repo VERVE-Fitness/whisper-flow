@@ -738,7 +738,7 @@ final class AppState: ObservableObject {
     /// cancel and nothing is recorded -- there is no path to a recording that
     /// skips this, and the CLI harnesses stamp their own wording version so a
     /// test run can never be mistaken for a real consent.
-    func startMeeting() {
+    func startMeeting(title: String = "", attendees: [String] = [], calendarEventId: String? = nil) {
         guard !meetings.isRecording else { return }
         Task {
             // The consent wording promises the recording reaches VERVE's
@@ -749,18 +749,42 @@ final class AppState: ObservableObject {
                 ConsentGate.presentNotConnected(settingsURL: flowSettingsURL)
                 return
             }
+            // Ask Flow whether one of its bots already has this meeting. Any
+            // failure here is silent and the recording goes ahead: the bot
+            // check is a courtesy, never a gate.
+            if case .botHasIt(let botTitle) = await activeBotDecision() {
+                guard await ConsentGate.presentBotAlreadyRecording(title: botTitle) else {
+                    meetingStatus = "Left to VERVE Notes, nothing recorded here"
+                    return
+                }
+            }
             guard let consent = await ConsentGate.present() else {
                 meetingStatus = "Cancelled, nothing recorded"
                 return
             }
             do {
-                _ = try await meetings.start(title: "", attendees: [], consent: consent)
+                _ = try await meetings.start(title: title, attendees: attendees, consent: consent,
+                                             calendarEventId: calendarEventId)
                 pill.show(.meeting(elapsed: 0))
                 meetingStatus = "Recording"
             } catch {
                 meetingStatus = "Could not start: \(error.localizedDescription)"
                 pill.show(.failed(error.localizedDescription))
             }
+        }
+    }
+
+    /// What Flow's bots are doing, on a two second budget. A slow or broken
+    /// answer reads as `.clear`, so the person still gets the consent gate.
+    private func activeBotDecision() async -> BotAwareness.Decision {
+        do {
+            let bots = try await flow.activeBots()
+            let decision = BotAwareness.decide(bots: bots, now: Date())
+            BotAwareness.logDecision(decision, bots: bots)
+            return decision
+        } catch {
+            BotAwareness.logUnavailable(error)
+            return .clear
         }
     }
 
