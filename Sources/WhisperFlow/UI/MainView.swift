@@ -1,7 +1,12 @@
 import SwiftUI
+import AppKit
 
+/// The transcript window: what was just said, raw and tidied up. The dictionary and the
+/// snippets used to live at the bottom of it; from the settings window they have a proper
+/// home, so this window shows the transcript and points at that.
 struct MainView: View {
     @EnvironmentObject var state: AppState
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         ScrollView {
@@ -69,10 +74,18 @@ struct MainView: View {
             }
 
             Divider()
-            DictionaryEditor()
-
-            Divider()
-            SnippetsEditor()
+            HStack {
+                Button {
+                    NSApp.activate(ignoringOtherApps: true)
+                    openWindow(id: WhisperFlowApp.settingsWindowID)
+                } label: {
+                    Label("Settings…", systemImage: "gearshape")
+                }
+                Text("Dictionary, phrases, snippets and the rest live here now.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
         }
         .padding(16)
         }
@@ -88,126 +101,5 @@ struct MainView: View {
         case .cleaning: return .orange
         case .error: return .gray
         }
-    }
-}
-
-/// "Dictionary…" section: proper nouns/terms injected into the cleanup
-/// prompt so near-misses get spell-corrected. Simple add/delete list --
-/// deliberately no bulk import/export, this is meant to grow a handful of
-/// entries at a time as the speaker notices mishearings.
-private struct DictionaryEditor: View {
-    @State private var words: [String] = UserLexicon.shared.dictionary.sorted()
-    @State private var newWord: String = ""
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Dictionary").font(.caption).foregroundStyle(.secondary)
-            HStack {
-                TextField("Add a name or term…", text: $newWord)
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit(add)
-                Button("Add", action: add).disabled(newWord.trimmingCharacters(in: .whitespaces).isEmpty)
-            }
-            if words.isEmpty {
-                Text("No words yet.").font(.caption).foregroundStyle(.secondary)
-            } else {
-                ForEach(words, id: \.self) { word in
-                    HStack {
-                        Text(word)
-                        if isBuiltin(word) {
-                            Text("built-in").font(.caption2).foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        // Built-ins are compiled into the app, not stored in
-                        // lexicon.json -- removeDictionaryWord only edits the
-                        // stored file, so a trash click on one of these would
-                        // silently no-op (it reappears immediately on the
-                        // next merge). Hiding the button instead of shipping
-                        // a button that visibly does nothing.
-                        if !isBuiltin(word) {
-                            Button(role: .destructive) { remove(word) } label: {
-                                Image(systemName: "trash")
-                            }
-                            .buttonStyle(.borderless)
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    private func add() {
-        let trimmed = newWord.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        UserLexicon.shared.addDictionaryWord(trimmed)
-        words = UserLexicon.shared.dictionary.sorted()
-        newWord = ""
-    }
-
-    private func remove(_ word: String) {
-        UserLexicon.shared.removeDictionaryWord(word)
-        words = UserLexicon.shared.dictionary.sorted()
-    }
-
-    private func isBuiltin(_ word: String) -> Bool {
-        BuiltinLexicon.dictionary.contains { $0.caseInsensitiveCompare(word) == .orderedSame }
-    }
-}
-
-/// "Snippets…" section: a spoken cue that expands to fixed text verbatim,
-/// skipping cleanup entirely (see AppState.matchSnippet).
-private struct SnippetsEditor: View {
-    @State private var snippets: [(cue: String, text: String)] =
-        UserLexicon.shared.snippets.sorted { $0.key < $1.key }.map { ($0.key, $0.value) }
-    @State private var newCue: String = ""
-    @State private var newText: String = ""
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Snippets").font(.caption).foregroundStyle(.secondary)
-            HStack {
-                TextField("Cue (e.g. \"my calendar link\")…", text: $newCue)
-                    .textFieldStyle(.roundedBorder)
-                TextField("Expands to…", text: $newText)
-                    .textFieldStyle(.roundedBorder)
-                Button("Add", action: add)
-                    .disabled(newCue.trimmingCharacters(in: .whitespaces).isEmpty || newText.isEmpty)
-            }
-            if snippets.isEmpty {
-                Text("No snippets yet.").font(.caption).foregroundStyle(.secondary)
-            } else {
-                ForEach(snippets, id: \.cue) { snippet in
-                    HStack {
-                        Text(snippet.cue).bold()
-                        Text("→ \(snippet.text)")
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                        Spacer()
-                        Button(role: .destructive) { remove(snippet.cue) } label: {
-                            Image(systemName: "trash")
-                        }
-                        .buttonStyle(.borderless)
-                    }
-                }
-            }
-        }
-    }
-
-    private func add() {
-        let cue = newCue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cue.isEmpty, !newText.isEmpty else { return }
-        UserLexicon.shared.setSnippet(cue: cue, text: newText)
-        reload()
-        newCue = ""
-        newText = ""
-    }
-
-    private func remove(_ cue: String) {
-        UserLexicon.shared.removeSnippet(cue: cue)
-        reload()
-    }
-
-    private func reload() {
-        snippets = UserLexicon.shared.snippets.sorted { $0.key < $1.key }.map { ($0.key, $0.value) }
     }
 }

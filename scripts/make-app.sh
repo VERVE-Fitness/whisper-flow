@@ -104,6 +104,13 @@ fi
 GIT_SHA="$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 /usr/libexec/PlistBuddy -c "Add :WFGitCommit string $GIT_SHA" "$APP_DIR/Contents/Info.plist" 2>/dev/null \
   || /usr/libexec/PlistBuddy -c "Set :WFGitCommit $GIT_SHA" "$APP_DIR/Contents/Info.plist"
+# When this build was made (UTC, ISO 8601). The menu shows it next to the
+# version in local time, so "which build are you on?" has a date and a time
+# a colleague can read out, not just a commit hash. A release goes up on
+# GitHub within minutes of the build, so build time and upload time agree.
+BUILD_STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+/usr/libexec/PlistBuddy -c "Add :WFBuildDate string $BUILD_STAMP" "$APP_DIR/Contents/Info.plist" 2>/dev/null \
+  || /usr/libexec/PlistBuddy -c "Set :WFBuildDate $BUILD_STAMP" "$APP_DIR/Contents/Info.plist"
 
 codesign "${SIGN_OPTS[@]}" --entitlements "$ENTITLEMENTS" --sign "$CODESIGN_ID" "$APP_DIR" \
   || codesign --force --entitlements "$ENTITLEMENTS" --sign - "$APP_DIR"

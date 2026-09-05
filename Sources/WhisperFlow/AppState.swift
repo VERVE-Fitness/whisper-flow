@@ -53,6 +53,10 @@ final class AppState: ObservableObject {
     @Published var inputDevices: [AudioInputDevice] = []
     /// Non-nil when GitHub has a newer build than this one (see UpdateCheck).
     @Published var updateAvailable: UpdateCheck.Result?
+    /// True from the moment the person clicks "Update available" until the
+    /// app is replaced (it never comes back false on success: the process is
+    /// gone). Stops a second click starting a second download.
+    @Published private(set) var isInstallingUpdate = false
 
     let accessibility = AccessibilityPermission()
 
@@ -204,7 +208,23 @@ final class AppState: ObservableObject {
         let info = Bundle.main.infoDictionary ?? [:]
         let version = info["CFBundleShortVersionString"] as? String ?? "dev"
         let sha = info["WFGitCommit"] as? String
-        return "v\(version)" + (sha.map { " (\($0))" } ?? "")
+        let built = (info["WFBuildDate"] as? String).flatMap { Self.buildDateLabel($0) }
+        let detail = [sha, built].compactMap { $0 }.joined(separator: ", ")
+        return "v\(version)" + (detail.isEmpty ? "" : " (\(detail))")
+    }
+
+    /// "built 5 Sep 2026, 3:19 pm" from the UTC stamp make-app.sh writes,
+    /// shown in the Mac's local time zone so the time matches the clock the
+    /// person is looking at. A stamp that does not parse is left out.
+    nonisolated static func buildDateLabel(_ iso: String, timeZone: TimeZone = .current) -> String? {
+        let parser = ISO8601DateFormatter()
+        parser.formatOptions = [.withInternetDateTime]
+        guard let date = parser.date(from: iso) else { return nil }
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_AU")
+        f.timeZone = timeZone
+        f.dateFormat = "d MMM yyyy, h:mm a"
+        return "built " + f.string(from: date).replacingOccurrences(of: "AM", with: "am").replacingOccurrences(of: "PM", with: "pm")
     }
 
     /// Name of the microphone the current selection resolves to right now.
@@ -276,12 +296,26 @@ final class AppState: ObservableObject {
         // An update replaces the signed binary and macOS drops the
         // Accessibility grant with it, which reads as "the app stopped
         // typing". Ask again, once per new version, and say why.
-        if accessibility.handleVersionChange() {
-            pill.show(.accessibilityAfterUpdate)
-        } else {
-            accessibility.checkAndPromptIfNeeded()
+        let accessibilityReask = accessibility.handleVersionChange()
+        if !accessibilityReask { accessibility.checkAndPromptIfNeeded() }
+        // A one-click update restarts the app, and the copy that comes back
+        // says so. If the same update also cost the Accessibility grant, that
+        // ask wins the pill: it is the one message that needs something done
+        // about it.
+        if let launchPill = SelfUpdater.launchPill(
+            didSelfUpdate: SelfUpdater.didSelfUpdate(arguments: CommandLine.arguments),
+            accessibilityReask: accessibilityReask,
+            version: AccessibilityPermission.currentVersion) {
+            pill.show(launchPill)
         }
         refreshInputDevices()
+        // A copy left in Downloads or run off a disk image loses its macOS
+        // permissions on every rebuild and cannot be updated in place. Offer
+        // to install it properly, once per place it is being run from.
+        if Bundle.main.bundleIdentifier != nil {
+            let bundlePath = Bundle.main.bundleURL.path
+            Task { await SelfUpdater.offerMoveToApplications(bundlePath: bundlePath) }
+        }
         startUpdateChecks()
         refreshFlowIdentity()
         resumePendingUploads()
@@ -345,6 +379,36 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// The menu's "Update available" item. Nothing here happens on its own:
+    /// this runs because somebody clicked it. Any failure leaves the running
+    /// app untouched, says why on the pill, and opens the download page so
+    /// there is still a way through.
+    func installUpdate() {
+        guard let update = updateAvailable, !isInstallingUpdate else { return }
+        isInstallingUpdate = true
+        pill.show(.updateDownloading(percent: nil))
+        let bundlePath = Bundle.main.bundleURL.path
+        Task { [weak self] in
+            do {
+                let installed = try await SelfUpdater.installUpdate(
+                    tag: update.tag,
+                    from: UpdateCheck.latestZip,
+                    runningBundlePath: bundlePath,
+                    progress: { percent in
+                        Task { @MainActor in self?.pill.show(.updateDownloading(percent: percent)) }
+                    })
+                try await SelfUpdater.relaunch(at: installed,
+                                               argument: SelfUpdater.relaunchedAfterUpdateArgument)
+            } catch {
+                let reason = (error as? SelfUpdater.Failure)?.reason ?? error.localizedDescription
+                guard let self else { return }
+                self.isInstallingUpdate = false
+                self.pill.show(.updateFailed(reason))
+                NSWorkspace.shared.open(UpdateCheck.downloadPage)
+            }
+        }
+    }
+
     private func startUpdateChecks() {
         Task { [weak self] in
             while !Task.isCancelled {
@@ -352,6 +416,15 @@ final class AppState: ObservableObject {
                 await MainActor.run { self?.updateAvailable = result }
                 try? await Task.sleep(nanoseconds: UInt64(UpdateCheck.interval) * 1_000_000_000)
             }
+        }
+    }
+
+    /// The About section's button. The background check runs every few hours anyway; this is
+    /// for the moment somebody wants to know right now.
+    func checkForUpdateNow() {
+        Task { [weak self] in
+            let result = await UpdateCheck.check(currentCommit: Self.currentCommit)
+            await MainActor.run { self?.updateAvailable = result }
         }
     }
 
@@ -954,8 +1027,9 @@ final class AppState: ObservableObject {
                 pill.show(.flowConnected(name: who))
                 VoiceProfileCache.save(me.profiles)
                 PhraseStore.shared.replace(me.phrases)
+                SnippetStore.shared.replace(me.snippets)
                 resumePendingUploads()
-                FileHandle.standardError.write(Data("[flow] connected as \(me.email) to \(flow.serverBase), recognise_me=\(me.recogniseMe), \(me.profiles.count) voice profiles, \(me.phrases.count) phrases\n".utf8))
+                FileHandle.standardError.write(Data("[flow] connected as \(me.email) to \(flow.serverBase), recognise_me=\(me.recogniseMe), \(me.profiles.count) voice profiles, \(me.phrases.count) phrases, \(me.snippets.count) snippets\n".utf8))
             } catch {
                 flowMe = nil
                 flowStatus = "Could not connect: \(error.localizedDescription)"
@@ -1005,6 +1079,9 @@ final class AppState: ObservableObject {
         UserDefaults.standard.set(me.recogniseMe, forKey: Self.recogniseMeDefaultsKey)
         VoiceProfileCache.save(me.profiles)
         PhraseStore.shared.replace(me.phrases)
+        // Team and person snippets land in the same place local ones do, so the next
+        // dictation says them without waiting for a relaunch.
+        SnippetStore.shared.replace(me.snippets)
         // First connect of this launch is where the notification permission
         // is asked for. Nothing is asked on a Mac that never connects.
         Task { await meetingPrompts.requestAuthorisationOnce() }
@@ -1116,6 +1193,15 @@ final class AppState: ObservableObject {
         NSWorkspace.shared.open(flowSettingsURL)
     }
 
+    /// The meetings page on Flow: every recording, the summaries and the draft actions.
+    var flowMeetingsURL: URL {
+        URL(string: flow.serverBase + "/meetings") ?? flowSettingsURL
+    }
+
+    func openFlowMeetings() {
+        NSWorkspace.shared.open(flowMeetingsURL)
+    }
+
     func openMeetingFolder(_ id: String) {
         NSWorkspace.shared.open(MeetingStore.directory(for: id))
     }
@@ -1156,7 +1242,9 @@ final class AppState: ObservableObject {
     /// match risks firing on an unrelated sentence that happens to contain
     /// the cue words.
     static func matchSnippet(_ raw: String) -> String? {
-        let snippets = UserLexicon.shared.snippets
+        // Team and person snippets from Flow, with this Mac's own on top: see
+        // SnippetRules.merged. An offline Mac simply matches its local list.
+        let snippets = SnippetStore.shared.runtimeMap(local: UserLexicon.shared.snippets)
         guard !snippets.isEmpty else { return nil }
         // Normalize the stored cues the same way as the transcript: cues are
         // saved as the user typed them ("calendar link!"), but the transcript
