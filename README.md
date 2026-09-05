@@ -86,34 +86,91 @@ The app is signed with an Apple Development certificate, not Developer ID, and i
 
 Guard rails: empty output, output longer than 1.6× the raw text, too few content words kept, too many new words, a dropped question mark, errors, or the timeout all fall back to the raw transcript (logged to stderr and the usage log). Deterministic passes (dictionary corrections, self-correction stripping, digit formatting) run on every path. Whole-sentence cue-led replacement ("… by Tuesday. Actually make that Wednesday.") only deletes the previous sentence when the replacement is at least half its length; shorter remainders are word-level swaps left for the LLM.
 
-## Meetings (week 1, Mac-only)
+## Meetings (week 2: recorded here, kept in Flow)
 
-**Record meeting…** in the menu records both sides of a call and, at Stop, leaves you a folder with the audio, a speaker-labelled transcript and a summary. Nothing goes to the Engine, Supabase or Flow in week 1: everything stays on this Mac.
+**Record meeting…** in the menu records both sides of a call. At Stop the Mac transcribes it, works out who spoke, and sends the audio, the transcript and the speakers to Flow, which writes the summary and the proposed actions. You end up with the meeting at flow.vervefitness.ai/meetings and a copy of everything in a folder on this Mac.
 
-**Wear headphones.** Two tracks are recorded: track A is your microphone, track B is whatever the Mac is playing (the other side of the call). Out loud through the speakers, your microphone hears their side as well, so both tracks carry the same words and the speaker names get mixed up. Headphones keep the two apart.
+### Connect this Mac first
 
-**Consent gate.** Every recording passes through it, there is no auto-record, and the wording version you saw (`consent-v1`) plus the timestamp is written into `meeting.json`. Cancel is the safe path; a cancelled gate records nothing at all. CLI harness runs stamp `consent-v1-cli` so a test run can never be read as a real person agreeing.
+"Record meeting…" does nothing until this Mac is connected, because the consent wording promises the recording reaches VERVE's system and it has to be true.
 
-**What Stop does**, with each stage shown on the pill: transcribes track A (you), transcribes track B (them), separates track B into speakers with the offline diariser (the first run downloads a 22 MB model), shifts track B on to track A's clock, names the speakers from the attendee list in the order they first spoke, writes the transcript, then summarises it if a key is on the machine. Finder opens the folder when it is done.
+1. Open **flow.vervefitness.ai/whisper-settings** (the menu has "Whisper Flow settings…").
+2. Under **Connect this Mac**, name the Mac and click **Create connection**.
+3. Click **Open in Whisper Flow**. That is a `whisperflow://connect?token=…&server=…` link; the app takes the token, puts it in the login keychain and says "Connected to Flow as <your name>" on the pill.
 
-**The folder** is `~/Library/Application Support/WhisperFlow/meetings/<id>/`, one per meeting, id shaped `2026-09-05-1432-<8 hex>`:
+The token is shown once. It never appears in a log, a preference file or the transcript folder. The menu says "Flow: connected as …" or "Flow: not connected". Revoke a Mac from the same page.
+
+For a preview deployment: `defaults write com.niallwogan.whisperflow flowServer https://your-preview-url` before clicking the link, or let the link carry its own `server=`.
+
+### Wear headphones
+
+Two tracks are recorded: track A is your microphone, track B is whatever the Mac is playing (the other side of the call). Out loud through the speakers, your microphone hears their side as well, so both tracks carry the same words and the speaker names get mixed up. Headphones keep the two apart.
+
+### Consent gate
+
+Every recording passes through it, there is no auto-record, and the wording version you saw (`consent-v2`) plus the timestamp is written into `meeting.json` and sent with the recording. Cancel is the default button; a cancelled gate records nothing at all. CLI harness runs stamp `consent-v2-cli` so a test run can never be read as a real person agreeing.
+
+### What Stop does
+
+Each stage shows on the pill:
+
+1. Transcribes track A (you) and track B (them) with Parakeet.
+2. Separates track B into speakers with the offline diariser, and runs the diariser over track A as well to read your own voice.
+3. **Matches each speaker against the voice profiles Flow holds.** A colleague who has been confirmed once, and who has switched on "recognise my voice", is named without anyone being asked again.
+4. Cuts an eight second clip of each speaker it could not name, so the confirmer on the settings page hears the voice.
+5. Encodes both tracks to AAC in .m4a, 32 kbps mono, about 14 MB an hour.
+6. Uploads: `track-a.m4a`, `track-b.m4a`, the clips, `transcript.json`, `meeting.json`, then posts the manifest. The pill counts: "Uploading 2 of 5".
+7. Waits up to three minutes for Flow's summary ("Summarising in Flow"), writes it into `summary.md`, and says "Done, open in Flow".
+
+Nothing is lost if the network drops. The meeting stays on this Mac with an `upload-state.json`, and the next launch or the next connect picks it up where it stopped.
+
+### What leaves this Mac
+
+| Leaves | Stays here |
+|---|---|
+| Both tracks as .m4a, the sample clips, `transcript.json`, `meeting.json` | The two WAVs (about 115 MB an hour), which are never uploaded |
+| The manifest: title, times, attendees, the consent record, the segments, and one 256-float voice embedding per speaker | `voices.json` and `manifest.json`, the staging files a resumed upload reads |
+
+Flow deletes the audio after 90 days. The transcript and summary are kept. The owner can delete either at any time from Flow.
+
+### Voice recognition
+
+The diariser already produces a 256-dimension embedding for every chunk of speech. The app averages them per speaker, weighted by how long each chunk ran, and compares them with the profiles Flow holds using cosine distance. A match needs a distance under **0.45** and a margin of at least **0.10** over the second closest profile, so two colleagues who sound alike produce a question rather than a coin toss. Every decision is on stderr:
+
+```
+[meeting] speaker S1 -> nathan.hall@… (0.31, next 0.58)
+[meeting] speaker S2 unmatched (best 0.62)
+```
+
+A profile only ever exists for a VERVE staff member who switched on "recognise my voice" on their own settings page, or for the person doing the confirming. Customers and outsiders get a name on that one recording and no stored voiceprint: a voiceprint is sensitive biometric information under the Privacy Act, a name is not. The profiles are cached at `~/Library/Application Support/WhisperFlow/voice-profiles.json` and refreshed at every connect and every Stop. "Forget my voice" on the settings page deletes the profile.
+
+### The folder
+
+`~/Library/Application Support/WhisperFlow/meetings/<id>/`, one per meeting, id shaped `2026-09-05-1432-<8 hex>`:
 
 | File | What it is |
 |---|---|
 | `meeting.json` | Times, title, attendees, the consent record, status, track lengths, the measured track-B offset, the speaker name map |
-| `track-a.wav` | Your microphone, 16 kHz mono Float32 |
-| `track-b.wav` | The Mac's output audio, same format. Always present; empty when the system tap was unavailable |
-| `transcript.json` | Segments with speaker ids, start and end times |
-| `transcript.md` | The readable transcript, timestamps and names |
-| `summary.md` | Summary, decisions, actions, catch-up. Only when a key is present |
+| `track-a.wav` / `track-b.wav` | Your microphone and the Mac's output audio, 16 kHz mono Float32. Never uploaded |
+| `track-a.m4a` / `track-b.m4a` | The same two tracks as AAC, which is what Flow gets |
+| `speaker-S<n>.m4a` | The eight second sample clip for a speaker nobody has named yet |
+| `transcript.json` / `transcript.md` | Segments with speaker ids and times; the readable version |
+| `voices.json` | Per speaker: seconds, embedding, and who the voice matched |
+| `manifest.json` | Exactly what was POSTed to `complete` |
+| `upload-state.json` | `pending`, `complete` or `failed`, plus the files already sent |
+| `summary.md` | The summary Flow wrote, pulled back down after it lands |
 
-**Track alignment.** The microphone is started first and the system tap a second later (starting the tap posts a configuration change that would kill a still-starting mic engine). Each WAV therefore begins at its own zero. The recorder measures the gap, stores it as `trackBOffsetSeconds`, and the transcriber adds it to every track-B time before merging, so the far side lands where it was actually said. Typical measured value on this M4 is 1.03 to 1.08 s.
+### Track alignment
 
-**Permissions.** Microphone (the usual prompt), plus **System Audio Recording**, granted in System Settings → Privacy & Security → Screen & System Audio Recording → "System Audio Recording Only". Without it the tap still runs and `track-b.wav` is silent; a `[capture] system-audio:` note on stderr says so. The system tap needs macOS 14.2; below that the meeting records your microphone only and says so.
+The microphone is started first and the system tap a second later (starting the tap posts a configuration change that would kill a still-starting mic engine). Each WAV therefore begins at its own zero. The recorder measures the gap, stores it as `trackBOffsetSeconds`, and the transcriber adds it to every track-B time before merging, so the far side lands where it was actually said. Typical measured value on this M4 is 1.03 to 1.08 s.
 
-**Summariser key (week 1 only).** `ANTHROPIC_API_KEY` in the environment, or a file at `~/Library/Application Support/WhisperFlow/anthropic.key`. Only the transcript text is sent, never audio. No key means no summary and no error; everything else still runs. In week 2 the Engine does the summarising and the key leaves the Mac entirely.
+### Permissions
 
-**CLI harnesses** (the debug binary, `$HOME/.cache/whisperflow-build-scratch/debug/WhisperFlow`):
+Microphone (the usual prompt), plus **System Audio Recording**, granted in System Settings → Privacy & Security → Screen & System Audio Recording → "System Audio Recording Only". Without it the tap still runs and `track-b.wav` is silent; a `[capture] system-audio:` note on stderr says so. The system tap needs macOS 14.2; below that the meeting records your microphone only and says so.
+
+### CLI harnesses
+
+The debug binary, `$HOME/.cache/whisperflow-build-scratch/debug/WhisperFlow`:
 
 | Command | What it does |
 |---|---|
@@ -121,22 +178,25 @@ Guard rails: empty output, output longer than 1.6× the raw text, too few conten
 | `--dual-test <seconds>` | Microphone and tap at the same time, to prove neither starves the other |
 | `--record-test <seconds>` | One real recording through `MeetingRecorder`; prints the folder, both track lengths and the measured offset |
 | `--transcribe-meeting <id>` | Parakeet over both tracks plus the diariser, prints `transcript.md` |
-| `--summarise-meeting <id>` | Anthropic summary for an already-transcribed meeting, prints `summary.md` |
-| `--meeting-test <seconds> [--attendees "A,B"]` | The whole chain in one go: record, transcribe, name, summarise, print |
+| `--summarise-meeting <id>` | Summarises on this Mac with a local Anthropic key. Harness only: the GUI never does this, Flow does |
+| `--meeting-test <seconds> [--attendees "A,B"] [--no-upload]` | The whole chain: record, transcribe, match, upload, print. `--no-upload` stops at the transcript |
 
-**Not in week 1:** nothing is uploaded to the Engine, there is no Flow page, attendees are typed rather than read from the calendar, your manager cannot play anything back yet, and the 90-day audio retention job does not exist. All of that is week 2 and later.
-
-### Week-1 dogfood (Niall, five real meetings)
+### Week-2 dogfood (Niall, five real meetings)
 
 ```
-1. Consent alert appeared every time; Cancel was the default; you actually announced the recording.
-2. Pill counted up for the whole meeting; dictation with Right Option still worked mid-meeting.
-3. track-b.wav is not silent (open it): the other side was captured.
-4. Speakers: how many of the "them" segments had the right name after you typed attendees? (target: most; note the count)
-5. Words: read transcript.md against what was said; note the worst three errors.
-6. Summary: are decisions and actions real, not invented? Note any invented item verbatim.
-7. Time from Stop to Finder opening (target: under 3 minutes for a 30-minute meeting on this M4; note the M1 figure when a colleague tries).
+1. Connect: the settings link connected this Mac first time, and the pill named you correctly.
+2. Consent alert appeared every time; Cancel was the default; you actually announced the recording.
+3. Pill counted up for the whole meeting; dictation with Right Option still worked mid-meeting.
+4. Upload: the pill counted files, then said "Done, open in Flow". Time from Stop to Done (target: under 3 minutes for a 30-minute meeting).
+5. Speakers: how many were named by voice with nobody asked? How many landed in the settings page queue? Note both counts.
+6. Wrong names: any speaker matched to the WRONG colleague? Note it verbatim; that is the number that decides whether 0.45 and 0.10 are right.
+7. Sample clips: play one from the settings page. Could you tell who it was in eight seconds?
+8. Summary from Flow: are decisions and actions real, not invented? Note any invented item verbatim.
+9. Actions: accept one in Flow and check it appears in your Flow actions with status open.
+10. Resume: turn the wifi off, stop a meeting, turn it back on. Did it finish on its own?
 ```
+
+**Not yet:** attendees are typed rather than read from the calendar, and the 90-day retention job is installed on the VPS by Fable, not by this app.
 
 ## Swapping the STT backend
 

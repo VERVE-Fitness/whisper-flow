@@ -256,7 +256,7 @@ final class MeetingSummariserTests: XCTestCase {
 
 final class TrackBAlignmentTests: XCTestCase {
     /// A meeting.json written before trackBOffsetSeconds existed must still
-    /// load, as 0 — which is the alignment those recordings actually had.
+    /// load, as 0, which is the alignment those recordings actually had.
     func testRecordWithoutOffsetDecodesAsZero() throws {
         let json = """
         {

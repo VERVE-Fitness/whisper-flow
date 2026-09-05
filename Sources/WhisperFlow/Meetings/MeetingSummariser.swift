@@ -29,9 +29,12 @@ enum SummariserError: Error, LocalizedError {
     }
 }
 
-/// Week-1 summariser: calls the Anthropic Messages API from the Mac with a
-/// key the owner placed on the machine. Week 2 moves this into an Engine
-/// function and the key leaves the Mac. Text only is sent, never audio.
+/// CLI-only summariser: calls the Anthropic Messages API from the Mac with a
+/// key the owner placed on the machine. From week 2 the GUI does not use it,
+/// Flow summarises on upload with the key held as a Pages secret, and
+/// `markdown(_:)` below is what turns Flow's answer into the `summary.md` in
+/// the meeting folder. Reachable from `--summarise-meeting` only. Text only is
+/// sent, never audio.
 enum MeetingSummariser {
     static let model = "claude-sonnet-5"
 

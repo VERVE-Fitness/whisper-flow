@@ -74,7 +74,8 @@ enum WhisperFlowMain {
                     .map { $0.trimmingCharacters(in: .whitespaces) }
                     .filter { !$0.isEmpty }
             }
-            exit(runCLIMeetingTest(seconds: seconds, attendees: attendees))
+            exit(runCLIMeetingTest(seconds: seconds, attendees: attendees,
+                                   upload: !args.contains("--no-upload")))
         }
         if let idx = args.firstIndex(of: "--record-test") {
             guard idx + 1 < args.count, let seconds = Double(args[idx + 1]) else {
@@ -573,11 +574,13 @@ private func runCLITranscribeMeeting(id: String) -> Int32 {
     return exitCode
 }
 
-/// Sends an already-transcribed meeting to the Anthropic Messages API and
-/// prints the summary that was written next to the audio. Does nothing (exit 0)
-/// when no key is on the machine: the key lives in the environment as
-/// ANTHROPIC_API_KEY or in Application Support/WhisperFlow/anthropic.key, never
-/// in the repo.
+/// Summarises an already-transcribed meeting on this Mac, straight from the
+/// Anthropic Messages API. This is a CLI harness only: from week 2 the GUI
+/// never summarises locally, Flow does it on upload with its own key. Kept so
+/// a transcript can be summarised without a Flow connection, and so prompt
+/// changes can be tried without a deploy. Does nothing (exit 0) when no key is
+/// on the machine: the key lives in the environment as ANTHROPIC_API_KEY or in
+/// Application Support/WhisperFlow/anthropic.key, never in the repo.
 private func runCLISummariseMeeting(id: String) -> Int32 {
     var finished = false
     var exitCode: Int32 = 0
@@ -600,12 +603,15 @@ private func runCLISummariseMeeting(id: String) -> Int32 {
     return exitCode
 }
 
-/// The whole week-1 meeting pipeline in one command: record for `seconds`,
-/// transcribe both tracks, name the speakers from `--attendees`, summarise if a
-/// key is present, then print the folder, the transcript and the summary. This
-/// is the harness a human uses to check a change end to end without clicking
-/// through the menu bar.
-private func runCLIMeetingTest(seconds: Double, attendees: [String]) -> Int32 {
+/// The whole meeting pipeline in one command: record for `seconds`,
+/// transcribe both tracks, match the voices, then (unless `--no-upload`)
+/// encode, upload to Flow and wait for the summary Flow writes. Prints the
+/// folder, the transcript and the summary. This is the harness a human uses
+/// to check a change end to end without clicking through the menu bar.
+///
+/// `--no-upload` stops at the transcript, which is how the recording and
+/// transcription path is exercised on a Mac that is not connected to Flow.
+private func runCLIMeetingTest(seconds: Double, attendees: [String], upload: Bool) -> Int32 {
     var finished = false
     var exitCode: Int32 = 0
     Task { @MainActor in
@@ -634,15 +640,31 @@ private func runCLIMeetingTest(seconds: Double, attendees: [String]) -> Int32 {
             try transcriber.write(transcript, record: record)
             print("transcribed in \(String(format: "%.1f", Date().timeIntervalSince(t0)))s: \(transcript.segments.count) segments, speakers \(transcript.speakerNames.keys.sorted())")
 
-            let summary = try await MeetingSummariser.summarise(meetingID: rec.id)
+            var uploaded = false
+            if upload {
+                let flow = FlowClient.shared
+                if flow.isConnected {
+                    let me = try? await flow.me()
+                    if let me { VoiceProfileCache.save(me.profiles) }
+                    let profiles = me?.profiles ?? VoiceProfileCache.load()
+                    let uploader = MeetingUploader(flow: flow) { progress in print("  \(progress.text)") }
+                    try uploader.prepare(meetingID: rec.id, transcript: transcript,
+                                         chunks: transcriber.lastChunks, profiles: profiles, owner: me)
+                    let status = try await uploader.ship(meetingID: rec.id)
+                    uploaded = true
+                    print("uploaded to \(flow.serverBase): status \(status.status), names \(status.speakerNames)")
+                } else {
+                    print("not connected to Flow; run the connect link from \(FlowClient.shared.serverBase)/whisper-settings, or pass --no-upload")
+                }
+            }
             print("folder: \(MeetingStore.directory(for: rec.id).path)")
             print("--- transcript.md ---")
             print(try String(contentsOf: MeetingStore.transcriptMarkdownURL(rec.id), encoding: .utf8))
-            if summary != nil {
-                print("--- summary.md ---")
-                print(try String(contentsOf: MeetingStore.summaryURL(rec.id), encoding: .utf8))
+            if uploaded, let summaryText = try? String(contentsOf: MeetingStore.summaryURL(rec.id), encoding: .utf8) {
+                print("--- summary.md (written by Flow) ---")
+                print(summaryText)
             } else {
-                print("--- summary.md --- (skipped: no Anthropic key on this Mac)")
+                print("--- summary.md --- (none: Flow writes the summary, and this run did not upload)")
             }
         } catch {
             FileHandle.standardError.write(Data("error: \(error.localizedDescription)\n".utf8))
