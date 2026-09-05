@@ -302,6 +302,13 @@ final class AppState: ObservableObject {
             accessibility.checkAndPromptIfNeeded()
         }
         refreshInputDevices()
+        // A copy left in Downloads or run off a disk image loses its macOS
+        // permissions on every rebuild and cannot be updated in place. Offer
+        // to install it properly, once per place it is being run from.
+        if Bundle.main.bundleIdentifier != nil {
+            let bundlePath = Bundle.main.bundleURL.path
+            Task { await SelfUpdater.offerMoveToApplications(bundlePath: bundlePath) }
+        }
         startUpdateChecks()
         refreshFlowIdentity()
         resumePendingUploads()

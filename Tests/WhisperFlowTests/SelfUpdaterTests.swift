@@ -138,6 +138,36 @@ final class SelfUpdaterTests: XCTestCase {
                        "/Applications/WhisperFlow.app")
     }
 
+    // MARK: - Offering to move
+
+    /// The offer is only for a copy that was never installed, and only once
+    /// per place it is run from: say "Not now" to the one in Downloads and it
+    /// stops asking about that one, while a copy on the Desktop still gets
+    /// its own ask.
+    func testTheMoveIsOfferedOncePerPlaceAndNeverToAnInstalledCopy() {
+        let downloads = "/Users/niall/Downloads/WhisperFlow.app"
+        let desktop = "/Users/niall/Desktop/WhisperFlow.app"
+        XCTAssertTrue(SelfUpdater.shouldOfferMove(location: .elsewhere(folder: "Downloads"),
+                                                  bundlePath: downloads, declinedPaths: []))
+        XCTAssertFalse(SelfUpdater.shouldOfferMove(location: .elsewhere(folder: "Downloads"),
+                                                   bundlePath: downloads, declinedPaths: [downloads]))
+        XCTAssertTrue(SelfUpdater.shouldOfferMove(location: .elsewhere(folder: "Desktop"),
+                                                  bundlePath: desktop, declinedPaths: [downloads]))
+        XCTAssertFalse(SelfUpdater.shouldOfferMove(location: .applications,
+                                                   bundlePath: "/Applications/WhisperFlow.app", declinedPaths: []))
+        XCTAssertFalse(SelfUpdater.shouldOfferMove(location: .userApplications,
+                                                   bundlePath: "/Users/niall/Applications/WhisperFlow.app",
+                                                   declinedPaths: []))
+        // Remembered by the standardised path, so a trailing slash is the
+        // same copy and is not asked about twice.
+        XCTAssertFalse(SelfUpdater.shouldOfferMove(location: .elsewhere(folder: "Downloads"),
+                                                   bundlePath: downloads + "/", declinedPaths: [downloads]))
+    }
+
+    func testTheDeclinedListHasTheKeyTheDesignNames() {
+        XCTAssertEqual(SelfUpdater.declinedMoveDefaultsKey, "declinedMoveToApplicationsPaths")
+    }
+
     // MARK: - Progress
 
     func testThePercentageIsWhatTheServerSaidAndNothingWhenItSaidNothing() {
