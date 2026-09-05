@@ -33,10 +33,20 @@ enum PillState: Equatable {
     /// nothing can be typed until the person grants it again. Stays up longer
     /// than the rest: it is the one pill that asks for something.
     case accessibilityAfterUpdate
+    /// A one-click update is downloading. nil percent means the server did
+    /// not say how big the file is.
+    case updateDownloading(percent: Int?)
+    /// The update stopped before anything was replaced, so the app running
+    /// right now is the one that was running before. The reason names the
+    /// step that failed.
+    case updateFailed(String)
+    /// First launch of the copy a one-click update just installed.
+    case updated(version: String)
 
     var isTerminal: Bool {
         switch self {
-        case .inserted, .copiedOnly, .discarded, .failed, .flowConnected, .accessibilityAfterUpdate: return true
+        case .inserted, .copiedOnly, .discarded, .failed, .flowConnected, .accessibilityAfterUpdate,
+             .updateFailed, .updated: return true
         default: return false
         }
     }
@@ -50,6 +60,10 @@ enum PillState: Equatable {
     var autoHideSeconds: Double {
         switch self {
         case .accessibilityAfterUpdate: return 8.0
+        // Both name a state of the app rather than the last dictation, so
+        // they sit long enough to be read from across the desk.
+        case .updateFailed: return 8.0
+        case .updated: return 4.0
         case .failed: return 3.5
         default: return 1.0
         }
@@ -112,6 +126,21 @@ private struct PillContentView: View {
                 Image(systemName: "lock.open")
                     .foregroundStyle(.yellow)
                 Text(AccessibilityPermission.updatePillText)
+                    .lineLimit(1)
+            case .updateDownloading(let percent):
+                ProgressView()
+                    .controlSize(.small)
+                Text(SelfUpdater.downloadingText(percent: percent))
+                    .lineLimit(1)
+            case .updateFailed(let reason):
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.yellow)
+                Text(SelfUpdater.failedText(reason: reason))
+                    .lineLimit(1)
+            case .updated(let version):
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+                Text(SelfUpdater.updatedText(version: version))
                     .lineLimit(1)
             }
         }

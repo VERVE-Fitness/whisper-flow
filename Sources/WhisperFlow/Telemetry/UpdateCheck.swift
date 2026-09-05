@@ -18,6 +18,10 @@ enum UpdateCheck {
 
     static let latestReleaseAPI = URL(string: "https://api.github.com/repos/VERVE-Fitness/whisper-flow/releases/latest")!
     static let downloadPage = URL(string: "https://flow.vervefitness.ai/whisper")!
+    /// The asset the one-click update downloads. `releases/latest/download`
+    /// always points at the newest release, so this never needs editing for a
+    /// new build, and it is the same file the download page links to.
+    static let latestZip = URL(string: "https://github.com/VERVE-Fitness/whisper-flow/releases/latest/download/WhisperFlow.zip")!
     static let interval: TimeInterval = 6 * 60 * 60
 
     /// Returns a Result when a different build is published, nil when this

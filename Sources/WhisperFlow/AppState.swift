@@ -53,6 +53,10 @@ final class AppState: ObservableObject {
     @Published var inputDevices: [AudioInputDevice] = []
     /// Non-nil when GitHub has a newer build than this one (see UpdateCheck).
     @Published var updateAvailable: UpdateCheck.Result?
+    /// True from the moment the person clicks "Update available" until the
+    /// app is replaced (it never comes back false on success: the process is
+    /// gone). Stops a second click starting a second download.
+    @Published private(set) var isInstallingUpdate = false
 
     let accessibility = AccessibilityPermission()
 
@@ -357,6 +361,36 @@ final class AppState: ObservableObject {
                 self.phase = .idle
             } catch {
                 self.phase = .error("model load failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// The menu's "Update available" item. Nothing here happens on its own:
+    /// this runs because somebody clicked it. Any failure leaves the running
+    /// app untouched, says why on the pill, and opens the download page so
+    /// there is still a way through.
+    func installUpdate() {
+        guard let update = updateAvailable, !isInstallingUpdate else { return }
+        isInstallingUpdate = true
+        pill.show(.updateDownloading(percent: nil))
+        let bundlePath = Bundle.main.bundleURL.path
+        Task { [weak self] in
+            do {
+                let installed = try await SelfUpdater.installUpdate(
+                    tag: update.tag,
+                    from: UpdateCheck.latestZip,
+                    runningBundlePath: bundlePath,
+                    progress: { percent in
+                        Task { @MainActor in self?.pill.show(.updateDownloading(percent: percent)) }
+                    })
+                try await SelfUpdater.relaunch(at: installed,
+                                               argument: SelfUpdater.relaunchedAfterUpdateArgument)
+            } catch {
+                let reason = (error as? SelfUpdater.Failure)?.reason ?? error.localizedDescription
+                guard let self else { return }
+                self.isInstallingUpdate = false
+                self.pill.show(.updateFailed(reason))
+                NSWorkspace.shared.open(UpdateCheck.downloadPage)
             }
         }
     }

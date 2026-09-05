@@ -28,7 +28,15 @@ struct MenuBarContent: View {
         .onAppear { state.refreshInputDevices() }
 
         if let update = state.updateAvailable {
-            Button("Update available (\(update.tag)) — download…") {
+            // One click: download, check the copy is really ours, replace the
+            // running app, restart. No Finder, no dragging, no uninstall.
+            Button(state.isInstallingUpdate ? "Updating…" : "Update available (\(update.tag))") {
+                state.installUpdate()
+            }
+            .disabled(state.isInstallingUpdate)
+            // The old route, kept for a Mac where the one-click install
+            // cannot finish (no write access to /Applications, say).
+            Button("Download update from Flow…") {
                 NSWorkspace.shared.open(update.downloadPage)
             }
         }
