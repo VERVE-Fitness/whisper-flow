@@ -332,6 +332,29 @@ The existing low-confidence short-clip discard runs off that same single decode,
 [stt] streaming 8 words, batch 2 words, using streaming
 ```
 
+## Settings
+
+Menu bar, **Whisper Flow settings…**, or `Cmd+,`. A native window inside the app, so nothing routine needs a browser after this Mac is first connected. Six sections:
+
+| Section | What is in it | With no connection |
+|---|---|---|
+| **Dictation** | Microphone, what the keys do, Accessibility, Auto-learn corrections, Start at login, which cleanup model is running | All of it works |
+| **Meetings** | Connected as, Connect this Mac, Disconnect; Meeting prompts; Recognise my voice; Meeting bot mode and bot name; the Who is who queue with a play button on each clip | The connection block only |
+| **Dictionary and phrases** | The dictionary this Mac keeps; the team phrase list with what each phrase comes out as; the Heard wrong queue | The dictionary only |
+| **Snippets** | Mine and the team's: a cue, and the text it types | Local snippets only |
+| **Insights** | Thirty days of dictations and words a day, minutes of talking, average words a dictation, and the typing time saved at 40 words a minute | All of it works |
+| **About** | The build, the update button, links to the Whisper and meetings pages on Flow | The build line only |
+
+Everything the window reads and writes goes through the device token, at `GET`/`POST /api/public/whisper/settings`, which is the same payload and the same action names the web page at `/whisper-settings` uses. The web page stays: it is where a Mac is connected in the first place, and it is the fallback. Device tokens can never mint or revoke device tokens; that stays on the web.
+
+The window never blanks a list because Flow was unreachable. A block that needs the server says so in a sentence, and the local half carries on.
+
+### Snippets
+
+Say the cue on its own, or with "insert" in front of it, and the text is typed word for word, skipping cleanup. `GET /api/public/whisper/me` carries `snippets: [{cue, text, scope}]`, the team's plus your own, cached at `~/Library/Application Support/WhisperFlow/snippets.json` and refreshed at connect, at launch and at every Stop.
+
+What dictation matches against is the three lists merged, in this order: team, then your own from Flow, then whatever is on this Mac. **Local wins a cue clash**, so a snippet edited here works this second and an offline Mac behaves exactly as it did before any of this existed. A personal snippet added in the window is saved on this Mac and sent to Flow as a person-scoped row, so a second Mac gets it too.
+
 ## Swapping the STT backend
 
 `STT/TranscriptionBackend.swift` defines the streaming protocol (prepare → startStream → feed → finishStream, plus batch `transcribeFile`). `ParakeetBackend` is the live implementation; `WhisperBackend` is a stub showing where a whisper.cpp/WhisperKit buffer+commit wrapper would conform.
