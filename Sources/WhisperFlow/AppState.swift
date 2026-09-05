@@ -56,7 +56,50 @@ final class AppState: ObservableObject {
 
     let accessibility = AccessibilityPermission()
 
-    private let backend: TranscriptionBackend = ParakeetBackend()
+    // MARK: - Meetings
+
+    /// The meeting recorder owns its OWN AudioCapture, so a meeting running in
+    /// the background does not touch the dictation capture and Right Option
+    /// keeps working mid-meeting.
+    let meetings = MeetingRecorder()
+    /// Plain-English line for the menu ("Recording", "Separating speakers… 40%",
+    /// "Saved", "Failed: …"). Nil when no meeting has run this launch.
+    @Published var meetingStatus: String?
+    /// The meeting the review window and "Open last meeting folder" act on.
+    @Published var lastMeetingID: String?
+    private var meetingTicker: AnyCancellable?
+
+    // MARK: - Flow connection
+
+    /// Who this Mac is connected to Flow as, once `me()` has answered. Nil
+    /// means either no token or a token Flow has not confirmed this launch.
+    @Published var flowMe: FlowMe?
+    /// Last thing the connection did, for the menu ("Connecting…", an error).
+    @Published var flowStatus: String?
+    let flow = FlowClient.shared
+
+    /// Remembered across launches so the menu can say "connected" before the
+    /// first `me()` of the session comes back.
+    static let recogniseMeDefaultsKey = "flowRecogniseMe"
+    var flowRecogniseMe: Bool { UserDefaults.standard.bool(forKey: Self.recogniseMeDefaultsKey) }
+
+    /// One line for the menu. Never shows the token.
+    var flowMenuLine: String {
+        if let flowMe {
+            let who = flowMe.name.isEmpty ? flowMe.email : flowMe.name
+            return "Flow: connected as \(who)"
+        }
+        return flow.isConnected ? "Flow: connected" : "Flow: not connected"
+    }
+
+    var flowSettingsURL: URL {
+        URL(string: flow.serverBase + "/whisper-settings") ?? URL(string: "https://flow.vervefitness.ai/whisper-settings")!
+    }
+
+    /// Concrete, not the `TranscriptionBackend` protocol: MeetingTranscriber
+    /// needs `transcribeLong(url:)`, which only Parakeet has (it is the
+    /// disk-backed long-form path, and there is no second backend shipping).
+    private let backend = ParakeetBackend()
     private let router = CleanupRouter()
     private let capture = AudioCapture()
     private let hotkeys = HotkeyManager()
@@ -214,14 +257,33 @@ final class AppState: ObservableObject {
         accessibility.checkAndPromptIfNeeded()
         refreshInputDevices()
         startUpdateChecks()
+        refreshFlowIdentity()
+        resumePendingUploads()
 
         pill.onTapStop = { [weak self] in
-            guard let self, self.currentMode != .window else { return }
+            guard let self else { return }
+            // A meeting owns the pill while it records, so a tap means "stop
+            // the meeting" and must not fall through to the dictation stop.
+            if self.meetings.isRecording {
+                self.stopMeeting()
+                return
+            }
+            guard self.currentMode != .window else { return }
             // The hands-free key tap is still armed; without this it would
             // swallow the user's next keypress as the "finish" key.
             self.hotkeys.reset()
             self.stopRecording()
         }
+
+        // Redraw the elapsed time on the pill twice a second while a meeting
+        // records. Guarded on isRecording so a late tick cannot put the pill
+        // back up after the meeting stopped.
+        meetingTicker = meetings.$elapsedSeconds
+            .receive(on: RunLoop.main)
+            .sink { [weak self] elapsed in
+                guard let self, self.meetings.isRecording else { return }
+                self.pill.update(.meeting(elapsed: elapsed))
+            }
 
         hotkeys.onStart = { [weak self] in
             guard let self, self.accessibility.isTrusted, self.canRecord else { return }
@@ -667,6 +729,216 @@ final class AppState: ObservableObject {
                     hotkeys.reset()
                 }
             }
+        }
+    }
+
+    // MARK: - Meetings
+
+    /// Consent gate first, always. `ConsentGate.present` returning nil is a
+    /// cancel and nothing is recorded -- there is no path to a recording that
+    /// skips this, and the CLI harnesses stamp their own wording version so a
+    /// test run can never be mistaken for a real consent.
+    func startMeeting() {
+        guard !meetings.isRecording else { return }
+        Task {
+            // The consent wording promises the recording reaches VERVE's
+            // system. On a Mac with no token it would not, so there is no
+            // path from here to a recording that cannot be uploaded.
+            guard flow.isConnected else {
+                meetingStatus = "Not recorded: connect this Mac to Flow first"
+                ConsentGate.presentNotConnected(settingsURL: flowSettingsURL)
+                return
+            }
+            guard let consent = await ConsentGate.present() else {
+                meetingStatus = "Cancelled, nothing recorded"
+                return
+            }
+            do {
+                _ = try await meetings.start(title: "", attendees: [], consent: consent)
+                pill.show(.meeting(elapsed: 0))
+                meetingStatus = "Recording"
+            } catch {
+                meetingStatus = "Could not start: \(error.localizedDescription)"
+                pill.show(.failed(error.localizedDescription))
+            }
+        }
+    }
+
+    /// Stop, then the whole offline pass: both tracks through Parakeet, the far
+    /// side through the diariser, names proposed from the attendee list, and a
+    /// summary when a key is on the machine. Every stage reports into the pill
+    /// because the first run downloads the diariser model and silence would
+    /// read as a hang.
+    func stopMeeting() {
+        guard meetings.isRecording else { return }
+        Task {
+            guard let rec = await meetings.stop() else { return }
+            lastMeetingID = rec.id
+            pill.update(.meetingProcessing("Transcribing…"))
+            meetingStatus = "Transcribing…"
+            do {
+                let transcriber = MeetingTranscriber(backend: backend) { [weak self] status in
+                    Task { @MainActor in
+                        guard let self else { return }
+                        self.meetingStatus = status
+                        self.pill.update(.meetingProcessing(status))
+                    }
+                }
+                var transcript = try await transcriber.transcribe(meetingID: rec.id)
+                transcript.speakerNames = SpeakerNaming.proposeNames(for: transcript,
+                                                                    ownerName: NSFullUserName(),
+                                                                    attendees: rec.attendees)
+                var updated = try MeetingStore.load(id: rec.id)
+                updated.speakerNames = transcript.speakerNames
+                try MeetingStore.save(updated)
+                try transcriber.write(transcript, record: updated)
+
+                // Week 2: the summary is written by Flow, not on this Mac.
+                // Everything from here is match, encode, upload, wait.
+                try await uploadMeeting(id: rec.id, transcript: transcript, chunks: transcriber.lastChunks)
+            } catch {
+                meetingStatus = "Failed: \(error.localizedDescription)"
+                pill.show(.failed(error.localizedDescription))
+            }
+        }
+    }
+
+    /// The Flow half of Stop: refresh the voice profiles, match, encode,
+    /// upload, wait for the summary. A failure here leaves the meeting on
+    /// disk with a pending `upload-state.json`, which the next launch or the
+    /// next connect picks up.
+    private func uploadMeeting(id: String, transcript: Transcript, chunks: [SpeakerChunk]) async throws {
+        guard flow.isConnected else {
+            meetingStatus = "Saved on this Mac. Connect to Flow to upload it."
+            pill.show(.failed("not connected to Flow"))
+            return
+        }
+        // Fresh profiles at every Stop, so a colleague confirmed this morning
+        // is recognised this afternoon without a relaunch.
+        var profiles = VoiceProfileCache.load()
+        var owner = flowMe
+        if let me = try? await flow.me() {
+            applyFlowIdentity(me)
+            owner = me
+            profiles = me.profiles
+            VoiceProfileCache.save(me.profiles)
+        }
+
+        let uploader = MeetingUploader(flow: flow) { [weak self] progress in
+            Task { @MainActor in
+                guard let self else { return }
+                self.meetingStatus = progress.text
+                if progress == .done {
+                    self.pill.show(.inserted)
+                } else {
+                    self.pill.update(.meetingProcessing(progress.text))
+                }
+            }
+        }
+        pill.update(.meetingProcessing("Preparing the audio…"))
+        meetingStatus = "Preparing the audio…"
+        try uploader.prepare(meetingID: id, transcript: transcript, chunks: chunks,
+                             profiles: profiles, owner: owner)
+        _ = try await uploader.ship(meetingID: id)
+    }
+
+    /// Anything that did not finish uploading: run at launch and every time
+    /// this Mac connects. Quiet, because a Mac that was offline all weekend
+    /// should catch up without a stack of alerts.
+    func resumePendingUploads() {
+        guard flow.isConnected else { return }
+        Task {
+            let uploader = MeetingUploader(flow: flow) { [weak self] progress in
+                Task { @MainActor in self?.meetingStatus = progress.text }
+            }
+            await uploader.resumePending()
+        }
+    }
+
+    /// The recording's page in Flow.
+    func flowRecordingURL(_ id: String) -> URL {
+        URL(string: flow.serverBase + "/meetings/recording/" + id) ?? flowSettingsURL
+    }
+
+    func openInFlow(_ id: String) {
+        NSWorkspace.shared.open(flowRecordingURL(id))
+    }
+
+    // MARK: - Flow connection
+
+    /// Handles `whisperflow://connect?token=…&server=…`: stores the token in
+    /// the keychain, asks Flow who it belongs to, and says so on the pill.
+    func handleFlowURL(_ url: URL) {
+        guard let connect = FlowConnectURL.parse(url) else {
+            flowStatus = "That link was not a Whisper Flow connection link"
+            pill.show(.failed("that link did not carry a connection"))
+            return
+        }
+        flowStatus = "Connecting to Flow…"
+        Task {
+            do {
+                let me = try await flow.connect(token: connect.token, server: connect.server)
+                applyFlowIdentity(me)
+                let who = me.name.isEmpty ? me.email : me.name
+                flowStatus = "Connected as \(who)"
+                pill.show(.flowConnected(name: who))
+                VoiceProfileCache.save(me.profiles)
+                resumePendingUploads()
+                FileHandle.standardError.write(Data("[flow] connected as \(me.email) to \(flow.serverBase), recognise_me=\(me.recogniseMe), \(me.profiles.count) voice profiles\n".utf8))
+            } catch {
+                flowMe = nil
+                flowStatus = "Could not connect: \(error.localizedDescription)"
+                pill.show(.failed(error.localizedDescription))
+                FileHandle.standardError.write(Data("[flow] connect failed: \(error.localizedDescription)\n".utf8))
+            }
+        }
+    }
+
+    /// Confirms the stored token at launch, quietly. A failure here is not
+    /// worth a pill: the menu line says "not connected" and that is enough.
+    func refreshFlowIdentity() {
+        guard flow.isConnected else { return }
+        Task {
+            do {
+                applyFlowIdentity(try await flow.me())
+            } catch {
+                FileHandle.standardError.write(Data("[flow] could not confirm the stored token: \(error.localizedDescription)\n".utf8))
+                if let flowError = error as? FlowError, flowError == .unauthorised {
+                    flowMe = nil
+                    flowStatus = "This Mac was disconnected in Flow; connect it again"
+                }
+            }
+        }
+    }
+
+    private func applyFlowIdentity(_ me: FlowMe) {
+        flowMe = me
+        UserDefaults.standard.set(me.recogniseMe, forKey: Self.recogniseMeDefaultsKey)
+        VoiceProfileCache.save(me.profiles)
+    }
+
+    func openFlowSettings() {
+        NSWorkspace.shared.open(flowSettingsURL)
+    }
+
+    func openMeetingFolder(_ id: String) {
+        NSWorkspace.shared.open(MeetingStore.directory(for: id))
+    }
+
+    /// Rename one speaker on a saved meeting: rewrites transcript.json,
+    /// transcript.md and the name map in meeting.json so the folder on disk and
+    /// the review window never disagree.
+    func applySpeakerName(meetingID: String, speakerId: String, name: String) {
+        do {
+            var record = try MeetingStore.load(id: meetingID)
+            let data = try Data(contentsOf: MeetingStore.transcriptJSONURL(meetingID))
+            let transcript = SpeakerNaming.renamed(try JSONDecoder().decode(Transcript.self, from: data),
+                                                   speakerId: speakerId, to: name)
+            record.speakerNames = transcript.speakerNames
+            try MeetingStore.save(record)
+            try MeetingTranscriber(backend: backend).write(transcript, record: record)
+        } catch {
+            meetingStatus = "Could not rename: \(error.localizedDescription)"
         }
     }
 

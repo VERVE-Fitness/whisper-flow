@@ -1,0 +1,320 @@
+import XCTest
+@testable import WhisperFlow
+
+final class TrackWriterTests: XCTestCase {
+    func testWritesChunksReadableAs16kMono() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("trackwriter-\(UUID().uuidString).wav")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let writer = try TrackWriter(url: url)
+        // 1.5 s of a 440 Hz sine in three 0.5 s chunks
+        let chunk = (0..<8_000).map { i in Float(sin(2 * .pi * 440 * Double(i) / 16_000)) * 0.5 }
+        try writer.append(chunk)
+        try writer.append(chunk)
+        try writer.append(chunk)
+        XCTAssertEqual(writer.framesWritten, 24_000)
+        XCTAssertEqual(writer.seconds, 1.5, accuracy: 0.001)
+        writer.close()
+
+        let samples = try loadAudioFileAs16kMonoFloats(path: url.path)
+        XCTAssertEqual(samples.count, 24_000)
+        XCTAssertEqual(samples[100], chunk[100], accuracy: 1e-4)
+    }
+
+    func testCloseIsIdempotentAndAppendAfterCloseThrows() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("trackwriter-\(UUID().uuidString).wav")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let writer = try TrackWriter(url: url)
+        try writer.append([0, 0, 0, 0])
+        writer.close()
+        writer.close()
+        XCTAssertThrowsError(try writer.append([0]))
+    }
+}
+
+final class MeetingStoreTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        MeetingStore.rootOverride = FileManager.default.temporaryDirectory
+            .appendingPathComponent("meetings-test-\(UUID().uuidString)")
+    }
+    override func tearDown() {
+        if let root = MeetingStore.rootOverride { try? FileManager.default.removeItem(at: root) }
+        MeetingStore.rootOverride = nil
+        super.tearDown()
+    }
+
+    func testIDIsDateStampedAndUnique() {
+        let date = ISO8601DateFormatter().date(from: "2026-09-05T14:32:00+10:00")!
+        let a = MeetingStore.newMeetingID(at: date)
+        let b = MeetingStore.newMeetingID(at: date)
+        XCTAssertTrue(a.hasPrefix("2026-09-05-1432-"), a)
+        XCTAssertNotEqual(a, b)
+        XCTAssertEqual(a.count, "2026-09-05-1432-".count + 8)
+    }
+
+    func testSaveLoadRoundTripAndListNewestFirst() throws {
+        let consent = MeetingConsent(confirmedAt: Date(timeIntervalSince1970: 1_800_000_000), wordingVersion: "consent-v2")
+        var r1 = MeetingRecord(id: "2026-09-05-0900-aaaaaaaa", startedAt: Date(timeIntervalSince1970: 1_800_000_000),
+                               endedAt: nil, title: "Clayton lease", attendees: ["Nathan Hall"], consent: consent,
+                               status: .recording, failureReason: nil, trackASeconds: 0, trackBSeconds: 0, speakerNames: [:])
+        try MeetingStore.save(r1)
+        r1.status = .recorded; r1.trackASeconds = 61.5
+        try MeetingStore.save(r1)
+        let r2 = MeetingRecord(id: "2026-09-05-1000-bbbbbbbb", startedAt: Date(timeIntervalSince1970: 1_800_003_600),
+                               endedAt: nil, title: "", attendees: [], consent: consent,
+                               status: .recording, failureReason: nil, trackASeconds: 0, trackBSeconds: 0, speakerNames: [:])
+        try MeetingStore.save(r2)
+
+        let loaded = try MeetingStore.load(id: r1.id)
+        XCTAssertEqual(loaded, r1)
+        XCTAssertEqual(MeetingStore.listIDs(), [r2.id, r1.id])
+        XCTAssertEqual(MeetingStore.trackAURL(r1.id).lastPathComponent, "track-a.wav")
+        XCTAssertEqual(MeetingStore.summaryURL(r1.id).lastPathComponent, "summary.md")
+    }
+}
+
+final class ConsentGateTests: XCTestCase {
+    func testWordingCarriesEveryPromiseVersionTwoMakes() {
+        let w = ConsentGate.wording()
+        XCTAssertEqual(ConsentGate.wordingVersion, "consent-v2")
+        XCTAssertEqual(w.title, "Record this meeting?")
+        XCTAssertTrue(w.body.contains("Tell everyone on the call first"))
+        XCTAssertTrue(w.body.contains("I'm recording this for notes, is that OK with everyone?"))
+        // Week 2: the recording leaves the Mac, and the wording has to say so.
+        XCTAssertTrue(w.body.contains("saved to VERVE's system (Flow)"))
+        XCTAssertTrue(w.body.contains("You and your manager can play it back"))
+        XCTAssertTrue(w.body.contains("deleted after 90 days"))
+        XCTAssertTrue(w.body.contains("transcript and summary are kept"))
+        XCTAssertTrue(w.body.contains("delete either at any time from Flow"))
+        XCTAssertEqual(w.confirm, "I've told everyone and they're OK with it")
+        XCTAssertEqual(w.cancel, "Cancel")
+    }
+
+    /// No em or en dashes anywhere in the wording a person reads.
+    func testWordingHasNoEmOrEnDashes() {
+        let w = ConsentGate.wording()
+        for text in [w.title, w.body, w.confirm, w.cancel] {
+            XCTAssertFalse(text.contains("\u{2014}"), "em dash in: \(text)")
+            XCTAssertFalse(text.contains("\u{2013}"), "en dash in: \(text)")
+        }
+    }
+}
+
+final class TranscriptBuilderTests: XCTestCase {
+    // Parakeet emits SentencePiece tokens: "▁" marks the start of a word.
+    func testWordsGroupSentencePieceTokens() {
+        let tokens: [(token: String, start: Double, end: Double)] = [
+            ("▁The", 0.10, 0.20), ("▁Tor", 0.25, 0.35), ("i", 0.35, 0.40), ("▁trainer", 0.45, 0.80),
+            (",", 0.80, 0.82), ("▁ships", 0.90, 1.10),
+        ]
+        let words = TranscriptBuilder.words(fromTokens: tokens)
+        XCTAssertEqual(words.map(\.text), ["The", "Tori", "trainer,", "ships"])
+        XCTAssertEqual(words[1].start, 0.25); XCTAssertEqual(words[1].end, 0.40)
+    }
+
+    func testSegmentsSplitOnSilenceGap() {
+        let words = [TimedWord(text: "Hi", start: 0, end: 0.3), TimedWord(text: "Nathan", start: 0.35, end: 0.7),
+                     TimedWord(text: "Next", start: 2.0, end: 2.3), TimedWord(text: "item", start: 2.35, end: 2.6)]
+        let segs = TranscriptBuilder.segments(words: words, speakerId: "owner")
+        XCTAssertEqual(segs.count, 2)
+        XCTAssertEqual(segs[0].text, "Hi Nathan"); XCTAssertEqual(segs[0].start, 0); XCTAssertEqual(segs[0].end, 0.7)
+        XCTAssertEqual(segs[1].text, "Next item"); XCTAssertEqual(segs[1].speakerId, "owner")
+    }
+
+    func testAssignWordsToSpeakerSpansByMidpointAndGroupTurns() {
+        let words = [TimedWord(text: "Yes", start: 0.0, end: 0.3), TimedWord(text: "agreed", start: 0.4, end: 0.9),
+                     TimedWord(text: "But", start: 3.0, end: 3.2), TimedWord(text: "when", start: 3.3, end: 3.6),
+                     TimedWord(text: "Wednesday", start: 5.0, end: 5.6)]
+        let spans = [SpeakerSpan(speakerId: "speaker_0", start: 0, end: 1.0),
+                     SpeakerSpan(speakerId: "speaker_1", start: 2.8, end: 3.7),
+                     SpeakerSpan(speakerId: "speaker_0", start: 4.9, end: 6.0)]
+        let segs = TranscriptBuilder.assign(words: words, to: spans)
+        XCTAssertEqual(segs.map(\.speakerId), ["speaker_0", "speaker_1", "speaker_0"])
+        XCTAssertEqual(segs.map(\.text), ["Yes agreed", "But when", "Wednesday"])
+    }
+
+    func testAssignWordOutsideAnySpanGoesToNearestSpanWithinOneSecondElseUnknown() {
+        let words = [TimedWord(text: "late", start: 1.2, end: 1.4), TimedWord(text: "lost", start: 9.0, end: 9.2)]
+        let spans = [SpeakerSpan(speakerId: "speaker_0", start: 0, end: 1.0)]
+        let segs = TranscriptBuilder.assign(words: words, to: spans)
+        XCTAssertEqual(segs.map(\.speakerId), ["speaker_0", "speaker_unknown"])
+    }
+
+    func testMergeInterleavesByStartTime() {
+        let a = [TranscriptSegment(speakerId: "owner", start: 0, end: 1, text: "Morning"),
+                 TranscriptSegment(speakerId: "owner", start: 4, end: 5, text: "Wednesday works")]
+        let b = [TranscriptSegment(speakerId: "speaker_0", start: 1.5, end: 3.5, text: "Can we do Wednesday")]
+        let merged = TranscriptBuilder.merge(a, b)
+        XCTAssertEqual(merged.map(\.text), ["Morning", "Can we do Wednesday", "Wednesday works"])
+    }
+
+    func testMarkdownUsesNamesAndTimestamps() {
+        let t = Transcript(meetingID: "m", segments: [
+            TranscriptSegment(speakerId: "owner", start: 0, end: 1, text: "Morning"),
+            TranscriptSegment(speakerId: "speaker_0", start: 65.2, end: 67, text: "Can we do Wednesday"),
+        ], speakerNames: ["owner": "Niall Wogan", "speaker_0": "Nathan Hall"])
+        let md = TranscriptBuilder.markdown(t, title: "Clayton lease", startedAt: Date(timeIntervalSince1970: 0))
+        XCTAssertTrue(md.hasPrefix("# Clayton lease"))
+        XCTAssertTrue(md.contains("**[00:00] Niall Wogan:** Morning"))
+        XCTAssertTrue(md.contains("**[01:05] Nathan Hall:** Can we do Wednesday"))
+    }
+}
+
+final class MeetingRecorderTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        MeetingStore.rootOverride = FileManager.default.temporaryDirectory
+            .appendingPathComponent("meetings-rec-\(UUID().uuidString)")
+    }
+    override func tearDown() {
+        if let root = MeetingStore.rootOverride { try? FileManager.default.removeItem(at: root) }
+        MeetingStore.rootOverride = nil
+        super.tearDown()
+    }
+
+    @MainActor
+    func testStartWithoutHardwareCreatesRecordAndStopFinalisesIt() async throws {
+        let recorder = MeetingRecorder(captureFactory: { MeetingRecorder.Captures(mic: nil, system: nil) })
+        let consent = MeetingConsent(confirmedAt: Date(), wordingVersion: ConsentGate.wordingVersion)
+        let started = try await recorder.start(title: "Test", attendees: ["Nathan Hall"], consent: consent)
+        XCTAssertEqual(started.status, .recording)
+        XCTAssertTrue(recorder.isRecording)
+        let stopped = await recorder.stop()
+        XCTAssertEqual(stopped?.status, .recorded)
+        XCTAssertNotNil(stopped?.endedAt)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: MeetingStore.trackAURL(started.id).path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: MeetingStore.trackBURL(started.id).path))
+        XCTAssertEqual(try MeetingStore.load(id: started.id).status, .recorded)
+    }
+}
+
+final class SpeakerNamingTests: XCTestCase {
+    private let t = Transcript(meetingID: "m", segments: [
+        TranscriptSegment(speakerId: "owner", start: 0, end: 1, text: "Morning"),
+        TranscriptSegment(speakerId: "speaker_1", start: 1.5, end: 3, text: "Morning Niall"),
+        TranscriptSegment(speakerId: "speaker_0", start: 3.5, end: 5, text: "Hi both"),
+        TranscriptSegment(speakerId: "speaker_1", start: 5.5, end: 6, text: "So"),
+    ], speakerNames: [:])
+
+    func testNamesByFirstSpeechOrderAndFallsBackToNumbering() {
+        let names = SpeakerNaming.proposeNames(for: t, ownerName: "Niall Wogan", attendees: ["Nathan Hall"])
+        XCTAssertEqual(names["owner"], "Niall Wogan")
+        XCTAssertEqual(names["speaker_1"], "Nathan Hall")   // spoke first among the others
+        XCTAssertEqual(names["speaker_0"], "Speaker 2")     // no attendee left
+    }
+
+    func testProposeNeverOverwritesExistingNames() {
+        var named = t; named.speakerNames = ["speaker_0": "Damian"]
+        let names = SpeakerNaming.proposeNames(for: named, ownerName: "Niall Wogan", attendees: ["Nathan Hall"])
+        XCTAssertEqual(names["speaker_0"], "Damian")
+        XCTAssertEqual(names["speaker_1"], "Nathan Hall")
+    }
+
+    func testRenameAndReassign() {
+        let renamed = SpeakerNaming.renamed(t, speakerId: "speaker_0", to: "Giuseppe Tappi")
+        XCTAssertEqual(renamed.speakerNames["speaker_0"], "Giuseppe Tappi")
+        let reassigned = SpeakerNaming.reassigned(t, segmentIndex: 3, to: "speaker_0")
+        XCTAssertEqual(reassigned.segments[3].speakerId, "speaker_0")
+        XCTAssertEqual(reassigned.segments[1].speakerId, "speaker_1")
+    }
+}
+
+final class MeetingSummariserTests: XCTestCase {
+    func testPromptContainsTranscriptAndAsksForJSON() {
+        let t = Transcript(meetingID: "m", segments: [TranscriptSegment(speakerId: "owner", start: 0, end: 1, text: "Send the Clayton quote Wednesday")],
+                           speakerNames: ["owner": "Niall Wogan"])
+        let p = MeetingSummariser.prompt(for: t, title: "Clayton")
+        XCTAssertTrue(p.contains("Niall Wogan: Send the Clayton quote Wednesday"))
+        XCTAssertTrue(p.contains("\"decisions\""))
+        XCTAssertTrue(p.contains("Return only JSON"))
+    }
+
+    func testParseAcceptsFencedJSON() throws {
+        let text = """
+        ```json
+        {"summary":"Quote timing agreed.","decisions":["Quote goes Wednesday"],"actions":[{"text":"Send Clayton quote","owner":"Nathan Hall","due":"2026-09-09"}],"catch_up":"Nathan sends the Clayton quote Wednesday."}
+        ```
+        """
+        let s = try MeetingSummariser.parse(text)
+        XCTAssertEqual(s.decisions, ["Quote goes Wednesday"])
+        XCTAssertEqual(s.actions.first?.owner, "Nathan Hall")
+        XCTAssertEqual(s.catchUp, "Nathan sends the Clayton quote Wednesday.")
+    }
+
+    func testMarkdownSections() {
+        let s = MeetingSummary(summary: "S", decisions: ["D1"], actions: [MeetingAction(text: "A1", owner: "Niall", due: nil)], catchUp: "C")
+        let md = MeetingSummariser.markdown(s)
+        XCTAssertTrue(md.contains("## Summary\n\nS"))
+        XCTAssertTrue(md.contains("## Decisions\n\n- D1"))
+        XCTAssertTrue(md.contains("- A1 (Niall)"))
+        XCTAssertTrue(md.contains("## Catch-up\n\nC"))
+    }
+}
+
+final class TrackBAlignmentTests: XCTestCase {
+    /// A meeting.json written before trackBOffsetSeconds existed must still
+    /// load, as 0, which is the alignment those recordings actually had.
+    func testRecordWithoutOffsetDecodesAsZero() throws {
+        let json = """
+        {
+          "attendees" : ["Nathan Hall"],
+          "consent" : { "confirmedAt" : "2026-09-05T00:00:00Z", "wordingVersion" : "consent-v2" },
+          "id" : "2026-09-05-0900-aaaaaaaa",
+          "speakerNames" : {},
+          "startedAt" : "2026-09-05T00:00:00Z",
+          "status" : "recorded",
+          "title" : "Clayton lease",
+          "trackASeconds" : 61.5,
+          "trackBSeconds" : 60.4
+        }
+        """
+        let d = JSONDecoder()
+        d.dateDecodingStrategy = .iso8601
+        let record = try d.decode(MeetingRecord.self, from: Data(json.utf8))
+        XCTAssertEqual(record.trackBOffsetSeconds, 0)
+        XCTAssertEqual(record.trackASeconds, 61.5)
+        XCTAssertEqual(record.id, "2026-09-05-0900-aaaaaaaa")
+    }
+
+    func testOffsetRoundTripsThroughTheStore() throws {
+        MeetingStore.rootOverride = FileManager.default.temporaryDirectory
+            .appendingPathComponent("meetings-offset-\(UUID().uuidString)")
+        defer {
+            if let root = MeetingStore.rootOverride { try? FileManager.default.removeItem(at: root) }
+            MeetingStore.rootOverride = nil
+        }
+        let consent = MeetingConsent(confirmedAt: Date(timeIntervalSince1970: 1_800_000_000), wordingVersion: "consent-v2")
+        let record = MeetingRecord(id: "2026-09-05-1100-cccccccc", startedAt: Date(timeIntervalSince1970: 1_800_000_000),
+                                   endedAt: nil, title: "", attendees: [], consent: consent, status: .recorded,
+                                   failureReason: nil, trackASeconds: 30, trackBSeconds: 28.9,
+                                   trackBOffsetSeconds: 1.07, speakerNames: [:])
+        try MeetingStore.save(record)
+        XCTAssertEqual(try MeetingStore.load(id: record.id).trackBOffsetSeconds, 1.07, accuracy: 1e-9)
+    }
+
+    func testShiftMovesTrackBOnToTrackATimeline() {
+        let b = [TranscriptSegment(speakerId: "S1", start: 0.5, end: 2.0, text: "Can we do Wednesday"),
+                 TranscriptSegment(speakerId: "S2", start: 3.0, end: 4.5, text: "Wednesday is realistic")]
+        let shifted = TranscriptBuilder.shifted(b, by: 1.05)
+        XCTAssertEqual(shifted.map(\.start), [1.55, 4.05])
+        XCTAssertEqual(shifted.map(\.end), [3.05, 5.55])
+        XCTAssertEqual(shifted.map(\.speakerId), ["S1", "S2"])
+        XCTAssertEqual(shifted.map(\.text), b.map(\.text))
+    }
+
+    func testShiftByZeroIsIdentityAndOrdersTheMergeCorrectly() {
+        let a = [TranscriptSegment(speakerId: "owner", start: 0, end: 1.2, text: "Morning"),
+                 TranscriptSegment(speakerId: "owner", start: 2.4, end: 3.0, text: "Wednesday works")]
+        let b = [TranscriptSegment(speakerId: "S1", start: 0.4, end: 1.2, text: "Can we do Wednesday")]
+        XCTAssertEqual(TranscriptBuilder.shifted(a, by: 0), a)
+        // Unshifted, the answer lands before the question was finished.
+        XCTAssertEqual(TranscriptBuilder.merge(a, b).map(\.text),
+                       ["Morning", "Can we do Wednesday", "Wednesday works"])
+        // Shifted by the measured second, the question lands between them.
+        XCTAssertEqual(TranscriptBuilder.merge(a, TranscriptBuilder.shifted(b, by: 1.0)).map(\.start),
+                       [0, 1.4, 2.4])
+    }
+}

@@ -7,7 +7,9 @@ import AppKit
 struct MenuBarContent: View {
     @EnvironmentObject var state: AppState
     @ObservedObject var accessibility: AccessibilityPermission
+    @ObservedObject var meetings: MeetingRecorder
     var openTranscriptWindow: () -> Void
+    var openMeetingWindow: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -53,6 +55,42 @@ struct MenuBarContent: View {
                 }
             }
         }
+
+        Divider()
+
+        // Meetings. `meetings` is observed so this flips to "Stop" while a
+        // recording is running, even if the menu was already open.
+        if meetings.isRecording {
+            Button("Stop meeting recording") { state.stopMeeting() }
+        } else {
+            Button("Record meeting…") { state.startMeeting() }
+        }
+        if let status = state.meetingStatus {
+            Text("meeting: \(status)")
+                .foregroundStyle(.secondary)
+        }
+        Button("Show last meeting…") {
+            openMeetingWindow()
+        }
+        if let id = state.lastMeetingID {
+            Button("Open last meeting folder") { state.openMeetingFolder(id) }
+        }
+
+        Divider()
+
+        // Flow connection. A meeting cannot be recorded until this says
+        // connected, because the consent wording promises the audio reaches
+        // VERVE's system and it only does once a token is on this Mac.
+        Text(state.flowMenuLine)
+            .foregroundStyle(.secondary)
+        if let status = state.flowStatus {
+            Text(status)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        Button("Whisper Flow settings…") { state.openFlowSettings() }
+
+        Divider()
 
         Button("Show Transcript Window") {
             openTranscriptWindow()

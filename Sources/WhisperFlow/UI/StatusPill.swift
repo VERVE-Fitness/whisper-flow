@@ -16,10 +16,23 @@ enum PillState: Equatable {
     /// vanished on error, which read as "it stalled" -- the reason was only
     /// in the menu bar dropdown nobody opens.
     case failed(String)
+    /// A meeting is being recorded; the pill shows elapsed time and is the
+    /// Stop button. Orange, not the dictation red, so nobody confuses a
+    /// meeting that runs for an hour with a dictation that runs for ten
+    /// seconds -- and so nobody assumes Right Option will stop it.
+    case meeting(elapsed: Double)
+    /// Post-meeting work: transcribing, separating speakers, uploading,
+    /// waiting on the summary. The payload is whatever the transcriber or the
+    /// uploader last reported, including the diariser's percentage, because
+    /// the first run of that model downloads 22 MB and an unlabelled spinner
+    /// reads as a hang.
+    case meetingProcessing(String)
+    /// This Mac just connected to Flow. Terminal, so it auto-hides.
+    case flowConnected(name: String)
 
     var isTerminal: Bool {
         switch self {
-        case .inserted, .copiedOnly, .discarded, .failed: return true
+        case .inserted, .copiedOnly, .discarded, .failed, .flowConnected: return true
         default: return false
         }
     }
@@ -66,6 +79,22 @@ private struct PillContentView: View {
                     .foregroundStyle(.yellow)
                 Text("Didn't work: \(trailing(why, 70))")
                     .lineLimit(1)
+            case .meeting(let elapsed):
+                Circle()
+                    .fill(Color.orange)
+                    .frame(width: 8, height: 8)
+                Text("Recording meeting · \(TranscriptBuilder.stamp(elapsed)) · click to stop")
+                    .lineLimit(1)
+            case .meetingProcessing(let status):
+                ProgressView()
+                    .controlSize(.small)
+                Text(status)
+                    .lineLimit(1)
+            case .flowConnected(let name):
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+                Text("Connected to Flow as \(name)")
+                    .lineLimit(1)
             }
         }
         .font(.system(size: 12, weight: .medium))
@@ -78,6 +107,7 @@ private struct PillContentView: View {
         .contentShape(Capsule())
         .onTapGesture {
             if case .listening = state { onTapStop() }
+            else if case .meeting = state { onTapStop() }
         }
         .fixedSize()
     }
