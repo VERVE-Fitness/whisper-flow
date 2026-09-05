@@ -86,7 +86,7 @@ The app is signed with an Apple Development certificate, not Developer ID, and i
 
 Guard rails: empty output, output longer than 1.6× the raw text, too few content words kept, too many new words, a dropped question mark, errors, or the timeout all fall back to the raw transcript (logged to stderr and the usage log). Deterministic passes (dictionary corrections, self-correction stripping, digit formatting) run on every path. Whole-sentence cue-led replacement ("… by Tuesday. Actually make that Wednesday.") only deletes the previous sentence when the replacement is at least half its length; shorter remainders are word-level swaps left for the LLM.
 
-## Meetings (week 2: recorded here, kept in Flow)
+## Meetings (week 3: recorded here or by a bot, kept in Flow)
 
 **Record meeting…** in the menu records both sides of a call. At Stop the Mac transcribes it, works out who spoke, and sends the audio, the transcript and the speakers to Flow, which writes the summary and the proposed actions. You end up with the meeting at flow.vervefitness.ai/meetings and a copy of everything in a folder on this Mac.
 
@@ -101,6 +101,53 @@ Guard rails: empty output, output longer than 1.6× the raw text, too few conten
 The token is shown once. It never appears in a log, a preference file or the transcript folder. The menu says "Flow: connected as …" or "Flow: not connected". Revoke a Mac from the same page.
 
 For a preview deployment: `defaults write com.niallwogan.whisperflow flowServer https://your-preview-url` before clicking the link, or let the link carry its own `server=`.
+
+### When VERVE Notes already has the meeting
+
+Flow can send a bot (VERVE Notes) to a meeting for you. Recording the same
+call here as well would give you two of everything: two summaries, two sets of
+draft actions, two recordings to delete. So when you click "Record meeting…"
+the app asks Flow what its bots are doing first.
+
+If a bot is joining or in the call now, or is scheduled to join within ten
+minutes, you get this instead of the consent gate:
+
+> VERVE Notes is already recording <title> into Flow. Recording here as well
+> would give you two copies.
+
+with **Let the bot do it** (the default button) and **Record here anyway**,
+which carries on to the normal consent gate. The check has a two second budget
+and no retry: if Flow is slow or unreachable you get the consent gate exactly
+as before. Every decision is on stderr as a `[bot]` line.
+
+### The calendar prompt
+
+While this Mac is connected, awake and not already recording, the app reads
+your calendar every sixty seconds and offers to record the meeting you are
+about to walk into. A meeting qualifies when it starts in the next one to two
+minutes, has at least one other person on it, and has no bot on the way.
+
+The notification reads *"Record Nathan 1:1?"* / *"With Nathan, Giuseppe and
+Ella. Starts in a minute."* with **Record** and **Not this one**. Record opens
+the normal consent gate with the title and the attendee names already filled
+in, and the recording carries the calendar event id so Flow can hang it off
+the event.
+
+- An event with a bot scheduled, joining, in a call or ingesting is the bot's
+  job and is never prompted for. A bot that failed recorded nothing, so that
+  meeting is offered after all.
+- An in-person meeting has no join link, so it never has a bot, and it always
+  qualifies. That is the case the prompt exists for.
+- Each event is asked about once a day, so a meeting sitting in the window for
+  a full minute does not prompt twice.
+- The poll pauses while the Mac is asleep, so a machine that wakes at 4pm does
+  not fire prompts for meetings that already happened.
+- **Meeting prompts** in the menu turns the whole thing off. On by default.
+- macOS asks for notification permission once, the first time this Mac
+  connects to Flow. If you say no, the same two buttons appear as an alert
+  instead, one at a time.
+
+Every decision, taken or skipped, is on stderr as a `[prompt]` line.
 
 ### Wear headphones
 
@@ -196,7 +243,21 @@ The debug binary, `$HOME/.cache/whisperflow-build-scratch/debug/WhisperFlow`:
 10. Resume: turn the wifi off, stop a meeting, turn it back on. Did it finish on its own?
 ```
 
-**Not yet:** attendees are typed rather than read from the calendar, and the 90-day retention job is installed on the VPS by Fable, not by this app.
+**Not yet:** the 90-day retention job is installed on the VPS by Fable, not by this app.
+
+### Week-3 dogfood (the prompt and the bot)
+
+```
+1. Prompt timing: did the notification arrive about a minute before the meeting, once, and not again?
+2. Prompt copy: did the subject and the attendee first names read correctly?
+3. Record from the prompt: did the consent gate open with the title and attendees already filled in?
+4. Bot overlap: send a bot to a meeting, then click "Record meeting…" in it. Did the alert name the right meeting?
+5. Let the bot do it: nothing recorded here, and the bot's recording appears in Flow on its own.
+6. In-person meeting with no join link: prompted for, as it should be.
+7. Meeting with a bot on the way: NOT prompted for.
+8. Turn "Meeting prompts" off: nothing arrives for the rest of the day.
+9. Close the lid between two meetings: no stack of late prompts on waking.
+```
 
 ## Swapping the STT backend
 
