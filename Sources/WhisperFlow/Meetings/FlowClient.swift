@@ -10,7 +10,15 @@ import Security
 /// uploading while the screen is locked still finds it.
 enum FlowKeychain {
     static let service = "com.niallwogan.whisperflow"
+    /// A debug binary is signed differently from the shipped app, so reading
+    /// the shipped app's item makes macOS put a password prompt in front of
+    /// whoever is at the keyboard (Niall, twice, 5 Sep 2026). Debug builds
+    /// get their own slot and never touch the real token.
+    #if DEBUG
+    static let account = "flow-device-token-dev"
+    #else
     static let account = "flow-device-token"
+    #endif
 
     private static var baseQuery: [String: Any] {
         [kSecClass as String: kSecClassGenericPassword,

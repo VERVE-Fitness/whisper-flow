@@ -123,10 +123,12 @@ enum SelfUpdater {
         case badTag(String)
         case replace(String)
         case relaunch
+        case notPackagedBuild
 
         var reason: String {
             switch self {
             case .download: return "the download did not finish"
+            case .notPackagedBuild: return "this copy was not built for release"
             case .unpack: return "the download could not be unpacked"
             case .noBundle: return "the download did not contain the app"
             case .gatekeeper: return "macOS did not accept the new copy"
@@ -236,6 +238,10 @@ enum SelfUpdater {
                               runningBundlePath: String,
                               home: String = NSHomeDirectory(),
                               progress: @escaping @Sendable (Int?) -> Void) async throws -> URL {
+        guard isPackagedBuild else {
+            log("not a packaged build (no WFBuildDate); refusing to install an update over anything")
+            throw Failure.notPackagedBuild
+        }
         let work = FileManager.default.temporaryDirectory
             .appendingPathComponent("whisperflow-update-\(UUID().uuidString)", isDirectory: true)
         try? FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
@@ -328,10 +334,25 @@ enum SelfUpdater {
     /// Offered once per source path, at launch, when the app is running from
     /// somewhere that is not an Applications folder. "Move" installs it the
     /// same way an update does and restarts from the new place.
+    /// Only a bundle that came out of scripts/make-app.sh carries WFBuildDate.
+    /// A `swift build` debug binary, a test host, or a helper app somebody
+    /// made to look at a window is not that, and must never move itself
+    /// into Applications or replace what is there. On 5 Sep 2026 a debug
+    /// copy did exactly that on Niall's Mac: it moved his real app to the
+    /// Trash and installed itself in its place. Never again.
+    static var isPackagedBuild: Bool {
+        Bundle.main.infoDictionary?["WFBuildDate"] as? String != nil
+            && Bundle.main.infoDictionary?["WFGitCommit"] as? String != nil
+    }
+
     @MainActor
     static func offerMoveToApplications(bundlePath: String,
                                         home: String = NSHomeDirectory(),
                                         defaults: UserDefaults = .standard) async {
+        guard isPackagedBuild else {
+            log("not a packaged build (no WFBuildDate); never offering to move or install")
+            return
+        }
         let location = classify(bundlePath: bundlePath, home: home)
         let declined = defaults.stringArray(forKey: declinedMoveDefaultsKey) ?? []
         guard shouldOfferMove(location: location, bundlePath: bundlePath, declinedPaths: declined) else { return }
