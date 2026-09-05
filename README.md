@@ -67,11 +67,13 @@ If the engine actually stops under a running capture (`AVAudioEngineConfiguratio
 1. **Microphone** — standard TCC prompt on first dictation attempt.
 2. **Accessibility** — required for global hotkeys and cursor insertion. Prompted once automatically at launch; if dismissed, grant later via the menu bar's "Grant Accessibility…" item. Without it, hotkeys and insertion silently no-op — dictated text is left on the clipboard with a "copied — paste with ⌘V" note instead.
 
+**After an update:** macOS drops the Accessibility grant whenever the signed binary changes, which used to read as the app quietly refusing to type. On the first launch of a new `CFBundleShortVersionString`, if the grant is gone, the app opens the system prompt itself, once, and the pill says "Update installed: grant Accessibility again". The version it last checked is stored under `UserDefaults` `lastAccessibilityCheckVersion`. A first ever install is not treated as an update: it gets the ordinary first-run prompt.
+
 The app is signed with an Apple Development certificate, not Developer ID, and is not notarised: on macOS 15+ the first launch is blocked and must be allowed from System Settings → Privacy & Security → "Open Anyway" (Control-click → Open no longer works there). The download page walks through it.
 
 ## Hotkeys and insertion
 
-- **Push-to-talk (Right Option, keyCode 61):** watched via both a global and a local `NSEvent` flagsChanged monitor, so it also fires when Whisper Flow's own UI has focus. Holds shorter than 150 ms are treated as accidental taps and ignored. The mic stays open 250 ms after release so the last word isn't clipped.
+- **Push-to-talk (Right Option, keyCode 61):** watched via both a global and a local `NSEvent` flagsChanged monitor, so it also fires when Whisper Flow's own UI has focus. Holds shorter than 150 ms are treated as accidental taps and ignored. The mic stays open 400 ms after release so the last word isn't clipped (see **Phrases and the last two seconds** below).
 - **Hands-free (⌘ + Right Option):** a CGEvent tap swallows the finishing key press.
 - **Insertion:** on stop, the cleaned text is placed on the general pasteboard, a synthetic ⌘V is posted to the system HID event tap, and the previous clipboard contents are restored ~0.3 s later. The app never activates itself, so the target app keeps focus throughout. A floating, non-activating status pill shows Listening → Cleaning → Inserted (or "Didn't catch that" / "Didn't work: …").
 - **Watchdog:** if a stop is still in "Cleaning…" after 45 s, the state machine is reset so the next dictation works, and the pill says so.
@@ -257,6 +259,57 @@ The debug binary, `$HOME/.cache/whisperflow-build-scratch/debug/WhisperFlow`:
 7. Meeting with a bot on the way: NOT prompted for.
 8. Turn "Meeting prompts" off: nothing arrives for the rest of the day.
 9. Close the lid between two meetings: no stack of late prompts on waking.
+```
+
+### Week-3 part 3 dogfood (phrases and the tail)
+
+```
+1. Add "Tori" with "it comes out as: tory" on /whisper-settings, open the refresh link, dictate "the tory rack": comes out "Tori".
+2. Dictate "that is the story of the quarter": still says "story".
+3. Dictate something already right ("the functional trainer"): unchanged, and no [phrase] line on stderr.
+4. Pull the network out and dictate: the cached list still corrects, no hang at Stop.
+5. Hand-edit a dictation ("vervey pulls" to "VERVE Pulse"), wait ten seconds: it appears in the "Heard wrong" queue in Flow.
+6. Dictate a long sentence and let go of the key ON the last syllable: the last word is there.
+7. Check stderr for the [stt] streaming N words, batch M words line on every dictation under two minutes.
+8. Dictate for three minutes: no batch pass, no eight second wait at Stop.
+9. Install a new build without granting Accessibility: the pill says "Update installed: grant Accessibility again", once.
+```
+
+## Phrases and the last two seconds
+
+Two things Niall asked for on 5 Sep 2026: "get better at phrases we use often but it doesn't catch properly", and "sometimes it misses the last 2 seconds of what I say even though I'm holding the key long enough".
+
+### Phrases we say
+
+The phrase list lives in Flow, not on the Mac, so one person's fix reaches everyone. `GET /api/public/whisper/me` returns `phrases: [{phrase, heard_as: [...]}]`, the team's phrases plus your own, and the app caches them at `~/Library/Application Support/WhisperFlow/phrases.json`. The cache is refreshed on connect, at every Stop (2 s, one attempt, fire and forget) and whenever the settings page opens `whisperflow://refresh` after an edit. With no connection the cached list is used exactly as it stands.
+
+`Cleanup/PhraseMatcher.swift` is pure and applies two passes, in `CleanupRouter.finalize` alongside the dictionary corrections, so it runs on **every** path including passthrough and every guard-rail fallback:
+
+1. **Exact.** Each `heard_as` variant is replaced by its phrase, on word boundaries, case-insensitively, longest variant first, in the phrase's own casing. "tory." becomes "Tori."; "verve pulse" becomes "VERVE Pulse".
+2. **Fuzzy.** Windows of one to four words within a normalised edit distance of 0.25 of a phrase become that phrase. Three guards keep it off ordinary English: the comparison has to involve at least five characters, a phrase that is itself a common English word (or any single lower-case word) is never a fuzzy target, and a window has to be the same number of words as the phrase. That is why "story" stays "story": two edits over five characters is 0.4, well over the bar.
+
+The phrase list also joins the dictionary hints the LLM sees. At Stop, every meeting transcript segment goes through the same matcher before the transcript is written, so what Flow stores and what the summariser reads say "Tori" too. Every replacement writes one line to stderr:
+
+```
+[phrase] "tory" -> "Tori" (exact)
+[phrase] "verve pulze" -> "VERVE Pulse" (fuzzy 0.09)
+```
+
+**Learning them.** `CorrectionLearner` now learns runs of up to four words replaced by up to four words, not just single words, so "vervey pulls" becoming "VERVE Pulse" is one correction. It keeps them locally as before **and** POSTs each new one to `POST /api/public/whisper/phrases/suggest` with the device token. Nothing becomes a team phrase until a person accepts it in the "Heard wrong" queue on `/whisper-settings`. A Mac with no token never calls at all.
+
+### The missing last two seconds
+
+The sliding-window decoder commits words a window at a time, so the tail of a dictation can still be volatile when the key is released and never gets committed. Three changes together, with the judgement calls kept pure in `STT/TranscriptChoice.swift`:
+
+1. The release hold is 400 ms, up from 250 ms.
+2. 600 ms of silence (9,600 zero samples at 16 kHz) is fed into the streaming session **after** the capture stream has drained and before `finish()`, which is what makes the window commit its last words.
+3. Any dictation of 120 s or less is re-decoded through the batch path, which never had a window to lose anything from, with an 8 s budget. Its text is used unless it came back with fewer than half the words the streaming pass heard. The batch decoder occasionally drops an out-of-vocabulary opening outright, and a mangled attempt at a product name beats a clean transcript missing it. A failure or a timeout keeps the streaming text.
+
+The existing low-confidence short-clip discard runs off that same single decode, so nothing is ever transcribed twice. Every dictation logs the choice, which is what makes a future truncation visible instead of silent:
+
+```
+[stt] streaming 5 words, batch 6 words, using batch
+[stt] streaming 8 words, batch 2 words, using streaming
 ```
 
 ## Swapping the STT backend

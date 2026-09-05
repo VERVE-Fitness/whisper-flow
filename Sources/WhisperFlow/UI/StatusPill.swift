@@ -29,10 +29,14 @@ enum PillState: Equatable {
     case meetingProcessing(String)
     /// This Mac just connected to Flow. Terminal, so it auto-hides.
     case flowConnected(name: String)
+    /// An update landed and macOS dropped the Accessibility grant with it, so
+    /// nothing can be typed until the person grants it again. Stays up longer
+    /// than the rest: it is the one pill that asks for something.
+    case accessibilityAfterUpdate
 
     var isTerminal: Bool {
         switch self {
-        case .inserted, .copiedOnly, .discarded, .failed, .flowConnected: return true
+        case .inserted, .copiedOnly, .discarded, .failed, .flowConnected, .accessibilityAfterUpdate: return true
         default: return false
         }
     }
@@ -40,6 +44,15 @@ enum PillState: Equatable {
     var isFailure: Bool {
         if case .failed = self { return true }
         return false
+    }
+
+    /// How long a terminal pill stays up before it hides itself.
+    var autoHideSeconds: Double {
+        switch self {
+        case .accessibilityAfterUpdate: return 8.0
+        case .failed: return 3.5
+        default: return 1.0
+        }
     }
 }
 
@@ -95,6 +108,11 @@ private struct PillContentView: View {
                     .foregroundStyle(.green)
                 Text("Connected to Flow as \(name)")
                     .lineLimit(1)
+            case .accessibilityAfterUpdate:
+                Image(systemName: "lock.open")
+                    .foregroundStyle(.yellow)
+                Text(AccessibilityPermission.updatePillText)
+                    .lineLimit(1)
             }
         }
         .font(.system(size: 12, weight: .medium))
@@ -143,7 +161,7 @@ final class StatusPillController {
                 self?.hide()
             }
             autoHideWorkItem = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + (state.isFailure ? 3.5 : 1.0), execute: work)
+            DispatchQueue.main.asyncAfter(deadline: .now() + state.autoHideSeconds, execute: work)
         }
     }
 

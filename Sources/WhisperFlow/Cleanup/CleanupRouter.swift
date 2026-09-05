@@ -30,7 +30,12 @@ struct CleanupRouter: Sendable {
     func clean(_ raw: String, context: String? = nil) async -> CleanupResult {
         let start = Date()
         let backend = await resolveBackend()
-        let dictionary = UserLexicon.shared.dictionary
+        let phrases = PhraseStore.shared.phrases
+        // The phrase list rides in with the personal dictionary, so the LLM
+        // sees "VERVE Pulse" spelled the way the team spells it and stops
+        // inventing its own rendering; the deterministic pass in finalize()
+        // is what actually guarantees the spelling either way.
+        let dictionary = Self.dictionaryWithPhrases(UserLexicon.shared.dictionary, phrases: phrases)
         let corrections = UserLexicon.shared.corrections
 
         func elapsedMs() -> Int { Int(Date().timeIntervalSince(start) * 1000) }
@@ -46,7 +51,12 @@ struct CleanupRouter: Sendable {
         // through, cue and all.
         func finalize(_ text: String, backendName: String, fellBackToRaw: Bool) -> CleanupResult {
             let corrected = Self.applyCorrections(corrections, to: text)
-            let selfCorrected = Self.stripStandaloneCorrections(corrected)
+            // Phrases run here, next to the corrections map, for the same
+            // reason: every path reaches finalize, including passthrough and
+            // every guard-rail fallback, so "Tori" comes out right whether or
+            // not an LLM was reachable.
+            let phrased = PhraseMatcher.applyLogging(corrected, phrases: phrases)
+            let selfCorrected = Self.stripStandaloneCorrections(phrased)
             let digitsFormatted = SpokenNumbers.convert(selfCorrected)
             return CleanupResult(text: digitsFormatted, backendName: backendName, fellBackToRaw: fellBackToRaw, durationMs: elapsedMs())
         }
@@ -480,6 +490,22 @@ struct CleanupRouter: Sendable {
         let remainder = current.trimmingCharacters(in: .whitespaces)
         if !remainder.isEmpty { sentences.append(remainder) }
         return sentences
+    }
+
+    /// The personal dictionary with the phrase list appended, de-duplicated
+    /// case-insensitively. The dictionary feeds the LLM prompt and the three
+    /// guard rails that treat a dictionary term as an expected correction
+    /// rather than an invention, and a phrase is exactly that.
+    static func dictionaryWithPhrases(_ dictionary: [String], phrases: [FlowPhrase]) -> [String] {
+        var merged = dictionary
+        for phrase in phrases {
+            let term = phrase.phrase.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !term.isEmpty else { continue }
+            if !merged.contains(where: { $0.caseInsensitiveCompare(term) == .orderedSame }) {
+                merged.append(term)
+            }
+        }
+        return merged
     }
 
     /// Applies the deterministic misheard->corrected map, case-insensitive,

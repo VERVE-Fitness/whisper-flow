@@ -672,7 +672,10 @@ private func runCLIMeetingTest(seconds: Double, attendees: [String], upload: Boo
                 let flow = FlowClient.shared
                 if flow.isConnected {
                     let me = try? await flow.me()
-                    if let me { VoiceProfileCache.save(me.profiles) }
+                    if let me {
+                        VoiceProfileCache.save(me.profiles)
+                        PhraseStore.shared.replace(me.phrases)
+                    }
                     let profiles = me?.profiles ?? VoiceProfileCache.load()
                     let uploader = MeetingUploader(flow: flow) { progress in print("  \(progress.text)") }
                     try uploader.prepare(meetingID: rec.id, transcript: transcript,

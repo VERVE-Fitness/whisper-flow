@@ -168,10 +168,15 @@ final class AppState: ObservableObject {
     /// is reset so the next dictation works; the wedged task, if it ever
     /// completes, is ignored.
     private static let cleaningWatchdogSeconds: UInt64 = 45
+    /// Budget for the background list refresh at every Stop. Short on
+    /// purpose: it runs alongside cleanup and must never be the reason a
+    /// dictation feels slow.
+    static let backgroundRefreshTimeout: TimeInterval = 2
     /// Keep the mic open this long after the key is released: people let go
-    /// of the key on the last syllable, and the sliding-window decoder
-    /// needs the trailing silence to commit the final word.
-    private static let releaseTailNanoseconds: UInt64 = 250_000_000
+    /// of the key on the last syllable, and the sliding-window decoder needs
+    /// the trailing silence to commit the final word. 400 ms since week 3,
+    /// alongside the silence pad and the batch re-check in TranscriptChoice.
+    private static var releaseTailNanoseconds: UInt64 { TranscriptChoice.releaseTailNanoseconds }
 
     var isRecording: Bool { phase == .recording }
     /// `.error` is deliberately recordable: an error is a message about the
@@ -227,8 +232,10 @@ final class AppState: ObservableObject {
     /// word, regardless of energy.
     private static let minimumSamplesForTranscription = 4_800
     /// Below this, the sliding-window streaming pass has too little context
-    /// to be trusted on its own; re-decode the full retained clip through the
-    /// batch path instead, which reports a real per-utterance confidence.
+    /// to be trusted on its own, and the batch pass's confidence score is
+    /// used to discard the clip outright. Longer clips still run through the
+    /// batch decoder (see TranscriptChoice.batchRecheckMaxSeconds), but only
+    /// to recover a lost tail, never to discard.
     private static let shortClipSecondsThreshold: Double = 3.0
     /// FluidAudio's batch confidence ranges ~0.1 (empty/near-silent) to 1.0
     /// (fully confident); below this the re-check is treated the same as a
@@ -266,7 +273,14 @@ final class AppState: ObservableObject {
                 if trusted { self?.installHotkeys() }
             }
 
-        accessibility.checkAndPromptIfNeeded()
+        // An update replaces the signed binary and macOS drops the
+        // Accessibility grant with it, which reads as "the app stopped
+        // typing". Ask again, once per new version, and say why.
+        if accessibility.handleVersionChange() {
+            pill.show(.accessibilityAfterUpdate)
+        } else {
+            accessibility.checkAndPromptIfNeeded()
+        }
         refreshInputDevices()
         startUpdateChecks()
         refreshFlowIdentity()
@@ -499,6 +513,11 @@ final class AppState: ObservableObject {
         guard isRecording else { return }
         isStopping = true
         phase = .cleaning
+        // Fire and forget, alongside the cleanup: the phrase list and the
+        // voice profiles are refreshed at every Stop so an edit made on the
+        // settings page this morning is live this afternoon, with no relaunch
+        // and no waiting.
+        refreshFromFlow(reason: "stop")
         let mode = currentMode
         let sttStart = recordStart ?? Date()
         // Snapshot the handles now; the watchdog or a later dictation may
@@ -580,6 +599,12 @@ final class AppState: ObservableObject {
             guard current() else { return }
             do {
                 let sttT0 = Date()
+                // The capture stream has drained, so every real sample is in
+                // before this: 600 ms of silence on the end is what makes the
+                // sliding window commit the last words instead of leaving
+                // them volatile forever. A failure here is not worth
+                // abandoning the dictation for; finishStream still runs.
+                try? await backend.feed(samples: TranscriptChoice.silencePad())
                 var raw = TextNormalizer.normalizeSentenceSpacing(try await backend.finishStream())
                 guard current() else { return }
                 // stt_ms: time from stop-press to final text (streaming absorbed the rest).
@@ -606,16 +631,23 @@ final class AppState: ObservableObject {
 
                 var sttConfidence: Double?
 
-                // Short clips give the sliding-window streaming pass too
-                // little context to trust on its own; re-decode the full
-                // retained buffer through the batch path, which scores a
-                // real per-utterance confidence.
-                if audioSeconds < Self.shortClipSecondsThreshold {
+                // One batch pass, for two jobs. The full retained buffer goes
+                // through the batch decoder for any dictation of two minutes
+                // or less: it never had a sliding window, so it cannot have
+                // lost the tail the way streaming can. For a short clip the
+                // same pass also scores the confidence that decides whether
+                // to discard the clip entirely. One decode, never two.
+                if audioSeconds <= TranscriptChoice.batchRecheckMaxSeconds {
+                    var batchText: String?
                     do {
-                        let batch = try await backend.transcribeFileWithConfidence(samples: captured)
+                        let batch = try await withTimeout(seconds: TranscriptChoice.batchTimeoutSeconds) {
+                            [backend, captured] in
+                            try await backend.transcribeFileWithConfidence(samples: captured)
+                        }
                         guard current() else { return }
                         sttConfidence = Double(batch.confidence)
-                        if batch.confidence < Self.minimumBatchConfidence {
+                        if audioSeconds < Self.shortClipSecondsThreshold,
+                           batch.confidence < Self.minimumBatchConfidence {
                             FileHandle.standardError.write(Data("[stt] discarding low-confidence short clip (confidence=\(batch.confidence), text=\"\(batch.text)\")\n".utf8))
                             rawTranscript = ""
                             cleanedTranscript = ""
@@ -632,28 +664,15 @@ final class AppState: ObservableObject {
                                             inputDevice: deviceName, outcome: "discard_low_confidence")
                             return
                         }
-                        // The re-check exists to gate CONFIDENCE, not to
-                        // replace the transcript. The batch pass sometimes
-                        // drops out-of-vocabulary openings entirely (observed
-                        // 2026-07-08: spoken "The VERVE Tori Functional
-                        // Trainer", streaming heard the whole phrase, batch
-                        // returned just "Functional trainer"). If the batch
-                        // text lost a substantial share of the words the
-                        // streaming pass heard, keep the streaming text — a
-                        // mangled attempt at a product name downstream layers
-                        // can correct beats a clean transcript missing it.
-                        let streamWordCount = raw.split(whereSeparator: \.isWhitespace).count
-                        let batchWordCount = batch.text.split(whereSeparator: \.isWhitespace).count
-                        if Double(batchWordCount) >= Double(streamWordCount) * 0.7 {
-                            raw = TextNormalizer.normalizeSentenceSpacing(batch.text)
-                        } else {
-                            FileHandle.standardError.write(Data("[stt] batch re-check dropped words (\(batchWordCount) vs streaming \(streamWordCount)); keeping streaming text\n".utf8))
-                        }
+                        batchText = TextNormalizer.normalizeSentenceSpacing(batch.text)
                     } catch {
-                        // Guard failure shouldn't break dictation — fall back
-                        // to the streaming result.
-                        FileHandle.standardError.write(Data("[stt] batch re-check failed, keeping streaming result: \(error)\n".utf8))
+                        // A failed or timed-out batch pass must never break a
+                        // dictation: the streaming text stands.
+                        FileHandle.standardError.write(Data("[stt] batch pass failed, keeping the streaming result: \(error)\n".utf8))
                     }
+                    let choice = TranscriptChoice.choose(streaming: raw, batch: batchText)
+                    FileHandle.standardError.write(Data((TranscriptChoice.logLine(choice) + "\n").utf8))
+                    raw = choice.text
                 }
 
                 rawTranscript = raw
@@ -860,6 +879,10 @@ final class AppState: ObservableObject {
             profiles = me.profiles
             VoiceProfileCache.save(me.profiles)
         }
+        // The transcript has already been written by the time the upload
+        // starts, so a phrase list that arrives here lands on the NEXT
+        // recording, not this one. That is the same deal the voice profiles
+        // get, and it is why the list is also refreshed at every dictation.
 
         let uploader = MeetingUploader(flow: flow) { [weak self] progress in
             Task { @MainActor in
@@ -906,11 +929,21 @@ final class AppState: ObservableObject {
     /// Handles `whisperflow://connect?token=…&server=…`: stores the token in
     /// the keychain, asks Flow who it belongs to, and says so on the pill.
     func handleFlowURL(_ url: URL) {
-        guard let connect = FlowConnectURL.parse(url) else {
+        switch FlowConnectURL.action(url) {
+        case .refresh:
+            // The settings page opens this after a phrase edit. Quiet on
+            // purpose: nobody clicked anything on this Mac.
+            refreshFromFlow(reason: "refresh link")
+            return
+        case .connect(let connect):
+            connectToFlow(connect)
+        case nil:
             flowStatus = "That link was not a Whisper Flow connection link"
             pill.show(.failed("that link did not carry a connection"))
-            return
         }
+    }
+
+    private func connectToFlow(_ connect: FlowConnectURL.Connect) {
         flowStatus = "Connecting to Flow…"
         Task {
             do {
@@ -920,8 +953,9 @@ final class AppState: ObservableObject {
                 flowStatus = "Connected as \(who)"
                 pill.show(.flowConnected(name: who))
                 VoiceProfileCache.save(me.profiles)
+                PhraseStore.shared.replace(me.phrases)
                 resumePendingUploads()
-                FileHandle.standardError.write(Data("[flow] connected as \(me.email) to \(flow.serverBase), recognise_me=\(me.recogniseMe), \(me.profiles.count) voice profiles\n".utf8))
+                FileHandle.standardError.write(Data("[flow] connected as \(me.email) to \(flow.serverBase), recognise_me=\(me.recogniseMe), \(me.profiles.count) voice profiles, \(me.phrases.count) phrases\n".utf8))
             } catch {
                 flowMe = nil
                 flowStatus = "Could not connect: \(error.localizedDescription)"
@@ -948,10 +982,29 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// Re-reads the lists from Flow in the background. Two seconds and one
+    /// attempt: this runs after every dictation, and a slow or unreachable
+    /// server must cost nothing. Yesterday's cached list is still the right
+    /// list.
+    func refreshFromFlow(reason: String) {
+        guard flow.isConnected else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let me = try await self.flow.me(timeout: Self.backgroundRefreshTimeout, attempts: 1)
+                self.applyFlowIdentity(me)
+                FileHandle.standardError.write(Data("[phrase] refreshed from Flow (\(reason)): \(me.phrases.count) phrases\n".utf8))
+            } catch {
+                FileHandle.standardError.write(Data("[phrase] could not refresh from Flow (\(reason)): \(error.localizedDescription)\n".utf8))
+            }
+        }
+    }
+
     private func applyFlowIdentity(_ me: FlowMe) {
         flowMe = me
         UserDefaults.standard.set(me.recogniseMe, forKey: Self.recogniseMeDefaultsKey)
         VoiceProfileCache.save(me.profiles)
+        PhraseStore.shared.replace(me.phrases)
         // First connect of this launch is where the notification permission
         // is asked for. Nothing is asked on a Mac that never connects.
         Task { await meetingPrompts.requestAuthorisationOnce() }
