@@ -113,9 +113,12 @@ struct FlowMe: Codable, Equatable {
     /// shipped the phrases work yet, which reads as an empty list rather than
     /// a decode failure.
     let phrases: [FlowPhrase]
+    /// Team snippets plus the caller's own, merged over this Mac's local ones
+    /// on every read. Tolerant in exactly the same way as `phrases`.
+    let snippets: [FlowSnippet]
 
     enum CodingKeys: String, CodingKey {
-        case email, name, profiles, staff, phrases
+        case email, name, profiles, staff, phrases, snippets
         case recogniseMe = "recognise_me"
     }
 
@@ -127,16 +130,18 @@ struct FlowMe: Codable, Equatable {
         profiles = try c.decodeIfPresent([FlowVoiceProfile].self, forKey: .profiles) ?? []
         staff = try c.decodeIfPresent([FlowStaffMember].self, forKey: .staff) ?? []
         phrases = try c.decodeIfPresent([FlowPhrase].self, forKey: .phrases) ?? []
+        snippets = try c.decodeIfPresent([FlowSnippet].self, forKey: .snippets) ?? []
     }
 
     init(email: String, name: String, recogniseMe: Bool, profiles: [FlowVoiceProfile],
-         staff: [FlowStaffMember], phrases: [FlowPhrase] = []) {
+         staff: [FlowStaffMember], phrases: [FlowPhrase] = [], snippets: [FlowSnippet] = []) {
         self.email = email
         self.name = name
         self.recogniseMe = recogniseMe
         self.profiles = profiles
         self.staff = staff
         self.phrases = phrases
+        self.snippets = snippets
     }
 }
 
@@ -575,6 +580,35 @@ final class FlowClient: @unchecked Sendable {
         let data = try await send(path: "/api/public/whisper/bots?active=1", method: "GET", body: nil,
                                   label: "bots", attempts: 1, timeout: timeout)
         return try decode(FlowActiveBots.self, from: data, label: "bots").bots
+    }
+
+    /// Everything the settings window shows, through the device token: the same payload the
+    /// web page at /whisper-settings reads. One attempt and a short budget, because the
+    /// window can always be opened again and a spinner that hangs for two minutes is worse
+    /// than a line saying Flow could not be reached.
+    func settings(timeout: TimeInterval = 20) async throws -> FlowSettings {
+        let data = try await send(path: "/api/public/whisper/settings", method: "GET", body: nil,
+                                  label: "settings", attempts: 1, timeout: timeout)
+        return try decode(FlowSettings.self, from: data, label: "settings")
+    }
+
+    /// One write from the settings window. The body is the same `{ action: ... }` the web
+    /// page posts, spelled out by the caller so a new action needs no new method here.
+    @discardableResult
+    func settingsAction(_ body: [String: Any], timeout: TimeInterval = 20) async throws -> FlowActionResult {
+        let encoded = try Self.encodeAction(body)
+        let data = try await send(path: "/api/public/whisper/settings", method: "POST", body: encoded,
+                                  label: "settings \(body["action"] as? String ?? "action")",
+                                  attempts: 1, timeout: timeout)
+        return try decode(FlowActionResult.self, from: data, label: "settings action")
+    }
+
+    /// Sorted keys so the body a test reads back is the body that was sent, every run.
+    static func encodeAction(_ body: [String: Any]) throws -> Data {
+        guard JSONSerialization.isValidJSONObject(body) else {
+            throw FlowError.badResponse("that action could not be turned into JSON")
+        }
+        return try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
     }
 
     // MARK: Encoding

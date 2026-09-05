@@ -419,6 +419,15 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// The About section's button. The background check runs every few hours anyway; this is
+    /// for the moment somebody wants to know right now.
+    func checkForUpdateNow() {
+        Task { [weak self] in
+            let result = await UpdateCheck.check(currentCommit: Self.currentCommit)
+            await MainActor.run { self?.updateAvailable = result }
+        }
+    }
+
     func copyDiagnostics() {
         Diagnostics.copyToClipboard(state: self)
     }
@@ -1018,8 +1027,9 @@ final class AppState: ObservableObject {
                 pill.show(.flowConnected(name: who))
                 VoiceProfileCache.save(me.profiles)
                 PhraseStore.shared.replace(me.phrases)
+                SnippetStore.shared.replace(me.snippets)
                 resumePendingUploads()
-                FileHandle.standardError.write(Data("[flow] connected as \(me.email) to \(flow.serverBase), recognise_me=\(me.recogniseMe), \(me.profiles.count) voice profiles, \(me.phrases.count) phrases\n".utf8))
+                FileHandle.standardError.write(Data("[flow] connected as \(me.email) to \(flow.serverBase), recognise_me=\(me.recogniseMe), \(me.profiles.count) voice profiles, \(me.phrases.count) phrases, \(me.snippets.count) snippets\n".utf8))
             } catch {
                 flowMe = nil
                 flowStatus = "Could not connect: \(error.localizedDescription)"
@@ -1069,6 +1079,9 @@ final class AppState: ObservableObject {
         UserDefaults.standard.set(me.recogniseMe, forKey: Self.recogniseMeDefaultsKey)
         VoiceProfileCache.save(me.profiles)
         PhraseStore.shared.replace(me.phrases)
+        // Team and person snippets land in the same place local ones do, so the next
+        // dictation says them without waiting for a relaunch.
+        SnippetStore.shared.replace(me.snippets)
         // First connect of this launch is where the notification permission
         // is asked for. Nothing is asked on a Mac that never connects.
         Task { await meetingPrompts.requestAuthorisationOnce() }
@@ -1180,6 +1193,15 @@ final class AppState: ObservableObject {
         NSWorkspace.shared.open(flowSettingsURL)
     }
 
+    /// The meetings page on Flow: every recording, the summaries and the draft actions.
+    var flowMeetingsURL: URL {
+        URL(string: flow.serverBase + "/meetings") ?? flowSettingsURL
+    }
+
+    func openFlowMeetings() {
+        NSWorkspace.shared.open(flowMeetingsURL)
+    }
+
     func openMeetingFolder(_ id: String) {
         NSWorkspace.shared.open(MeetingStore.directory(for: id))
     }
@@ -1220,7 +1242,9 @@ final class AppState: ObservableObject {
     /// match risks firing on an unrelated sentence that happens to contain
     /// the cue words.
     static func matchSnippet(_ raw: String) -> String? {
-        let snippets = UserLexicon.shared.snippets
+        // Team and person snippets from Flow, with this Mac's own on top: see
+        // SnippetRules.merged. An offline Mac simply matches its local list.
+        let snippets = SnippetStore.shared.runtimeMap(local: UserLexicon.shared.snippets)
         guard !snippets.isEmpty else { return nil }
         // Normalize the stored cues the same way as the transcript: cues are
         // saved as the user typed them ("calendar link!"), but the transcript
