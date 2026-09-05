@@ -109,9 +109,13 @@ struct FlowMe: Codable, Equatable {
     let recogniseMe: Bool
     let profiles: [FlowVoiceProfile]
     let staff: [FlowStaffMember]
+    /// Team phrases plus the caller's own. Absent on a server that has not
+    /// shipped the phrases work yet, which reads as an empty list rather than
+    /// a decode failure.
+    let phrases: [FlowPhrase]
 
     enum CodingKeys: String, CodingKey {
-        case email, name, profiles, staff
+        case email, name, profiles, staff, phrases
         case recogniseMe = "recognise_me"
     }
 
@@ -122,15 +126,24 @@ struct FlowMe: Codable, Equatable {
         recogniseMe = try c.decodeIfPresent(Bool.self, forKey: .recogniseMe) ?? false
         profiles = try c.decodeIfPresent([FlowVoiceProfile].self, forKey: .profiles) ?? []
         staff = try c.decodeIfPresent([FlowStaffMember].self, forKey: .staff) ?? []
+        phrases = try c.decodeIfPresent([FlowPhrase].self, forKey: .phrases) ?? []
     }
 
-    init(email: String, name: String, recogniseMe: Bool, profiles: [FlowVoiceProfile], staff: [FlowStaffMember]) {
+    init(email: String, name: String, recogniseMe: Bool, profiles: [FlowVoiceProfile],
+         staff: [FlowStaffMember], phrases: [FlowPhrase] = []) {
         self.email = email
         self.name = name
         self.recogniseMe = recogniseMe
         self.profiles = profiles
         self.staff = staff
+        self.phrases = phrases
     }
+}
+
+/// The body of POST /api/public/whisper/phrases/suggest.
+struct PhraseSuggestion: Codable, Equatable {
+    let heard: String
+    let typed: String
 }
 
 /// A meeting bot that Flow has on the way, or already in the room. The
@@ -495,8 +508,13 @@ final class FlowClient: @unchecked Sendable {
 
     // MARK: Endpoints
 
-    func me() async throws -> FlowMe {
-        let data = try await send(path: "/api/public/whisper/me", method: "GET", body: nil, label: "me")
+    /// The caller's identity, voice profiles, staff list and phrases. The
+    /// defaults are the deliberate, blocking call made at connect; the
+    /// background phrase refresh passes two seconds and one attempt so a slow
+    /// answer never holds up a dictation.
+    func me(timeout: TimeInterval = 120, attempts: Int = FlowClient.maxAttempts) async throws -> FlowMe {
+        let data = try await send(path: "/api/public/whisper/me", method: "GET", body: nil, label: "me",
+                                  attempts: attempts, timeout: timeout)
         return try decode(FlowMe.self, from: data, label: "me")
     }
 
@@ -537,6 +555,16 @@ final class FlowClient: @unchecked Sendable {
         let data = try await send(path: "/api/public/whisper/upcoming", method: "GET", body: nil,
                                   label: "upcoming", attempts: 1, timeout: timeout)
         return try decode(FlowUpcoming.self, from: data, label: "upcoming")
+    }
+
+    /// Tells Flow the app learned a correction on this Mac: heard X, the
+    /// person typed Y. Nothing becomes a phrase until a human accepts it on
+    /// the settings page, so this is deliberately fire and forget with one
+    /// attempt: a suggestion that does not arrive is not worth a retry queue.
+    func suggestPhrase(heard: String, typed: String, timeout: TimeInterval = 5) async throws {
+        let body = try JSONEncoder().encode(PhraseSuggestion(heard: heard, typed: typed))
+        _ = try await send(path: "/api/public/whisper/phrases/suggest", method: "POST", body: body,
+                           label: "phrase suggestion", attempts: 1, timeout: timeout)
     }
 
     /// The bots Flow has on the way or in a call right now. Called between

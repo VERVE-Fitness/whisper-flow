@@ -168,6 +168,10 @@ final class AppState: ObservableObject {
     /// is reset so the next dictation works; the wedged task, if it ever
     /// completes, is ignored.
     private static let cleaningWatchdogSeconds: UInt64 = 45
+    /// Budget for the background list refresh at every Stop. Short on
+    /// purpose: it runs alongside cleanup and must never be the reason a
+    /// dictation feels slow.
+    static let backgroundRefreshTimeout: TimeInterval = 2
     /// Keep the mic open this long after the key is released: people let go
     /// of the key on the last syllable, and the sliding-window decoder
     /// needs the trailing silence to commit the final word.
@@ -499,6 +503,11 @@ final class AppState: ObservableObject {
         guard isRecording else { return }
         isStopping = true
         phase = .cleaning
+        // Fire and forget, alongside the cleanup: the phrase list and the
+        // voice profiles are refreshed at every Stop so an edit made on the
+        // settings page this morning is live this afternoon, with no relaunch
+        // and no waiting.
+        refreshFromFlow(reason: "stop")
         let mode = currentMode
         let sttStart = recordStart ?? Date()
         // Snapshot the handles now; the watchdog or a later dictation may
@@ -860,6 +869,10 @@ final class AppState: ObservableObject {
             profiles = me.profiles
             VoiceProfileCache.save(me.profiles)
         }
+        // The transcript has already been written by the time the upload
+        // starts, so a phrase list that arrives here lands on the NEXT
+        // recording, not this one. That is the same deal the voice profiles
+        // get, and it is why the list is also refreshed at every dictation.
 
         let uploader = MeetingUploader(flow: flow) { [weak self] progress in
             Task { @MainActor in
@@ -906,11 +919,21 @@ final class AppState: ObservableObject {
     /// Handles `whisperflow://connect?token=…&server=…`: stores the token in
     /// the keychain, asks Flow who it belongs to, and says so on the pill.
     func handleFlowURL(_ url: URL) {
-        guard let connect = FlowConnectURL.parse(url) else {
+        switch FlowConnectURL.action(url) {
+        case .refresh:
+            // The settings page opens this after a phrase edit. Quiet on
+            // purpose: nobody clicked anything on this Mac.
+            refreshFromFlow(reason: "refresh link")
+            return
+        case .connect(let connect):
+            connectToFlow(connect)
+        case nil:
             flowStatus = "That link was not a Whisper Flow connection link"
             pill.show(.failed("that link did not carry a connection"))
-            return
         }
+    }
+
+    private func connectToFlow(_ connect: FlowConnectURL.Connect) {
         flowStatus = "Connecting to Flow…"
         Task {
             do {
@@ -920,8 +943,9 @@ final class AppState: ObservableObject {
                 flowStatus = "Connected as \(who)"
                 pill.show(.flowConnected(name: who))
                 VoiceProfileCache.save(me.profiles)
+                PhraseStore.shared.replace(me.phrases)
                 resumePendingUploads()
-                FileHandle.standardError.write(Data("[flow] connected as \(me.email) to \(flow.serverBase), recognise_me=\(me.recogniseMe), \(me.profiles.count) voice profiles\n".utf8))
+                FileHandle.standardError.write(Data("[flow] connected as \(me.email) to \(flow.serverBase), recognise_me=\(me.recogniseMe), \(me.profiles.count) voice profiles, \(me.phrases.count) phrases\n".utf8))
             } catch {
                 flowMe = nil
                 flowStatus = "Could not connect: \(error.localizedDescription)"
@@ -948,10 +972,29 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// Re-reads the lists from Flow in the background. Two seconds and one
+    /// attempt: this runs after every dictation, and a slow or unreachable
+    /// server must cost nothing. Yesterday's cached list is still the right
+    /// list.
+    func refreshFromFlow(reason: String) {
+        guard flow.isConnected else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let me = try await self.flow.me(timeout: Self.backgroundRefreshTimeout, attempts: 1)
+                self.applyFlowIdentity(me)
+                FileHandle.standardError.write(Data("[phrase] refreshed from Flow (\(reason)): \(me.phrases.count) phrases\n".utf8))
+            } catch {
+                FileHandle.standardError.write(Data("[phrase] could not refresh from Flow (\(reason)): \(error.localizedDescription)\n".utf8))
+            }
+        }
+    }
+
     private func applyFlowIdentity(_ me: FlowMe) {
         flowMe = me
         UserDefaults.standard.set(me.recogniseMe, forKey: Self.recogniseMeDefaultsKey)
         VoiceProfileCache.save(me.profiles)
+        PhraseStore.shared.replace(me.phrases)
         // First connect of this launch is where the notification permission
         // is asked for. Nothing is asked on a Mac that never connects.
         Task { await meetingPrompts.requestAuthorisationOnce() }

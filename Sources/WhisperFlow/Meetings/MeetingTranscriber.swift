@@ -88,8 +88,13 @@ final class MeetingTranscriber {
 
             var names = record.speakerNames
             names[TranscriptBuilder.ownerSpeakerId] = names[TranscriptBuilder.ownerSpeakerId] ?? NSFullUserName()
+            // Phrases before the transcript is written, so what goes up to
+            // Flow, what the summariser reads and what the person reads on
+            // the recording page all say "Tori" rather than "tory".
+            let merged = Self.applyPhrases(to: TranscriptBuilder.merge(aSegments, bSegments),
+                                           phrases: PhraseStore.shared.phrases)
             let transcript = Transcript(meetingID: meetingID,
-                                        segments: TranscriptBuilder.merge(aSegments, bSegments),
+                                        segments: merged,
                                         speakerNames: names)
             guard !transcript.segments.isEmpty else { throw MeetingError.noTranscript }
             try write(transcript, record: record)
@@ -102,6 +107,17 @@ final class MeetingTranscriber {
             record.failureReason = error.localizedDescription
             try? MeetingStore.save(record)
             throw error
+        }
+    }
+
+    /// Pure, so the segment rewrite is testable without a model or a file.
+    static func applyPhrases(to segments: [TranscriptSegment], phrases: [FlowPhrase]) -> [TranscriptSegment] {
+        guard !phrases.isEmpty else { return segments }
+        return segments.map { segment in
+            let rewritten = PhraseMatcher.applyLogging(segment.text, phrases: phrases)
+            guard rewritten != segment.text else { return segment }
+            return TranscriptSegment(speakerId: segment.speakerId, start: segment.start,
+                                     end: segment.end, text: rewritten)
         }
     }
 

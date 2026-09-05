@@ -16,6 +16,35 @@ enum FlowConnectURL {
         let server: String?
     }
 
+    /// What a `whisperflow://` link asks the app to do. Only two verbs exist:
+    /// connect this Mac, and re-read the lists from Flow (the settings page
+    /// opens the refresh link after any phrase edit, so a change reaches
+    /// every Mac without a relaunch).
+    enum Action: Equatable {
+        case connect(Connect)
+        case refresh
+    }
+
+    static let refreshHost = "refresh"
+
+    static func action(_ url: URL) -> Action? {
+        guard let verb = verb(url) else { return nil }
+        if verb == refreshHost { return .refresh }
+        guard verb == host, let connect = parse(url) else { return nil }
+        return .connect(connect)
+    }
+
+    /// The verb of a whisperflow link, whichever way it was written.
+    /// A URL with no path ("whisperflow://connect?…") puts the verb in the
+    /// host; one written with a slash ("whisperflow:///connect?…") puts it in
+    /// the path. Accept both rather than make the page get it exactly right.
+    private static func verb(_ url: URL) -> String? {
+        guard url.scheme?.lowercased() == scheme else { return nil }
+        let raw = (url.host?.lowercased()).flatMap { $0.isEmpty ? nil : $0 }
+            ?? url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")).lowercased()
+        return raw.isEmpty ? nil : raw
+    }
+
     static func parse(_ url: URL) -> Connect? {
         guard url.scheme?.lowercased() == scheme else { return nil }
         // A URL with no path ("whisperflow://connect?…") puts "connect" in the
