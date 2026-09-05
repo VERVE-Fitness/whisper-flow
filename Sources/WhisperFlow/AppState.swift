@@ -173,9 +173,10 @@ final class AppState: ObservableObject {
     /// dictation feels slow.
     static let backgroundRefreshTimeout: TimeInterval = 2
     /// Keep the mic open this long after the key is released: people let go
-    /// of the key on the last syllable, and the sliding-window decoder
-    /// needs the trailing silence to commit the final word.
-    private static let releaseTailNanoseconds: UInt64 = 250_000_000
+    /// of the key on the last syllable, and the sliding-window decoder needs
+    /// the trailing silence to commit the final word. 400 ms since week 3,
+    /// alongside the silence pad and the batch re-check in TranscriptChoice.
+    private static var releaseTailNanoseconds: UInt64 { TranscriptChoice.releaseTailNanoseconds }
 
     var isRecording: Bool { phase == .recording }
     /// `.error` is deliberately recordable: an error is a message about the
@@ -231,8 +232,10 @@ final class AppState: ObservableObject {
     /// word, regardless of energy.
     private static let minimumSamplesForTranscription = 4_800
     /// Below this, the sliding-window streaming pass has too little context
-    /// to be trusted on its own; re-decode the full retained clip through the
-    /// batch path instead, which reports a real per-utterance confidence.
+    /// to be trusted on its own, and the batch pass's confidence score is
+    /// used to discard the clip outright. Longer clips still run through the
+    /// batch decoder (see TranscriptChoice.batchRecheckMaxSeconds), but only
+    /// to recover a lost tail, never to discard.
     private static let shortClipSecondsThreshold: Double = 3.0
     /// FluidAudio's batch confidence ranges ~0.1 (empty/near-silent) to 1.0
     /// (fully confident); below this the re-check is treated the same as a
@@ -589,6 +592,12 @@ final class AppState: ObservableObject {
             guard current() else { return }
             do {
                 let sttT0 = Date()
+                // The capture stream has drained, so every real sample is in
+                // before this: 600 ms of silence on the end is what makes the
+                // sliding window commit the last words instead of leaving
+                // them volatile forever. A failure here is not worth
+                // abandoning the dictation for; finishStream still runs.
+                try? await backend.feed(samples: TranscriptChoice.silencePad())
                 var raw = TextNormalizer.normalizeSentenceSpacing(try await backend.finishStream())
                 guard current() else { return }
                 // stt_ms: time from stop-press to final text (streaming absorbed the rest).
@@ -615,16 +624,23 @@ final class AppState: ObservableObject {
 
                 var sttConfidence: Double?
 
-                // Short clips give the sliding-window streaming pass too
-                // little context to trust on its own; re-decode the full
-                // retained buffer through the batch path, which scores a
-                // real per-utterance confidence.
-                if audioSeconds < Self.shortClipSecondsThreshold {
+                // One batch pass, for two jobs. The full retained buffer goes
+                // through the batch decoder for any dictation of two minutes
+                // or less: it never had a sliding window, so it cannot have
+                // lost the tail the way streaming can. For a short clip the
+                // same pass also scores the confidence that decides whether
+                // to discard the clip entirely. One decode, never two.
+                if audioSeconds <= TranscriptChoice.batchRecheckMaxSeconds {
+                    var batchText: String?
                     do {
-                        let batch = try await backend.transcribeFileWithConfidence(samples: captured)
+                        let batch = try await withTimeout(seconds: TranscriptChoice.batchTimeoutSeconds) {
+                            [backend, captured] in
+                            try await backend.transcribeFileWithConfidence(samples: captured)
+                        }
                         guard current() else { return }
                         sttConfidence = Double(batch.confidence)
-                        if batch.confidence < Self.minimumBatchConfidence {
+                        if audioSeconds < Self.shortClipSecondsThreshold,
+                           batch.confidence < Self.minimumBatchConfidence {
                             FileHandle.standardError.write(Data("[stt] discarding low-confidence short clip (confidence=\(batch.confidence), text=\"\(batch.text)\")\n".utf8))
                             rawTranscript = ""
                             cleanedTranscript = ""
@@ -641,28 +657,15 @@ final class AppState: ObservableObject {
                                             inputDevice: deviceName, outcome: "discard_low_confidence")
                             return
                         }
-                        // The re-check exists to gate CONFIDENCE, not to
-                        // replace the transcript. The batch pass sometimes
-                        // drops out-of-vocabulary openings entirely (observed
-                        // 2026-07-08: spoken "The VERVE Tori Functional
-                        // Trainer", streaming heard the whole phrase, batch
-                        // returned just "Functional trainer"). If the batch
-                        // text lost a substantial share of the words the
-                        // streaming pass heard, keep the streaming text — a
-                        // mangled attempt at a product name downstream layers
-                        // can correct beats a clean transcript missing it.
-                        let streamWordCount = raw.split(whereSeparator: \.isWhitespace).count
-                        let batchWordCount = batch.text.split(whereSeparator: \.isWhitespace).count
-                        if Double(batchWordCount) >= Double(streamWordCount) * 0.7 {
-                            raw = TextNormalizer.normalizeSentenceSpacing(batch.text)
-                        } else {
-                            FileHandle.standardError.write(Data("[stt] batch re-check dropped words (\(batchWordCount) vs streaming \(streamWordCount)); keeping streaming text\n".utf8))
-                        }
+                        batchText = TextNormalizer.normalizeSentenceSpacing(batch.text)
                     } catch {
-                        // Guard failure shouldn't break dictation — fall back
-                        // to the streaming result.
-                        FileHandle.standardError.write(Data("[stt] batch re-check failed, keeping streaming result: \(error)\n".utf8))
+                        // A failed or timed-out batch pass must never break a
+                        // dictation: the streaming text stands.
+                        FileHandle.standardError.write(Data("[stt] batch pass failed, keeping the streaming result: \(error)\n".utf8))
                     }
+                    let choice = TranscriptChoice.choose(streaming: raw, batch: batchText)
+                    FileHandle.standardError.write(Data((TranscriptChoice.logLine(choice) + "\n").utf8))
+                    raw = choice.text
                 }
 
                 rawTranscript = raw
