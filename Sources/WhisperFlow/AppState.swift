@@ -145,7 +145,10 @@ final class AppState: ObservableObject {
     /// recording start (feature: context-aware spelling) -- by stop time our
     /// own pill/window may have shifted focus, so capturing later would read
     /// the wrong element.
-    private var capturedFocusContext: String?
+    /// The read runs off the main actor (an unresponsive target app used to
+    /// freeze the start of the recording), so what is held here is the task,
+    /// not the text; the cleanup stage awaits it long after it has finished.
+    private var focusContextTask: Task<String?, Never>?
     /// Defense-in-depth against stopRecording() being entered twice for one
     /// dictation: the actual observed cause was duplicate flagsChanged
     /// delivery (see HotkeyManager.lastHandledFlagsTimestamp), now deduped at
@@ -165,13 +168,29 @@ final class AppState: ObservableObject {
     /// Identifies the stop in flight so the watchdog below only fires for
     /// the dictation it was armed for.
     private var stopGeneration: UUID?
-    /// Hard cap on how long the app may sit in "Cleaning…". finishStream,
-    /// the batch re-check and the LLM all have their own timeouts, but a
-    /// hang anywhere in that chain used to leave the pill up and the state
-    /// machine wedged until the app was force-quit. After this long the UI
-    /// is reset so the next dictation works; the wedged task, if it ever
-    /// completes, is ignored.
-    private static let cleaningWatchdogSeconds: UInt64 = 45
+    /// The watchdog in flight for the current stop, so a stop that finishes
+    /// normally cancels it instead of leaving it to fire later.
+    private var watchdogTask: Task<Void, Never>?
+    /// Hard cap on how long the app may sit in "Cleaning…". Every stage of
+    /// the stop pipeline is bounded on its own now (see the three timeouts
+    /// below), so this is the backstop for a stage nobody predicted, not the
+    /// first line of defence it used to be -- which is why it is 15 seconds
+    /// and not 45. After this long the UI is reset so the next dictation
+    /// works; the wedged task, if it ever completes, is ignored.
+    private static let cleaningWatchdogSeconds: UInt64 = 15
+    /// The trailing silence pad plus finishStream. Measured: a normal final
+    /// pass is well under a second on an M4 Pro. Eight seconds is generous
+    /// enough that a busy Neural Engine never trips it and short enough that
+    /// a stall is over before the person reaches for the mouse.
+    private static let finishStreamTimeout: Double = 8
+    /// Draining the capture stream into the retained sample buffer. Those
+    /// samples only feed the silence guard and the batch re-check, so the
+    /// dictation survives losing them; the streaming transcript does not
+    /// depend on this at all.
+    private static let feedDrainTimeout: Double = 3
+    /// How long to give the CoreAudio engine teardown before carrying on
+    /// without it (see AudioCapture.stopAndWait).
+    private static let captureTeardownTimeout: TimeInterval = 2
     /// Budget for the background list refresh at every Stop. Short on
     /// purpose: it runs alongside cleanup and must never be the reason a
     /// dictation feels slow.
@@ -482,7 +501,8 @@ final class AppState: ObservableObject {
         lastSttMs = nil
         lastCleanupMs = nil
         recordStart = Date()
-        capturedFocusContext = accessibility.isTrusted ? FocusContext.captureBeforeCaret() : nil
+        focusContextTask?.cancel()
+        focusContextTask = accessibility.isTrusted ? Task { await FocusContext.captureBeforeCaret() } : nil
 
         if mode != .window {
             pill.show(.listening(partial: ""))
@@ -561,14 +581,26 @@ final class AppState: ObservableObject {
         let streamTask = streamStartTask
         captureStartTask = nil
         streamStartTask = nil
+        focusContextTask?.cancel()
+        focusContextTask = nil
         Task {
             defer { isStopping = false }
             _ = try? await streamTask?.value
             capture.stop()
             let feed = feedTask
             feedTask = nil
-            _ = await feed?.value
-            _ = try? await backend.finishStream()
+            if let feed {
+                // Bounded for the same reason as the stop pipeline: this is
+                // the escape hatch, and an escape hatch that can hang leaves
+                // isStopping true forever, which refuses every later
+                // dictation until the app is relaunched.
+                _ = try? await withHardTimeout(seconds: Self.feedDrainTimeout) { await feed.value }
+            }
+            // Cancelling throws the audio away, so there is nothing to
+            // finish -- and finishStream is exactly the unbounded call that
+            // wedges. resetStream drops the session and cleans it up on its
+            // own time.
+            backend.resetStream()
             rawTranscript = ""
             cleanedTranscript = ""
         }
@@ -592,7 +624,7 @@ final class AppState: ObservableObject {
         // and no waiting.
         refreshFromFlow(reason: "stop")
         let mode = currentMode
-        let sttStart = recordStart ?? Date()
+        let stopPressedAt = Date()
         // Snapshot the handles now; the watchdog or a later dictation may
         // replace the fields while this pipeline is still awaiting.
         let streamTask = streamStartTask
@@ -605,22 +637,46 @@ final class AppState: ObservableObject {
 
         let generation = UUID()
         stopGeneration = generation
-        Task { [weak self] in
-            try? await Task.sleep(nanoseconds: Self.cleaningWatchdogSeconds * 1_000_000_000)
-            guard let self, self.stopGeneration == generation, self.phase == .cleaning else { return }
-            FileHandle.standardError.write(Data("[stop] watchdog: still cleaning after \(Self.cleaningWatchdogSeconds)s; abandoning this dictation so the next one works\n".utf8))
-            // Abandon the work, not just the UI: cancel the pipeline, close
-            // the mic, and let the generation guards below drop anything the
-            // wedged task still produces.
-            self.stopTask?.cancel()
-            self.stopTask = nil
-            self.capture.stop()
-            self.feedTask = nil
-            self.phase = .error("Cleanup took too long; please try again")
-            self.isStopping = false
-            if mode != .window {
-                self.pill.show(.failed("took too long, try again"))
-                self.hotkeys.reset()
+        // Short, stable handle for this dictation so the six stage lines in
+        // app.log can be read as one run.
+        let dictationID = String(generation.uuidString.prefix(8))
+        func trace(_ stage: String) {
+            Diagnostics.dictation(dictationID, stage: stage,
+                                  ms: Int(Date().timeIntervalSince(stopPressedAt) * 1000))
+        }
+        trace("start")
+
+        // The watchdog sleeps on a DETACHED task, not the main actor. The
+        // previous version slept with `Task { try? await Task.sleep(...) }`
+        // inside this @MainActor method, so the sleep was scheduled on the
+        // main actor -- and a blocked main actor, which is the exact failure
+        // it exists to catch, meant it never fired at all. It only hops to
+        // the main actor to perform the reset, which by definition needs it.
+        watchdogTask?.cancel()
+        let watchdogSeconds = Self.cleaningWatchdogSeconds
+        watchdogTask = Task.detached { [weak self] in
+            try? await Task.sleep(nanoseconds: watchdogSeconds * 1_000_000_000)
+            guard !Task.isCancelled, let self else { return }
+            FileHandle.standardError.write(Data("[stop] watchdog: still cleaning after \(watchdogSeconds)s; abandoning this dictation so the next one works\n".utf8))
+            await MainActor.run {
+                guard self.stopGeneration == generation, self.phase == .cleaning else { return }
+                // Abandon the work, not just the UI: cancel the pipeline,
+                // close the mic, throw the stuck streaming session away, and
+                // let the generation guards below drop anything the wedged
+                // task still produces. Without the resetStream, one stalled
+                // dictation left a wedged manager installed and every
+                // dictation after it stalled in the same place.
+                self.stopTask?.cancel()
+                self.stopTask = nil
+                self.capture.stop()
+                self.backend.resetStream()
+                self.feedTask = nil
+                self.phase = .error("Cleanup took too long; please try again")
+                self.isStopping = false
+                if mode != .window {
+                    self.pill.show(.failed("took too long, try again"))
+                    self.hotkeys.reset()
+                }
             }
         }
 
@@ -629,6 +685,8 @@ final class AppState: ObservableObject {
                 if stopGeneration == generation {
                     isStopping = false
                     stopTask = nil
+                    watchdogTask?.cancel()
+                    watchdogTask = nil
                 }
             }
             /// False once the watchdog has abandoned this stop or a newer
@@ -655,7 +713,24 @@ final class AppState: ObservableObject {
             guard current() else { return }
             let audioSeconds = capture.capturedSeconds
             let deviceName = capture.activeDevice?.name ?? "?"
+            // A capture that gave up on a silent device logs both names, so
+            // "why did this dictation come from the wrong mic" is answerable
+            // from the usage log alone.
+            let silentSwitch = capture.silentDeviceSwitch
+            let deviceLabel = silentSwitch.map { "\($0.from) → \($0.to)" } ?? deviceName
+
+            // Closing the mic is now two calls: stop() returns straight away
+            // having finished the stream continuation (which is what ends the
+            // feed task), and stopAndWait gives the CoreAudio teardown a
+            // bounded two seconds to actually release the hardware. Neither
+            // blocks the main actor. The old single blocking capture.stop()
+            // on the main actor, racing the reconfigure task, is one of the
+            // two places the stop pipeline was seen to wedge.
             capture.stop()
+            await capture.stopAndWait(timeout: Self.captureTeardownTimeout)
+            trace("engine_stopped")
+            guard current() else { return }
+
             let feed = feedTask
             feedTask = nil
             guard let feed else {
@@ -668,172 +743,247 @@ final class AppState: ObservableObject {
                 }
                 return
             }
-            let captured = await feed.value
-            guard current() else { return }
+            // The retained samples are only needed for the silence guard and
+            // the batch re-check, so a drain that will not finish is skipped
+            // rather than waited on. The streaming transcript is unaffected.
+            var captured: [Float]?
             do {
-                let sttT0 = Date()
-                // The capture stream has drained, so every real sample is in
-                // before this: 600 ms of silence on the end is what makes the
-                // sliding window commit the last words instead of leaving
-                // them volatile forever. A failure here is not worth
-                // abandoning the dictation for; finishStream still runs.
-                try? await backend.feed(samples: TranscriptChoice.silencePad())
-                var raw = TextNormalizer.normalizeSentenceSpacing(try await backend.finishStream())
-                guard current() else { return }
-                // stt_ms: time from stop-press to final text (streaming absorbed the rest).
-                let sttMs = Int(Date().timeIntervalSince(sttT0) * 1000)
-                _ = sttStart
-
-                let rms = Self.rms(of: captured)
-                if rms < Self.silenceRmsThreshold || captured.count < Self.minimumSamplesForTranscription {
-                    FileHandle.standardError.write(Data("[stt] discarding near-silent/too-short capture (rms=\(rms), samples=\(captured.count), device=\(deviceName))\n".utf8))
-                    rawTranscript = ""
-                    cleanedTranscript = ""
-                    phase = .done
-                    if mode != .window {
-                        pill.show(.discarded)
-                        hotkeys.reset()
-                    }
-                    UsageLog.append(mode: mode.rawValue, audioSeconds: audioSeconds,
-                                    rawChars: raw.count, cleanedChars: 0,
-                                    sttMs: sttMs, cleanupMs: 0, cleanupBackend: "-",
-                                    rawText: raw, cleanedText: "",
-                                    rms: Double(rms), inputDevice: deviceName, outcome: "discard_silence")
-                    return
+                captured = try await withHardTimeout(seconds: Self.feedDrainTimeout) { await feed.value }
+            } catch {
+                captured = nil
+                FileHandle.standardError.write(Data("[stop] capture drain did not finish within \(Int(Self.feedDrainTimeout))s; skipping the silence guard and batch re-check\n".utf8))
+            }
+            guard current() else { return }
+            let sttT0 = Date()
+            // The capture stream has drained, so every real sample is in
+            // before this: 600 ms of silence on the end is what makes the
+            // sliding window commit the last words instead of leaving
+            // them volatile forever. The pad and the final pass are one
+            // bounded stage -- finishStream had no timeout at all, and a
+            // stop that hung in it left the pill on "Cleaning…" until the
+            // app was force-quit.
+            var finished: String?
+            var finishStalled = false
+            do {
+                finished = try await withHardTimeout(seconds: Self.finishStreamTimeout) { [backend] in
+                    try? await backend.feed(samples: TranscriptChoice.silencePad())
+                    return try await backend.finishStream()
                 }
-
-                var sttConfidence: Double?
-
-                // One batch pass, for two jobs. The full retained buffer goes
-                // through the batch decoder for any dictation of two minutes
-                // or less: it never had a sliding window, so it cannot have
-                // lost the tail the way streaming can. For a short clip the
-                // same pass also scores the confidence that decides whether
-                // to discard the clip entirely. One decode, never two.
-                if audioSeconds <= TranscriptChoice.batchRecheckMaxSeconds {
-                    var batchText: String?
-                    do {
-                        let batch = try await withTimeout(seconds: TranscriptChoice.batchTimeoutSeconds) {
-                            [backend, captured] in
-                            try await backend.transcribeFileWithConfidence(samples: captured)
-                        }
-                        guard current() else { return }
-                        sttConfidence = Double(batch.confidence)
-                        if audioSeconds < Self.shortClipSecondsThreshold,
-                           batch.confidence < Self.minimumBatchConfidence {
-                            FileHandle.standardError.write(Data("[stt] discarding low-confidence short clip (confidence=\(batch.confidence), text=\"\(batch.text)\")\n".utf8))
-                            rawTranscript = ""
-                            cleanedTranscript = ""
-                            phase = .done
-                            if mode != .window {
-                                pill.show(.discarded)
-                                hotkeys.reset()
-                            }
-                            UsageLog.append(mode: mode.rawValue, audioSeconds: audioSeconds,
-                                            rawChars: batch.text.count, cleanedChars: 0,
-                                            sttMs: sttMs, cleanupMs: 0, cleanupBackend: "-",
-                                            rawText: batch.text, cleanedText: "",
-                                            sttConfidence: sttConfidence, rms: Double(rms),
-                                            inputDevice: deviceName, outcome: "discard_low_confidence")
-                            return
-                        }
-                        batchText = TextNormalizer.normalizeSentenceSpacing(batch.text)
-                    } catch {
-                        // A failed or timed-out batch pass must never break a
-                        // dictation: the streaming text stands.
-                        FileHandle.standardError.write(Data("[stt] batch pass failed, keeping the streaming result: \(error)\n".utf8))
-                    }
-                    let choice = TranscriptChoice.choose(streaming: raw, batch: batchText)
-                    FileHandle.standardError.write(Data((TranscriptChoice.logLine(choice) + "\n").utf8))
-                    raw = choice.text
+            } catch {
+                finishStalled = true
+                if case CleanupError.timedOut = error {
+                    FileHandle.standardError.write(Data("[stt] finishStream timed out; using partial\n".utf8))
+                } else {
+                    FileHandle.standardError.write(Data("[stt] finishStream failed (\(error.localizedDescription)); using partial\n".utf8))
                 }
+                // The stuck manager must not survive into the next
+                // dictation, or that one hangs in the same place.
+                backend.resetStream()
+            }
+            let sttFinishMs = Int(Date().timeIntervalSince(sttT0) * 1000)
+            trace("stt_finished")
+            guard current() else { return }
+            // stt_ms is what it always claimed to be in its comment and now
+            // actually is: stop-press to final text, which is the number the
+            // person experiences. It covers the 400 ms release tail, the
+            // stream drain and the bounded final pass, so it reads a few
+            // hundred ms higher than rows written before the stop pipeline
+            // was broken into stages. stt_finish_ms is the final pass alone.
+            let sttMs = Int(Date().timeIntervalSince(stopPressedAt) * 1000)
 
-                rawTranscript = raw
-
-                // Snippets: a deterministic, pre-cleanup shortcut. If the raw
-                // transcript IS a snippet cue (optionally prefixed "insert"/
-                // "paste"), skip the LLM entirely and insert the stored text
-                // verbatim -- snippets are exact strings the user chose
-                // (URLs, signatures, etc.), and running them through cleanup
-                // risks the LLM "helpfully" rewording them.
-                if let snippetText = Self.matchSnippet(raw) {
-                    cleanedTranscript = snippetText
-                    cleanupBackendName = "snippet"
-                    lastSttMs = sttMs
-                    lastCleanupMs = 0
-                    phase = .done
-
-                    if mode != .window {
-                        let outcome = TextInserter.insert(snippetText, accessibilityTrusted: accessibility.isTrusted)
-                        switch outcome {
-                        case .inserted:
-                            pill.show(.inserted)
-                            CorrectionLearner.observe(insertedText: snippetText)
-                        case .copiedOnly:
-                            pill.show(.copiedOnly)
-                        }
-                    }
-
-                    UsageLog.append(mode: mode.rawValue, audioSeconds: audioSeconds,
-                                    rawChars: raw.count, cleanedChars: snippetText.count,
-                                    sttMs: sttMs, cleanupMs: 0, cleanupBackend: "snippet",
-                                    rawText: raw, cleanedText: snippetText,
-                                    sttConfidence: sttConfidence, rms: Double(rms),
-                                    inputDevice: deviceName, outcome: "snippet")
-                    return
+            // The words the pill has been showing are a real transcript,
+            // so a stalled final pass falls back to them instead of
+            // losing the dictation. Nil means there is nothing at all.
+            guard let rawSource = StopPipeline.rawText(finished: finished, partial: rawTranscript) else {
+                rawTranscript = ""
+                cleanedTranscript = ""
+                phase = .done
+                if mode != .window {
+                    pill.show(finishStalled ? .failed("speech engine stalled, try again") : .discarded)
+                    hotkeys.reset()
                 }
+                UsageLog.append(mode: mode.rawValue, audioSeconds: audioSeconds,
+                                rawChars: 0, cleanedChars: 0,
+                                sttMs: sttMs, cleanupMs: 0, cleanupBackend: "-",
+                                rawText: "", cleanedText: "",
+                                inputDevice: deviceLabel,
+                                outcome: finishStalled ? "stt_stalled" : "discard_empty",
+                                sttFinishMs: sttFinishMs)
+                return
+            }
+            var raw = TextNormalizer.normalizeSentenceSpacing(rawSource)
 
-                let cleanResult = await router.clean(raw, context: capturedFocusContext)
-                guard current() else { return }
-                let cleanedText = TextNormalizer.normalizeSentenceSpacing(cleanResult.text)
-                cleanedTranscript = cleanedText
-                cleanupBackendName = cleanResult.backendName
+            let rms = captured.map { Self.rms(of: $0) }
+            if let rms, let captured,
+               rms < Self.silenceRmsThreshold || captured.count < Self.minimumSamplesForTranscription {
+                FileHandle.standardError.write(Data("[stt] discarding near-silent/too-short capture (rms=\(rms), samples=\(captured.count), device=\(deviceLabel))\n".utf8))
+                rawTranscript = ""
+                cleanedTranscript = ""
+                phase = .done
+                if mode != .window {
+                    // An RMS of exactly zero is not a quiet room, it is a
+                    // microphone that recorded nothing at all -- four
+                    // dictations from AirPods in September read like this.
+                    // "Didn't catch that" sends the person back to try again
+                    // with the same dead device; name it instead.
+                    pill.show(rms == 0 ? .failed("\(deviceName) gave no audio") : .discarded)
+                    hotkeys.reset()
+                }
+                UsageLog.append(mode: mode.rawValue, audioSeconds: audioSeconds,
+                                rawChars: raw.count, cleanedChars: 0,
+                                sttMs: sttMs, cleanupMs: 0, cleanupBackend: "-",
+                                rawText: raw, cleanedText: "",
+                                rms: Double(rms), inputDevice: deviceLabel, outcome: "discard_silence",
+                                sttFinishMs: sttFinishMs)
+                return
+            }
+
+            var sttConfidence: Double?
+            var batchMs: Int?
+
+            // One batch pass, for two jobs. The full retained buffer goes
+            // through the batch decoder for any dictation of two minutes
+            // or less: it never had a sliding window, so it cannot have
+            // lost the tail the way streaming can. For a short clip the
+            // same pass also scores the confidence that decides whether
+            // to discard the clip entirely. One decode, never two.
+            if let captured, audioSeconds <= TranscriptChoice.batchRecheckMaxSeconds {
+                var batchText: String?
+                let batchT0 = Date()
+                do {
+                    let batch = try await withTimeout(seconds: TranscriptChoice.batchTimeoutSeconds) {
+                        [backend, captured] in
+                        try await backend.transcribeFileWithConfidence(samples: captured)
+                    }
+                    guard current() else { return }
+                    sttConfidence = Double(batch.confidence)
+                    if audioSeconds < Self.shortClipSecondsThreshold,
+                       batch.confidence < Self.minimumBatchConfidence {
+                        FileHandle.standardError.write(Data("[stt] discarding low-confidence short clip (confidence=\(batch.confidence), text=\"\(batch.text)\")\n".utf8))
+                        rawTranscript = ""
+                        cleanedTranscript = ""
+                        phase = .done
+                        if mode != .window {
+                            pill.show(.discarded)
+                            hotkeys.reset()
+                        }
+                        UsageLog.append(mode: mode.rawValue, audioSeconds: audioSeconds,
+                                        rawChars: batch.text.count, cleanedChars: 0,
+                                        sttMs: sttMs, cleanupMs: 0, cleanupBackend: "-",
+                                        rawText: batch.text, cleanedText: "",
+                                        sttConfidence: sttConfidence, rms: rms.map(Double.init),
+                                        inputDevice: deviceLabel, outcome: "discard_low_confidence",
+                                        sttFinishMs: sttFinishMs,
+                                        batchMs: Int(Date().timeIntervalSince(batchT0) * 1000))
+                        return
+                    }
+                    batchText = TextNormalizer.normalizeSentenceSpacing(batch.text)
+                } catch {
+                    // A failed or timed-out batch pass must never break a
+                    // dictation: the streaming text stands.
+                    FileHandle.standardError.write(Data("[stt] batch pass failed, keeping the streaming result: \(error)\n".utf8))
+                }
+                batchMs = Int(Date().timeIntervalSince(batchT0) * 1000)
+                trace("batch")
+                let choice = TranscriptChoice.choose(streaming: raw, batch: batchText)
+                FileHandle.standardError.write(Data((TranscriptChoice.logLine(choice) + "\n").utf8))
+                raw = choice.text
+            }
+
+            rawTranscript = raw
+
+            // Snippets: a deterministic, pre-cleanup shortcut. If the raw
+            // transcript IS a snippet cue (optionally prefixed "insert"/
+            // "paste"), skip the LLM entirely and insert the stored text
+            // verbatim -- snippets are exact strings the user chose
+            // (URLs, signatures, etc.), and running them through cleanup
+            // risks the LLM "helpfully" rewording them.
+            if let snippetText = Self.matchSnippet(raw) {
+                cleanedTranscript = snippetText
+                cleanupBackendName = "snippet"
                 lastSttMs = sttMs
-                lastCleanupMs = cleanResult.durationMs
+                lastCleanupMs = 0
                 phase = .done
 
-                let backendLogName = cleanResult.backendName + (cleanResult.fellBackToRaw ? " (fallback-to-raw)" : "")
-
-                // Tracked explicitly rather than left at UsageLog's "inserted"
-                // default -- window-mode dictations never attempt insertion at
-                // all, and copiedOnly (accessibility not trusted) is a
-                // meaningfully different outcome from a real insert; both used
-                // to be silently mislabeled "inserted" in the log.
-                var loggedOutcome = "window"
+                var insertMs: Int?
                 if mode != .window {
-                    let outcome = TextInserter.insert(cleanedText, accessibilityTrusted: accessibility.isTrusted)
+                    let insertT0 = Date()
+                    let outcome = await TextInserter.insert(snippetText, accessibilityTrusted: accessibility.isTrusted)
+                    insertMs = Int(Date().timeIntervalSince(insertT0) * 1000)
                     switch outcome {
                     case .inserted:
                         pill.show(.inserted)
-                        CorrectionLearner.observe(insertedText: cleanedText)
-                        loggedOutcome = "inserted"
+                        CorrectionLearner.observe(insertedText: snippetText)
                     case .copiedOnly:
                         pill.show(.copiedOnly)
-                        loggedOutcome = "copied_only"
                     }
                 }
 
-                UsageLog.append(mode: mode.rawValue,
-                                audioSeconds: audioSeconds,
-                                rawChars: raw.count,
-                                cleanedChars: cleanedText.count,
-                                sttMs: sttMs,
-                                cleanupMs: cleanResult.durationMs,
-                                cleanupBackend: backendLogName,
-                                rawText: raw,
-                                cleanedText: cleanedText,
-                                sttConfidence: sttConfidence,
-                                rms: Double(rms),
-                                inputDevice: deviceName,
-                                outcome: loggedOutcome)
-            } catch {
-                guard current() else { return }
-                phase = .error(error.localizedDescription)
-                if mode != .window {
-                    pill.show(.failed(error.localizedDescription))
-                    hotkeys.reset()
+                UsageLog.append(mode: mode.rawValue, audioSeconds: audioSeconds,
+                                rawChars: raw.count, cleanedChars: snippetText.count,
+                                sttMs: sttMs, cleanupMs: 0, cleanupBackend: "snippet",
+                                rawText: raw, cleanedText: snippetText,
+                                sttConfidence: sttConfidence, rms: rms.map(Double.init),
+                                inputDevice: deviceLabel, outcome: "snippet",
+                                sttFinishMs: sttFinishMs, batchMs: batchMs, insertMs: insertMs)
+                return
+            }
+
+            let focusContext = await focusContextTask?.value ?? nil
+            guard current() else { return }
+            let cleanResult = await router.clean(raw, context: focusContext)
+            trace("cleanup")
+            guard current() else { return }
+            let cleanedText = TextNormalizer.normalizeSentenceSpacing(cleanResult.text)
+            cleanedTranscript = cleanedText
+            cleanupBackendName = cleanResult.backendName
+            lastSttMs = sttMs
+            lastCleanupMs = cleanResult.durationMs
+            phase = .done
+
+            let backendLogName = cleanResult.backendName + (cleanResult.fellBackToRaw ? " (fallback-to-raw)" : "")
+
+            // Tracked explicitly rather than left at UsageLog's "inserted"
+            // default -- window-mode dictations never attempt insertion at
+            // all, and copiedOnly (accessibility not trusted) is a
+            // meaningfully different outcome from a real insert; both used
+            // to be silently mislabeled "inserted" in the log.
+            var loggedOutcome = "window"
+            var insertMs: Int?
+            if mode != .window {
+                let insertT0 = Date()
+                let outcome = await TextInserter.insert(cleanedText, accessibilityTrusted: accessibility.isTrusted)
+                insertMs = Int(Date().timeIntervalSince(insertT0) * 1000)
+                switch outcome {
+                case .inserted:
+                    pill.show(.inserted)
+                    CorrectionLearner.observe(insertedText: cleanedText)
+                    loggedOutcome = "inserted"
+                case .copiedOnly:
+                    pill.show(.copiedOnly)
+                    loggedOutcome = "copied_only"
                 }
             }
+
+            UsageLog.append(mode: mode.rawValue,
+                            audioSeconds: audioSeconds,
+                            rawChars: raw.count,
+                            cleanedChars: cleanedText.count,
+                            sttMs: sttMs,
+                            cleanupMs: cleanResult.durationMs,
+                            cleanupBackend: backendLogName,
+                            rawText: raw,
+                            cleanedText: cleanedText,
+                            sttConfidence: sttConfidence,
+                            rms: rms.map(Double.init),
+                            inputDevice: deviceLabel,
+                            outcome: loggedOutcome,
+                            sttFinishMs: sttFinishMs, batchMs: batchMs, insertMs: insertMs)
+            trace("inserted")
+            // One stat per dictation, so a log that has outgrown its 5 MB
+            // budget is rotated during a long-running session and not only at
+            // the next launch.
+            Diagnostics.rotateAppLogIfNeeded()
         }
     }
 

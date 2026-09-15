@@ -18,14 +18,20 @@ enum TextInserter {
     /// Insert `text` at the current cursor position if Accessibility is
     /// trusted; otherwise just place it on the clipboard so the user can
     /// paste manually.
-    static func insert(_ text: String, accessibilityTrusted: Bool) -> Outcome {
+    /// Async only because the "does this need a leading space?" check reads
+    /// the target app over the accessibility API, and that read is now bounded
+    /// off the main actor instead of stalling on an unresponsive app.
+    /// Deliberately @MainActor: everything else here (the pasteboard, the
+    /// frontmost app, the synthetic Cmd+V) stays exactly where it was.
+    @MainActor
+    static func insert(_ text: String, accessibilityTrusted: Bool) async -> Outcome {
         guard accessibilityTrusted else {
             copyToPasteboard(text)
             return .copiedOnly
         }
 
         let currentApp = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
-        let toInsert = withLeadingSpaceIfNeeded(text, currentApp: currentApp)
+        let toInsert = await withLeadingSpaceIfNeeded(text, currentApp: currentApp)
 
         let pasteboard = NSPasteboard.general
         let previous = pasteboard.string(forType: .string)
@@ -93,7 +99,8 @@ enum TextInserter {
     /// press again) each paste a complete, period-terminated block, and
     /// without this check they land glued together with zero space between
     /// them: "First sentence.Second sentence."
-    static func withLeadingSpaceIfNeeded(_ text: String, currentApp: String?) -> String {
+    @MainActor
+    static func withLeadingSpaceIfNeeded(_ text: String, currentApp: String?) async -> String {
         guard let first = text.first, !first.isWhitespace else { return text }
         // Punctuation that should never be preceded by a space anyway.
         let noSpaceBefore: Set<Character> = [".", ",", ";", ":", "!", "?", ")", "]", "}", "\u{2019}", "\u{201D}"]
@@ -101,7 +108,7 @@ enum TextInserter {
 
         // The reliable path: Accessibility gave us the actual character.
         // Trust it completely, in either direction.
-        if let priorChar = characterBeforeCaret()?.first {
+        if let priorChar = await characterBeforeCaret()?.first {
             if priorChar.isWhitespace || priorChar.isNewline { return text }
             // Don't add a space right after an opening bracket/quote.
             let noSpaceAfter: Set<Character> = ["(", "[", "{", "\u{201C}", "\u{2018}", "'", "\""]
@@ -136,12 +143,32 @@ enum TextInserter {
     /// field, or the app doesn't support the parameterized string-for-range
     /// query (common in some web/Electron text fields) — any of which means
     /// "can't tell, don't guess."
-    private static func characterBeforeCaret() -> String? {
+    ///
+    /// Bounded twice over: every element is given a 0.3 s messaging timeout
+    /// (an AX query is a synchronous round trip into another process, and the
+    /// default wait is several seconds), and the whole read is capped at 0.5 s
+    /// off the main actor. A timeout returns nil, which is already the
+    /// "can't tell" path -- so an unresponsive app falls through to the
+    /// insertion-history heuristic below instead of freezing the insert.
+    private static func characterBeforeCaret(timeout: TimeInterval = FocusContext.overallTimeout) async -> String? {
+        do {
+            return try await withHardTimeout(seconds: timeout) { blockingCharacterBeforeCaret() }
+        } catch {
+            FileHandle.standardError.write(Data("[ax] caret read did not answer within \(timeout)s; using the insertion-history heuristic\n".utf8))
+            return nil
+        }
+    }
+
+    /// The accessibility round trip itself. Synchronous by nature; never call
+    /// it on the main actor.
+    private static func blockingCharacterBeforeCaret() -> String? {
         let systemWide = AXUIElementCreateSystemWide()
+        _ = AXUIElementSetMessagingTimeout(systemWide, FocusContext.messagingTimeout)
         var focusedRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute as CFString, &focusedRef) == .success,
               let focusedRef else { return nil }
         let element = focusedRef as! AXUIElement
+        _ = AXUIElementSetMessagingTimeout(element, FocusContext.messagingTimeout)
 
         var rangeRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &rangeRef) == .success,

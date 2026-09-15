@@ -679,3 +679,46 @@ func withTimeout<T: Sendable>(seconds: UInt64, _ operation: @escaping @Sendable 
         return result
     }
 }
+
+/// Run an async operation with a timeout the operation itself cannot defeat.
+///
+/// `withTimeout` above is structured: when the sleeping child throws, the
+/// task group cancels its siblings and then WAITS for them, so the call only
+/// returns early if the operation actually honours cancellation. That is true
+/// of a URLSession request and not true of the two things the stop pipeline
+/// most needs bounded -- `Task.value` on a non-throwing task ignores
+/// cancellation entirely, and a speech decoder sitting in Core ML does not
+/// check `Task.isCancelled`.
+///
+/// So the operation runs in an UNSTRUCTURED task that hands its result over
+/// an AsyncStream, and the race is between reading that stream and a sleep.
+/// Both of those do honour cancellation, so the timeout always returns on
+/// time; a wedged operation is cancelled (in case it is listening) and then
+/// simply abandoned to finish in its own time, with nobody waiting.
+func withHardTimeout<T: Sendable>(seconds: Double,
+                                  _ operation: @escaping @Sendable () async throws -> T) async throws -> T {
+    let (results, deliver) = AsyncStream.makeStream(of: Result<T, Error>.self)
+    let work = Task.detached(priority: .userInitiated) {
+        do {
+            deliver.yield(.success(try await operation()))
+        } catch {
+            deliver.yield(.failure(error))
+        }
+        deliver.finish()
+    }
+    defer { work.cancel() }
+
+    return try await withThrowingTaskGroup(of: Result<T, Error>.self) { group in
+        group.addTask {
+            for await result in results { return result }
+            throw CleanupError.timedOut
+        }
+        group.addTask {
+            try await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
+            throw CleanupError.timedOut
+        }
+        guard let first = try await group.next() else { throw CleanupError.timedOut }
+        group.cancelAll()
+        return try first.get()
+    }
+}

@@ -27,6 +27,9 @@ enum Diagnostics {
         lines.append("")
         lines.append("ollama.log tail:")
         lines.append(contentsOf: tail(of: ollamaLogURL, lines: 12).map { "  " + $0 })
+        lines.append("")
+        lines.append("app.log tail (\(appLogURL.path)):")
+        lines.append(contentsOf: tail(of: appLogURL, lines: appLogTailLines).map { "  " + $0 })
         return lines.joined(separator: "\n")
     }
 
@@ -45,6 +48,82 @@ enum Diagnostics {
     }
     private static var usageLogURL: URL { appSupport.appendingPathComponent("usage.jsonl") }
     private static var ollamaLogURL: URL { appSupport.appendingPathComponent("ollama.log") }
+
+    // MARK: - The app's own log file
+
+    /// Everything this app has ever had to say went to stderr, and stderr is
+    /// thrown away when an app is launched from Finder -- which is how it is
+    /// always launched. Diagnosing the "Cleaning…" hang cost a morning for
+    /// that reason alone. fd 2 is pointed at this file at launch, so every
+    /// existing `FileHandle.standardError.write` lands in it with no call site
+    /// changed.
+    static var appLogURL: URL { appSupport.appendingPathComponent("app.log") }
+    /// The one previous file kept after a rotation.
+    static var rotatedAppLogURL: URL { appSupport.appendingPathComponent("app.log.1") }
+    /// Keep the last 5 MB. At the volume this app writes (a few hundred bytes
+    /// per dictation) that is months.
+    static let maxAppLogBytes = 5 * 1024 * 1024
+    /// How much of it goes on the clipboard with "Copy diagnostics".
+    static let appLogTailLines = 200
+
+    /// Whether the log has outgrown its budget and should be rotated.
+    /// Separated out and tested because getting it wrong in either direction
+    /// is bad: never rotating fills the disk, rotating too eagerly throws away
+    /// the evidence the file exists to keep.
+    static func shouldRotate(currentBytes: Int, limitBytes: Int = maxAppLogBytes) -> Bool {
+        guard limitBytes > 0 else { return false }
+        return currentBytes >= limitBytes
+    }
+
+    /// Point fd 2 at `app.log`, in append mode, rotating first if the file has
+    /// outgrown its budget. Call ONCE, at launch, and never from the CLI
+    /// harness modes -- their whole output is on stderr and belongs in the
+    /// terminal the person is watching.
+    static func redirectStandardErrorToLogFile() {
+        try? FileManager.default.createDirectory(at: appSupport, withIntermediateDirectories: true)
+        rotateAppLogIfNeeded(reopen: false)
+        guard openAppLogOnStandardError() else { return }
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        let info = Bundle.main.infoDictionary ?? [:]
+        let version = info["CFBundleShortVersionString"] as? String ?? "dev"
+        let sha = info["WFGitCommit"] as? String ?? "unstamped"
+        FileHandle.standardError.write(Data("\n[app] \(stamp) launched v\(version) (\(sha)), pid \(ProcessInfo.processInfo.processIdentifier)\n".utf8))
+    }
+
+    @discardableResult
+    private static func openAppLogOnStandardError() -> Bool {
+        let fd = open(appLogURL.path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
+        guard fd >= 0 else { return false }
+        if fd != STDERR_FILENO {
+            dup2(fd, STDERR_FILENO)
+            close(fd)
+        }
+        return true
+    }
+
+    /// Rotate `app.log` to `app.log.1` once it passes the size budget.
+    /// `reopen` re-points fd 2 at the fresh file afterwards; without it every
+    /// later write would follow the renamed inode into app.log.1, which is
+    /// exactly the bug that makes naive log rotation useless.
+    static func rotateAppLogIfNeeded(reopen: Bool = true) {
+        let fm = FileManager.default
+        let size = (try? fm.attributesOfItem(atPath: appLogURL.path)[.size] as? UInt64) ?? nil
+        guard let size, shouldRotate(currentBytes: Int(size)) else { return }
+        try? fm.removeItem(at: rotatedAppLogURL)
+        do {
+            try fm.moveItem(at: appLogURL, to: rotatedAppLogURL)
+        } catch {
+            return
+        }
+        if reopen { openAppLogOnStandardError() }
+    }
+
+    /// One line per stage of a dictation's stop pipeline, so the next hang
+    /// says where it happened instead of costing a morning. `ms` is measured
+    /// from the moment the key was released.
+    static func dictation(_ id: String, stage: String, ms: Int) {
+        FileHandle.standardError.write(Data("[dictation] id=\(id) stage=\(stage) ms=\(ms)\n".utf8))
+    }
 
     private static func describe(_ selection: InputDeviceSelection) -> String {
         switch selection {

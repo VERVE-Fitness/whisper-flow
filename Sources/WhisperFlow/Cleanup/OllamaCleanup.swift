@@ -64,8 +64,11 @@ struct OllamaCleanup: CleanupBackend {
         let body: [String: Any] = [
             "model": model,
             "stream": false,
-            "keep_alive": "30m",
-            "options": ["temperature": 0],
+            // Both from EmbeddedOllama, deliberately: the warm-up and every
+            // request must send identical options, or Ollama treats them as
+            // different loads and reloads the model per dictation.
+            "keep_alive": EmbeddedOllama.keepAlive,
+            "options": EmbeddedOllama.requestOptions,
             "messages": messages
         ]
         req.httpBody = try JSONSerialization.data(withJSONObject: body)

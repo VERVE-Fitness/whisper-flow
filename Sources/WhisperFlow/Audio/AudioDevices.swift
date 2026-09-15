@@ -156,6 +156,76 @@ enum AudioDevices {
         }
     }
 
+    // MARK: - Silent-device fallback
+
+    /// Transport types that mean "a real microphone attached to this Mac".
+    /// Bluetooth is out on purpose (AirPods in the case, or mid-profile-switch,
+    /// are the devices that deliver digital silence in the first place), and so
+    /// is anything virtual or aggregate -- BlackHole, Loopback, Aggregate and
+    /// Multi-Output devices all enumerate as inputs and would happily accept a
+    /// dictation nobody can hear.
+    static let physicalInputTransports: Set<UInt32> = [
+        kAudioDeviceTransportTypeBuiltIn,
+        kAudioDeviceTransportTypeUSB,
+        kAudioDeviceTransportTypeDisplayPort,
+        kAudioDeviceTransportTypeThunderbolt,
+        kAudioDeviceTransportTypeHDMI,
+        // Continuity Capture (an iPhone used as the Mac's mic) reports
+        // "Unknown" on some macOS versions and its own transport type on
+        // others; both are a real microphone.
+        kAudioDeviceTransportTypeContinuityCaptureWired,
+        kAudioDeviceTransportTypeContinuityCaptureWireless,
+        kAudioDeviceTransportTypeUnknown,
+    ]
+
+    /// Where to go when the device we are recording from delivers nothing but
+    /// digital zeros. Ordered best first; empty means "stay where you are,
+    /// there is nothing better".
+    ///
+    /// Live wrapper around `rankFallbacks`, which is the part with the rules
+    /// in it and the part the tests drive.
+    static func rankedFallbacks(excluding currentUID: String?) -> [AudioInputDevice] {
+        rankFallbacks(devices: allInputDevices(),
+                      excluding: currentUID,
+                      lidClosed: isLidClosed(),
+                      systemDefaultUID: defaultInputDevice()?.uid)
+    }
+
+    /// The ranking itself, with every piece of machine state passed in.
+    ///
+    /// 1. The built-in microphone, unless the lid is shut -- macOS disables it
+    ///    in clamshell mode and it delivers exactly the digital silence we are
+    ///    running away from.
+    /// 2. Any other real, wired input (see `physicalInputTransports`), in
+    ///    enumeration order.
+    /// 3. The system default input, whatever it is, as a last resort: it is at
+    ///    least the device the rest of the Mac is using.
+    ///
+    /// The device we are already on is never in the list, and no device
+    /// appears twice.
+    static func rankFallbacks(devices: [AudioInputDevice],
+                              excluding currentUID: String?,
+                              lidClosed: Bool,
+                              systemDefaultUID: String?) -> [AudioInputDevice] {
+        let candidates = devices.filter { $0.uid != currentUID }
+        var ranked: [AudioInputDevice] = []
+        func add(_ device: AudioInputDevice) {
+            guard !ranked.contains(where: { $0.uid == device.uid }) else { return }
+            ranked.append(device)
+        }
+        if !lidClosed, let builtIn = candidates.first(where: { $0.isBuiltIn }) {
+            add(builtIn)
+        }
+        for device in candidates where !device.isBuiltIn && !device.isBluetooth
+            && physicalInputTransports.contains(device.transportType) {
+            add(device)
+        }
+        if let systemDefaultUID, let fallback = candidates.first(where: { $0.uid == systemDefaultUID }) {
+            add(fallback)
+        }
+        return ranked
+    }
+
     // MARK: - Property helpers
 
     private static func hasInputStreams(_ id: AudioDeviceID) -> Bool {

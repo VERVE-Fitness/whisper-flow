@@ -77,6 +77,8 @@ Whisper Flow records from the **Mac's built-in microphone by default, even when 
 
 **Lid closed:** macOS switches the built-in mic off in clamshell mode (it still enumerates and still delivers buffers, all exactly zero). `AudioDevices.resolve(.builtIn)` reads `AppleClamshellState` from IOPMrootDomain and falls back to the system default while the lid is shut; the menu says "lid closed, using system default".
 
+**A device that delivers digital silence:** four dictations on 8 September were captured from AirPods with an RMS of exactly 0.0 — the device was selected, buffers arrived on time, and every sample in them was zero. The tap counts non-zero samples, and a full second of audio without a single one (a working mic in a silent room still delivers a noise floor) makes the capture switch device once, keeping the same output stream so the dictation survives. `AudioDevices.rankFallbacks` picks: the built-in mic unless the lid is shut, then any other real wired input, then the system default. Bluetooth is excluded (another headset is as likely to be silent as the one just left) and so is anything virtual or aggregate (BlackHole would happily accept a dictation nobody can hear). The switch is logged as `[capture] "A" delivered only zeros for 1.0s; switching to "B"`, the usage row records `input_device` as `A → B`, and a dictation that still comes out at exactly zero RMS gets a pill naming the device ("MacBook Pro Microphone gave no audio") instead of "Didn't catch that".
+
 If the engine actually stops under a running capture (`AVAudioEngineConfigurationChange` with `isRunning == false`, or no buffer for 2 s), `AudioCapture` tears it down and rebuilds it on the same output stream, at most three times per 5 s window. A pinned engine also receives that notification when the *system default* changes, without stopping; those are ignored (rebuilding on them caused a rebuild storm and a dead capture). Events are logged to the `audio-capture` category of `com.niallwogan.whisperflow` and mirrored to stderr as `[capture] …`.
 
 ## Permissions (first launch)
@@ -93,14 +95,16 @@ The app is signed with an Apple Development certificate, not Developer ID, and i
 - **Push-to-talk (Right Option, keyCode 61):** watched via both a global and a local `NSEvent` flagsChanged monitor, so it also fires when Whisper Flow's own UI has focus. Holds shorter than 150 ms are treated as accidental taps and ignored. The mic stays open 400 ms after release so the last word isn't clipped (see **Phrases and the last two seconds** below).
 - **Hands-free (⌘ + Right Option):** a CGEvent tap swallows the finishing key press.
 - **Insertion:** on stop, the cleaned text is placed on the general pasteboard, a synthetic ⌘V is posted to the system HID event tap, and the previous clipboard contents are restored ~0.3 s later. The app never activates itself, so the target app keeps focus throughout. A floating, non-activating status pill shows Listening → Cleaning → Inserted (or "Didn't catch that" / "Didn't work: …").
-- **Watchdog:** if a stop is still in "Cleaning…" after 45 s, the state machine is reset so the next dictation works, and the pill says so.
+- **Watchdog:** if a stop is still in "Cleaning…" after 15 s, the state machine is reset so the next dictation works, and the pill says so. See **Reliability: the stop pipeline** below for the per-stage timeouts that should catch a stall long before it gets that far.
 
 ## Cleanup backends
 
 `CleanupRouter` picks the first available backend at each dictation:
 
 1. **FoundationModels** — Apple Intelligence on-device model (macOS 26+, only when Apple Intelligence is enabled).
-2. **Ollama** — `llama3.2:3b` on the app-owned server at `http://127.0.0.1:11535`, temperature 0, `keep_alive 30m`. The model is warmed as soon as the server reports ready, and the router waits 25 s instead of 10 s when the model is not resident (`/api/ps`), so a cold first dictation on an 8 GB M1 no longer falls back to raw.
+2. **Ollama** — `llama3.2:3b` on the app-owned server at `http://127.0.0.1:11535`, temperature 0, `num_ctx 4096`. The model is warmed as soon as the server reports ready, and the router waits 25 s instead of 10 s when the model is not resident (`/api/ps`), so a cold first dictation on an 8 GB M1 no longer falls back to raw.
+
+   **Keep-alive policy.** Cleanup p50 is 857 ms, but the first dictation after half an hour idle was 3.3–3.7 s every time: `keep_alive 30m` let the model unload (5–8 reloads a day in `ollama.log`) and the reload allocated a 32k context, 3.5 GB of KV cache. A Mac with **16 GiB or more holds the model resident** (`keep_alive` **`-1` as a JSON number** — Ollama parses a keep_alive *string* as a Go duration and rejects `"-1"` outright); below that it keeps `30m` and re-warms every 20 minutes so the window never expires while the app runs. `EmbeddedOllama.keepAlive` and `EmbeddedOllama.numCtx` are used by the warm-up **and** every request: Ollama keys a loaded model on its options, so a mismatch reloads the model per dictation. Measured on the running server: `context_length` 32768 → 4096, `size_vram` 5.96 GB → 2.55 GB.
 3. **Passthrough** — returns the raw transcript unchanged.
 
 Guard rails: empty output, output longer than 1.6× the raw text, too few content words kept, too many new words, a dropped question mark, errors, or the timeout all fall back to the raw transcript (logged to stderr and the usage log). Deterministic passes (dictionary corrections, self-correction stripping, digit formatting) run on every path. Whole-sentence cue-led replacement ("… by Tuesday. Actually make that Wednesday.") only deletes the previous sentence when the replacement is at least half its length; shorter remainders are word-level swaps left for the LLM.
@@ -359,10 +363,46 @@ What dictation matches against is the three lists merged, in this order: team, t
 
 `STT/TranscriptionBackend.swift` defines the streaming protocol (prepare → startStream → feed → finishStream, plus batch `transcribeFile`). `ParakeetBackend` is the live implementation; `WhisperBackend` is a stub showing where a whisper.cpp/WhisperKit buffer+commit wrapper would conform.
 
+## Reliability: the stop pipeline
+
+There have never been any crash reports. The "crashes" were hangs: the pill sat on "Cleaning…" until the app was force-quit. Every Ollama `/api/chat` request has a matching usage-log row, so the hang was always *before* the LLM.
+
+**Nothing in the stop pipeline blocks the main actor, and nothing in it runs unbounded.**
+
+| Stage | Bound | What happens on a timeout |
+|---|---|---|
+| Streaming session bring-up | — | awaited; it is the model load, and a stop that lands during it must wait |
+| `capture.stop()` | non-blocking | returns at once; the engine teardown goes to the engine queue |
+| `capture.stopAndWait` | 2 s | carries on; the engine is leaked rather than the UI |
+| Capture drain (`feed.value`) | 3 s | the silence guard and batch re-check are skipped; the transcript is unaffected |
+| Silence pad + `finishStream` | 8 s | falls back to the streaming partial the pill is already showing, and `resetStream()` throws the stuck manager away so the *next* dictation is clean |
+| Batch re-check | existing | the streaming text stands |
+| Cleanup (LLM) | existing | falls back to the raw transcript |
+| Whole stop, backstop | 15 s | state machine reset, mic closed, stream reset, pill says "took too long, try again" |
+
+The watchdog sleeps on a **detached** task. It used to be a `Task.sleep` on the main actor, so a blocked main actor — the exact failure it existed to catch — meant it never fired; it hops to the main actor only to perform the reset.
+
+`AudioCapture` serialises every engine mutation on one queue (`com.niallwogan.whisperflow.engine`): `configureAndStart`, the `removeTap` + `stop` teardown, the configuration-change rebuild and the silent-device switch. Before that, a stop on the main actor could run a teardown at the same instant as a detached reconfigure was building a new engine on the same field.
+
+Accessibility reads are bounded twice over: `AXUIElementSetMessagingTimeout(element, 0.3)` on the system-wide element and on each focused element (an AX query is a synchronous round trip into another process, and the default wait is measured in seconds), plus a 0.5 s overall cap off the main actor. A timeout returns nil, which both call sites already treat as "can't tell": `FocusContext` dictates without spelling context, `TextInserter` falls back to its insertion-history heuristic.
+
 ## Telemetry and diagnostics
 
 Each dictation appends one JSONL line to `~/Library/Application Support/WhisperFlow/usage.jsonl`:
-`{ts, mode, audio_seconds, raw_chars, cleaned_chars, stt_ms, cleanup_ms, cleanup_backend, raw_text, cleaned_text, input_device, stt_confidence, rms, outcome}`. Local file only. The embedded Ollama logs to `ollama.log` in the same folder. **Copy diagnostics** in the menu puts version, macOS, chip, RAM, permissions, microphone setup, the last eight dictations (no transcript text) and the Ollama log tail on the clipboard.
+`{ts, mode, audio_seconds, raw_chars, cleaned_chars, stt_ms, cleanup_ms, cleanup_backend, raw_text, cleaned_text, input_device, stt_confidence, rms, outcome, stt_finish_ms, batch_ms, insert_ms}`. Local file only. `stt_ms` is stop-press to final text; `stt_finish_ms`, `batch_ms` and `insert_ms` are the individual stages inside it. `input_device` reads `A → B` when the capture switched away from a silent device.
+
+**`app.log`.** The app used to write no log of its own — every `[capture]`/`[stop]`/`[stt]` note went to stderr, which goes nowhere when the app is launched from Finder. `fd 2` is now redirected to `~/Library/Application Support/WhisperFlow/app.log` at launch (append mode, last 5 MB kept, rotated to `app.log.1`). The CLI harness modes (`--transcribe-file`, `--capture-test`, …) are **not** redirected: their output belongs in the terminal. The stop pipeline writes one line per stage:
+
+```
+[dictation] id=3f2a91c0 stage=start ms=0
+[dictation] id=3f2a91c0 stage=engine_stopped ms=421
+[dictation] id=3f2a91c0 stage=stt_finished ms=690
+[dictation] id=3f2a91c0 stage=batch ms=1104
+[dictation] id=3f2a91c0 stage=cleanup ms=1962
+[dictation] id=3f2a91c0 stage=inserted ms=1974
+```
+
+The embedded Ollama logs to `ollama.log` in the same folder. **Copy diagnostics** in the menu puts version, macOS, chip, RAM, permissions, microphone setup, the last eight dictations (no transcript text), the Ollama log tail and the last 200 lines of `app.log` on the clipboard.
 
 ## Roadmap
 

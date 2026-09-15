@@ -52,26 +52,47 @@ enum AudioCaptureError: Error, LocalizedError {
 ///
 /// Threading: the tap closure runs on the real-time audio thread, the
 /// configuration-change notification arrives on a CoreAudio thread, the
-/// stall timer on the main run loop, reconfiguration on a detached task, and
-/// start()/stop() on the main actor. Every field touched by more than one of
-/// those goes through `stateLock`; the tap closure captures its converter
-/// and format as constants so it never reads a field another thread may be
-/// replacing. `generation` ties each engine to the start() that created it,
-/// so a reconfigure that finishes after stop() tears its engine straight
-/// back down instead of leaving a live mic nobody is consuming.
+/// stall timer on the main run loop, and start()/stop() on the main actor.
+///
+/// Two separate mechanisms keep that safe, and they do different jobs:
+///
+/// * `engineQueue` is a serial queue, and EVERY sequence that mutates the
+///   engine graph runs on it: `configureAndStart` (build engine, pin device,
+///   install tap, start) and the `removeTap` + `stop` teardown. Before this,
+///   a stop on the main actor could run `removeTap`/`stop` at the same
+///   instant as a detached reconfigure task was building and starting a new
+///   engine on the same field -- a torn read of `engine` there leaves either
+///   a live mic nobody is consuming or a half-built graph, and it is one of
+///   the two ways the stop pipeline was observed to wedge.
+/// * `stateLock` guards the plain fields (flags, counters, the engine
+///   REFERENCE, the continuation). Reading the reference under the lock and
+///   then reading `isRunning` off it without the lock is deliberate: the
+///   stall timer runs on the main run loop and must never block behind an
+///   `AVAudioEngine.start()` that is taking 1-3 s on the engine queue.
+///
+/// `generation` ties each engine to the start() that created it, so a
+/// reconfigure that finishes after stop() tears its engine straight back
+/// down instead of leaving a live mic nobody is consuming.
 final class AudioCapture: @unchecked Sendable {
     static let targetSampleRate: Double = 16_000
 
-    private var engine = AVAudioEngine()
-    private var continuation: AsyncStream<[Float]>.Continuation?
-    /// Format the tap is currently installed with (diagnostics only).
-    private var inputFormat: AVAudioFormat?
-    private var followsSystemDefault = false
-    private var configObserver: NSObjectProtocol?
-    private var stallCheckTimer: Timer?
+    /// Serialises every engine graph mutation. See the class doc comment.
+    private let engineQueue = DispatchQueue(label: "com.niallwogan.whisperflow.engine")
 
     private let stateLock = NSLock()
     // -- everything below is guarded by stateLock --
+    /// The engine reference. Mutated only from inside `engineQueue`; read
+    /// from anywhere (under the lock) for diagnostics.
+    private var _engine = AVAudioEngine()
+    private var _continuation: AsyncStream<[Float]>.Continuation?
+    /// Format the tap is currently installed with (diagnostics only).
+    private var _inputFormat: AVAudioFormat?
+    private var _followsSystemDefault = false
+    private var _configObserver: NSObjectProtocol?
+    private var _stallCheckTimer: Timer?
+    /// Engine teardowns enqueued on `engineQueue` but not finished yet.
+    /// `stopAndWait` waits on this reaching zero.
+    private var _teardownsPending = 0
     private var _isActive = false
     private var _generation = 0
     private var _isReconfiguring = false
@@ -82,6 +103,11 @@ final class AudioCapture: @unchecked Sendable {
     private var _buffersDelivered = 0
     private var _lastBufferAt: Date?
     private var _activeDevice: AudioInputDevice?
+    /// How many samples in this capture were not exactly 0.0.
+    private var _nonZeroSamples = 0
+    /// The silent-device switch is offered once per capture, no more.
+    private var _silentSwitchAttempted = false
+    private var _silentDeviceSwitch: (from: String, to: String)?
 
     private func locked<T>(_ body: () -> T) -> T {
         stateLock.lock(); defer { stateLock.unlock() }
@@ -96,6 +122,16 @@ final class AudioCapture: @unchecked Sendable {
     /// The device the current/last capture actually recorded from (for the
     /// menu status line and the usage log).
     var activeDevice: AudioInputDevice? { locked { _activeDevice } }
+    /// Set when this capture gave up on a device that delivered nothing but
+    /// digital zeros and moved to another one. AppState puts both names in
+    /// the usage row and, if the dictation still came out silent, on the pill
+    /// -- "Didn't catch that" is the wrong thing to tell somebody whose
+    /// microphone was never actually recording.
+    var silentDeviceSwitch: (from: String, to: String)? { locked { _silentDeviceSwitch } }
+    /// Diagnostics only: whether the engine believes it is running. Reads the
+    /// reference under the lock and the property outside it, on purpose --
+    /// see the class doc comment.
+    private var engineIsRunning: Bool { locked { _engine }.isRunning }
 
     /// How long without a new buffer counts as a stall. Real taps deliver
     /// every ~0.25s (4096 samples @ the input device's native rate); anything
@@ -113,6 +149,13 @@ final class AudioCapture: @unchecked Sendable {
     /// try again once the storm has passed.
     private static let maxReconfigures = 3
     private static let reconfigureCooldown: TimeInterval = 5.0
+    /// How much audio to hear before concluding a device is not recording at
+    /// all. Every sample exactly 0.0 is not quiet, it is DIGITAL silence: a
+    /// working microphone in a silent room still delivers a noise floor. One
+    /// second is long enough that a device still waking up is not written off
+    /// and short enough that the switch happens while the person is still
+    /// talking, so the dictation survives.
+    private static let silentDeviceWindow: Double = 1.0
 
     /// Start capturing from the device `selection` resolves to. Returns a
     /// stream of 16 kHz mono Float32 chunks.
@@ -124,8 +167,10 @@ final class AudioCapture: @unchecked Sendable {
     /// unresponsiveness, so the "any key finishes" press is lost).
     func start(selection: InputDeviceSelection = InputDeviceSelection.saved) async throws -> AsyncStream<[Float]> {
         // Defensive: a previous capture that was never stopped (or a
-        // reconfigure that raced a stop) must not survive into this one.
-        if locked({ _isActive }) { stop() }
+        // reconfigure that raced a stop) must not survive into this one. The
+        // teardown it enqueues is serialised ahead of our own bring-up by
+        // engineQueue, so there is no need to wait for it here.
+        stop()
 
         let generation: Int = locked {
             _generation += 1
@@ -134,22 +179,25 @@ final class AudioCapture: @unchecked Sendable {
             _reconfigureCount = 0
             _isReconfiguring = false
             _stallLogged = false
+            _nonZeroSamples = 0
+            _silentSwitchAttempted = false
+            _silentDeviceSwitch = nil
             return _generation
         }
 
         let (stream, continuation) = AsyncStream.makeStream(of: [Float].self,
                                                             bufferingPolicy: .unbounded)
-        self.continuation = continuation
+        locked { _continuation = continuation }
 
-        try await Task.detached(priority: .userInitiated) { [self] in
-            try self.configureAndStart(selection: selection)
+        let engine: AVAudioEngine = try await Task.detached(priority: .userInitiated) { [self] in
+            try engineQueue.sync { try configureAndStart(selection: selection) }
         }.value
 
         locked {
             _isActive = true
             _lastBufferAt = Date()
         }
-        installConfigurationChangeObserver(generation: generation)
+        installConfigurationChangeObserver(generation: generation, on: engine)
         startStallCheck(generation: generation)
         return stream
     }
@@ -158,12 +206,18 @@ final class AudioCapture: @unchecked Sendable {
         locked { _isActive && _generation == generation }
     }
 
-    /// Synchronous engine bring-up; runs off the main actor (see `start`).
-    private func configureAndStart(selection: InputDeviceSelection) throws {
+    /// Synchronous engine bring-up. MUST run on `engineQueue` (see the class
+    /// doc comment) and off the main actor (see `start`). Returns the engine
+    /// it built so the caller can observe that exact object.
+    @discardableResult
+    private func configureAndStart(selection: InputDeviceSelection) throws -> AVAudioEngine {
+        dispatchPrecondition(condition: .onQueue(engineQueue))
         let (device, followsDefault) = AudioDevices.resolve(selection)
         guard let device else { throw AudioCaptureError.noInputDevice }
-        locked { _activeDevice = device }
-        followsSystemDefault = followsDefault
+        locked {
+            _activeDevice = device
+            _followsSystemDefault = followsDefault
+        }
 
         // A fresh engine per capture: after a configuration change or an
         // error the old graph can be left in a state where re-installing a
@@ -182,10 +236,13 @@ final class AudioCapture: @unchecked Sendable {
             input.removeTap(onBus: 0)
             throw AudioCaptureError.engineStartFailed(error.localizedDescription)
         }
-        engine = newEngine
-        inputFormat = format
+        locked {
+            _engine = newEngine
+            _inputFormat = format
+        }
         captureNote("started on \"\(device.name)\" pinned=\(!followsDefault) \(Int(format.sampleRate)) Hz \(format.channelCount) ch")
         captureLog.info("capture started on \"\(device.name, privacy: .public)\" (\(device.isBuiltIn ? "built-in" : device.isBluetooth ? "bluetooth" : "other", privacy: .public), pinned: \(!followsDefault)) at \(format.sampleRate, privacy: .public) Hz / \(format.channelCount, privacy: .public) ch")
+        return newEngine
     }
 
     /// Bind the engine's input AudioUnit to one specific device so it stops
@@ -228,7 +285,7 @@ final class AudioCapture: @unchecked Sendable {
               let converter = AVAudioConverter(from: inputFormat, to: targetFormat) else {
             throw AudioCaptureError.converterCreationFailed
         }
-        let continuation = self.continuation
+        let continuation = locked { _continuation }
 
         input.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
             guard let self else { return }
@@ -250,10 +307,27 @@ final class AudioCapture: @unchecked Sendable {
             guard status != .error, error == nil, out.frameLength > 0,
                   let channel = out.floatChannelData?[0] else { return }
             let samples = Array(UnsafeBufferPointer(start: channel, count: Int(out.frameLength)))
-            self.locked {
+            var nonZero = 0
+            for sample in samples where sample != 0 { nonZero += 1 }
+            let switchFrom: Int? = self.locked {
                 self._capturedSeconds += Double(samples.count) / Self.targetSampleRate
                 self._buffersDelivered += 1
                 self._lastBufferAt = Date()
+                self._nonZeroSamples += nonZero
+                // Not one non-zero sample in a full second of audio: this
+                // device is not recording. Claim the switch here, under the
+                // lock, so only one buffer can start it.
+                guard self._nonZeroSamples == 0,
+                      self._capturedSeconds >= Self.silentDeviceWindow,
+                      self._isActive,
+                      !self._silentSwitchAttempted,
+                      !self._isReconfiguring else { return nil }
+                self._silentSwitchAttempted = true
+                self._isReconfiguring = true
+                return self._generation
+            }
+            if let switchFrom {
+                self.switchAwayFromSilentDevice(generation: switchFrom)
             }
             // Yielding to a finished continuation is a documented no-op, so
             // a tap that outlives stop() by a callback is harmless.
@@ -264,19 +338,34 @@ final class AudioCapture: @unchecked Sendable {
 
     // MARK: - Configuration changes (device switched / format changed)
 
-    private func installConfigurationChangeObserver(generation: Int) {
-        if let configObserver { NotificationCenter.default.removeObserver(configObserver) }
+    private func installConfigurationChangeObserver(generation: Int, on engine: AVAudioEngine) {
+        let previous: NSObjectProtocol? = locked {
+            let old = _configObserver
+            _configObserver = nil
+            return old
+        }
+        if let previous { NotificationCenter.default.removeObserver(previous) }
         // queue: nil -- handle on the posting thread. Routing through the
         // main queue would make recovery depend on the main run loop being
         // serviced, which is exactly what a blocked main thread (Bluetooth
         // negotiation, a modal, the CLI test harness) can't guarantee.
-        configObserver = NotificationCenter.default.addObserver(
+        let observer = NotificationCenter.default.addObserver(
             forName: .AVAudioEngineConfigurationChange,
             object: engine,
             queue: nil
         ) { [weak self] _ in
             self?.handleConfigurationChange(reason: "AVAudioEngineConfigurationChange", generation: generation)
         }
+        locked { _configObserver = observer }
+    }
+
+    private func removeConfigurationChangeObserver() {
+        let observer: NSObjectProtocol? = locked {
+            let old = _configObserver
+            _configObserver = nil
+            return old
+        }
+        if let observer { NotificationCenter.default.removeObserver(observer) }
     }
 
     /// AVAudioEngine has stopped itself because the input device's
@@ -290,7 +379,8 @@ final class AudioCapture: @unchecked Sendable {
     /// Re-entrancy: the notification and the stall timer can both fire for
     /// one event, from different threads. `_isReconfiguring` makes the
     /// second caller a no-op; the generation check makes a rebuild that
-    /// finishes after stop() undo itself.
+    /// finishes after stop() undo itself. The rebuild itself is dispatched
+    /// to `engineQueue`, so it can never overlap a stop()'s teardown.
     private func handleConfigurationChange(reason: String, generation: Int) {
         // A PINNED engine receives AVAudioEngineConfigurationChange when the
         // system default input changes even though its own device did not,
@@ -300,7 +390,7 @@ final class AudioCapture: @unchecked Sendable {
         // switch, then a dead capture). Only a stopped engine needs a
         // rebuild; a running one is left alone, with the stall watchdog as
         // the safety net if it turns out to be running but silent.
-        if reason == "AVAudioEngineConfigurationChange", engine.isRunning, isCurrent(generation) {
+        if reason == "AVAudioEngineConfigurationChange", engineIsRunning, isCurrent(generation) {
             captureNote("configuration change while engine still running; keeping current capture")
             return
         }
@@ -324,29 +414,29 @@ final class AudioCapture: @unchecked Sendable {
         captureLog.error("input configuration changed mid-recording (\(reason, privacy: .public)); rebuilding capture (attempt \(attempt))")
         captureNote("configuration changed (\(reason)); rebuilding, attempt \(attempt)")
         let previousUID = activeDevice?.uid
-        let selection: InputDeviceSelection = followsSystemDefault
+        let selection: InputDeviceSelection = locked { _followsSystemDefault }
             ? .systemDefault
             : (previousUID.map { .device(uid: $0) } ?? .builtIn)
 
-        Task.detached(priority: .userInitiated) { [self] in
+        engineQueue.async { [self] in
             defer { locked { _isReconfiguring = false } }
             // Tear down the old graph fully; a tap left on a stopped engine
             // after a device change is the state that traps on reinstall.
-            let old = engine
+            let old = locked { _engine }
             old.inputNode.removeTap(onBus: 0)
             old.stop()
             guard isCurrent(generation) else { return }
             do {
-                try configureAndStart(selection: selection)
+                let rebuilt = try configureAndStart(selection: selection)
                 // stop() may have run while the engine was coming up. The
                 // new engine is then a zombie with a live mic: kill it.
                 guard isCurrent(generation) else {
-                    engine.inputNode.removeTap(onBus: 0)
-                    engine.stop()
+                    rebuilt.inputNode.removeTap(onBus: 0)
+                    rebuilt.stop()
                     captureLog.info("reconfigure finished after stop(); torn down again")
                     return
                 }
-                installConfigurationChangeObserver(generation: generation)
+                installConfigurationChangeObserver(generation: generation, on: rebuilt)
                 locked {
                     _lastBufferAt = Date()
                     _stallLogged = false
@@ -362,11 +452,56 @@ final class AudioCapture: @unchecked Sendable {
         }
     }
 
+    // MARK: - Silent device
+
+    /// The device we are recording from has delivered a full second of
+    /// nothing but exact zeros, so move to the best alternative and keep the
+    /// same output stream. Runs on `engineQueue` like every other engine
+    /// rebuild, so it cannot overlap a stop() teardown or a configuration
+    /// change. Caller has already claimed `_isReconfiguring`.
+    private func switchAwayFromSilentDevice(generation: Int) {
+        let from = activeDevice
+        let fromName = from?.name ?? "?"
+        guard let replacement = AudioDevices.rankedFallbacks(excluding: from?.uid).first else {
+            locked { _isReconfiguring = false }
+            captureNote("\"\(fromName)\" delivered only zeros for \(String(format: "%.1f", Self.silentDeviceWindow))s; nothing better to switch to, staying put")
+            captureLog.error("input \"\(fromName, privacy: .public)\" delivered only digital silence and there is no other input to switch to")
+            return
+        }
+        captureNote("\"\(fromName)\" delivered only zeros for \(String(format: "%.1f", Self.silentDeviceWindow))s; switching to \"\(replacement.name)\"")
+        captureLog.error("input \"\(fromName, privacy: .public)\" delivered only digital silence; switching to \"\(replacement.name, privacy: .public)\"")
+        locked { _silentDeviceSwitch = (from: fromName, to: replacement.name) }
+
+        engineQueue.async { [self] in
+            defer { locked { _isReconfiguring = false } }
+            let old = locked { _engine }
+            old.inputNode.removeTap(onBus: 0)
+            old.stop()
+            guard isCurrent(generation) else { return }
+            do {
+                let rebuilt = try configureAndStart(selection: .device(uid: replacement.uid))
+                guard isCurrent(generation) else {
+                    rebuilt.inputNode.removeTap(onBus: 0)
+                    rebuilt.stop()
+                    return
+                }
+                installConfigurationChangeObserver(generation: generation, on: rebuilt)
+                locked {
+                    _lastBufferAt = Date()
+                    _stallLogged = false
+                }
+            } catch {
+                captureNote("could not switch to \"\(replacement.name)\": \(error.localizedDescription)")
+                captureLog.error("could not switch away from a silent input: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+    }
+
     // MARK: - Stall watchdog
 
     private func startStallCheck(generation: Int) {
         let startedAt = Date()
-        stallCheckTimer?.invalidate()
+        invalidateStallTimer()
         let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self else { return }
             let (gap, shouldAct): (TimeInterval, Bool) = self.locked {
@@ -378,36 +513,87 @@ final class AudioCapture: @unchecked Sendable {
             }
             guard shouldAct else { return }
             let recordedFor = Date().timeIntervalSince(startedAt)
-            captureLog.error("mic tap stalled: no buffer for \(String(format: "%.2f", gap), privacy: .public)s (recording for \(String(format: "%.2f", recordedFor), privacy: .public)s total, device \"\(self.activeDevice?.name ?? "?", privacy: .public)\", engine running: \(self.engine.isRunning)); attempting restart")
+            captureLog.error("mic tap stalled: no buffer for \(String(format: "%.2f", gap), privacy: .public)s (recording for \(String(format: "%.2f", recordedFor), privacy: .public)s total, device \"\(self.activeDevice?.name ?? "?", privacy: .public)\", engine running: \(self.engineIsRunning)); attempting restart")
             // A stall with no configuration-change notification still means
             // the engine isn't feeding us. Treat it the same way rather than
             // sitting on a dead tap.
             self.handleConfigurationChange(reason: "tap stall \(String(format: "%.1f", gap))s", generation: generation)
         }
-        stallCheckTimer = timer
+        locked { _stallCheckTimer = timer }
         RunLoop.main.add(timer, forMode: .common)
     }
 
+    /// `Timer.invalidate()` is only safe on the thread whose run loop the
+    /// timer was scheduled on, and `stop()` is now callable from anywhere, so
+    /// the invalidation hops to main when it isn't already there.
+    private func invalidateStallTimer() {
+        let timer: Timer? = locked {
+            let t = _stallCheckTimer
+            _stallCheckTimer = nil
+            return t
+        }
+        guard let timer else { return }
+        if Thread.isMainThread {
+            timer.invalidate()
+        } else {
+            DispatchQueue.main.async { timer.invalidate() }
+        }
+    }
+
+    // MARK: - Stop
+
+    /// Stop capturing. Returns immediately -- nothing here blocks the caller,
+    /// and in particular nothing blocks the main actor.
+    ///
+    /// The parts a caller depends on happen synchronously: the capture is
+    /// marked inactive, the generation is bumped (so an in-flight reconfigure
+    /// undoes itself), and the stream continuation is finished, which is what
+    /// ends the feed task draining it. The engine teardown itself
+    /// (`removeTap` + `stop`, which can sit inside CoreAudio for a second or
+    /// more on a Bluetooth device) is handed to `engineQueue`. Use
+    /// `stopAndWait(timeout:)` when the caller genuinely needs to know the
+    /// hardware is released.
     func stop() {
         locked {
             _isActive = false
             _generation += 1   // invalidates any in-flight reconfigure
+            _teardownsPending += 1
         }
-        if let configObserver {
-            NotificationCenter.default.removeObserver(configObserver)
-            self.configObserver = nil
-        }
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
+        removeConfigurationChangeObserver()
         // Finish, don't nil: the tap thread may still be inside one last
         // callback holding this continuation, and yielding to a finished
         // continuation is a no-op. start() replaces it.
-        continuation?.finish()
-        stallCheckTimer?.invalidate()
-        stallCheckTimer = nil
+        locked { _continuation }?.finish()
+        invalidateStallTimer()
+
+        engineQueue.async { [self] in
+            let engine = locked { _engine }
+            engine.inputNode.removeTap(onBus: 0)
+            engine.stop()
+            locked { _teardownsPending -= 1 }
+        }
+    }
+
+    /// `stop()` plus a bounded wait for the engine teardown to actually
+    /// finish, for callers that want the mic released before they move on.
+    ///
+    /// Returns as soon as the teardown completes, or after `timeout`,
+    /// whichever comes first. On timeout it returns anyway and says so in the
+    /// log: a wedged CoreAudio teardown should cost a leaked engine, not a
+    /// wedged UI. Never blocks a thread -- it suspends between polls.
+    func stopAndWait(timeout: TimeInterval) async {
+        stop()
+        let deadline = Date().addingTimeInterval(timeout)
+        while !Task.isCancelled {
+            if locked({ _teardownsPending == 0 }) { return }
+            if Date() >= deadline { break }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        guard locked({ _teardownsPending > 0 }) else { return }
+        captureNote("engine teardown still running after \(String(format: "%.1f", timeout))s; leaving it to finish on its own rather than holding up the stop")
+        captureLog.error("engine teardown exceeded \(timeout, privacy: .public)s; abandoned (engine leaked, UI released)")
     }
 }
-
 /// Load any audio file (WAV/AIFF/M4A/...) and convert it to 16 kHz mono Float32.
 func loadAudioFileAs16kMonoFloats(path: String) throws -> [Float] {
     let url = URL(fileURLWithPath: path)

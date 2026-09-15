@@ -26,6 +26,51 @@ enum EmbeddedOllama {
     /// Kept in one place: OllamaCleanup checks for this same name.
     static let model = "llama3.2:3b"
 
+    /// How long Ollama keeps the model resident after a request.
+    ///
+    /// The first dictation after half an hour idle took 3.3 to 3.7 seconds,
+    /// every time, against a warm p50 of 857 ms -- ollama.log shows the model
+    /// being unloaded and reloaded five to eight times a day, and the reload
+    /// is the whole difference. "-1" means never unload. llama3.2:3b at a
+    /// 4096-token context is about 2.5 GB resident, which is a sensible thing
+    /// to hold on a 16 GB Mac and not on an 8 GB one, so small-memory Macs
+    /// keep the old 30-minute policy and lean on the idle re-warm below
+    /// instead.
+    /// Returns the value to put in the request body, which is deliberately
+    /// NOT always a string: Ollama parses a keep_alive STRING as a Go
+    /// duration, so "-1" comes back as
+    /// `time: missing unit in duration "-1"` and the request fails outright.
+    /// The never-unload form has to be the JSON NUMBER -1. Verified against
+    /// the running server on 127.0.0.1:11535.
+    static func keepAlive(physicalMemory: UInt64) -> Any {
+        physicalMemory >= 16 * 1024 * 1024 * 1024 ? -1 : "30m"
+    }
+
+    /// This Mac's policy. Used by the warm-up AND by every chat request --
+    /// they must agree, or each one resets the other's timer.
+    static var keepAlive: Any { keepAlive(physicalMemory: ProcessInfo.processInfo.physicalMemory) }
+
+    /// True when this Mac holds the model resident and the idle re-warm below
+    /// has nothing to do.
+    static var neverUnloads: Bool { keepAlive as? Int == -1 }
+
+    /// Context window for every request, warm-up included.
+    ///
+    /// The default 32k context made llama-server allocate 3.5 GB of KV cache
+    /// ("context 3584 MiB" in ollama.log) and dominated the cold-load time.
+    /// Our prompt is about 1,100 tokens including the few-shot examples, so
+    /// 4096 is roomy. It MUST be identical everywhere: Ollama keys a loaded
+    /// model on its options, so a warm-up at one context and a request at
+    /// another reloads the model on every single dictation.
+    static let numCtx = 4096
+
+    /// Options block every request sends. Same object, same values, one place.
+    static var requestOptions: [String: Any] { ["temperature": 0, "num_ctx": numCtx] }
+
+    /// How often a small-memory Mac re-warms the model so the 30-minute
+    /// keep_alive never actually expires while the app is running.
+    static let rewarmInterval: TimeInterval = 20 * 60
+
     /// Human-readable state of the local LLM for the menu bar status line.
     enum Status: Equatable {
         case notStarted
@@ -48,6 +93,7 @@ enum EmbeddedOllama {
     }
 
     private static var process: Process?
+    private static var rewarmTask: Task<Void, Never>?
     private static let readinessCheckTimeout: TimeInterval = 1.0
     private static let startupWait: TimeInterval = 20.0
     private static let terminationGracePeriod: TimeInterval = 3.0
@@ -110,6 +156,7 @@ enum EmbeddedOllama {
             if await hasModel() {
                 await MainActor.run { onStatus(.ready) }
                 await warmUp()
+                startIdleRewarm()
                 return
             }
             FileHandle.standardError.write(Data("[ollama] model \(model) not present; pulling\n".utf8))
@@ -119,7 +166,10 @@ enum EmbeddedOllama {
                 }
                 let present = await hasModel()
                 await MainActor.run { onStatus(present ? .ready : .unavailable("model pull finished but model still missing")) }
-                if present { await warmUp() }
+                if present {
+                    await warmUp()
+                    startIdleRewarm()
+                }
             } catch {
                 FileHandle.standardError.write(Data("[ollama] model pull failed: \(error)\n".utf8))
                 await MainActor.run { onStatus(.unavailable("model download failed")) }
@@ -189,6 +239,8 @@ enum EmbeddedOllama {
     /// just a leaf process) before force-killing -- this is what keeps quit
     /// from ever leaving an orphaned ollama process behind.
     static func stop() {
+        rewarmTask?.cancel()
+        rewarmTask = nil
         guard let task = process, task.isRunning else { return }
         task.terminate()
         let deadline = Date().addingTimeInterval(terminationGracePeriod)
@@ -209,13 +261,33 @@ enum EmbeddedOllama {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = 60
-        request.httpBody = try? JSONSerialization.data(withJSONObject: ["model": model, "keep_alive": "30m"])
+        request.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "model": model,
+            "keep_alive": keepAlive,
+            "options": requestOptions,
+        ])
         let t0 = Date()
         if let (_, response) = try? await URLSession.shared.data(for: request),
            (response as? HTTPURLResponse)?.statusCode == 200 {
             FileHandle.standardError.write(Data("[ollama] model warmed in \(Int(Date().timeIntervalSince(t0) * 1000)) ms\n".utf8))
         } else {
             FileHandle.standardError.write(Data("[ollama] warm-up request failed (non-fatal)\n".utf8))
+        }
+    }
+
+    /// On a Mac too small to pin the model in memory, touch it every twenty
+    /// minutes so the thirty-minute keep_alive never actually expires while
+    /// the app is running. Cheap (an empty generate against an already-loaded
+    /// model returns in milliseconds) and it is the whole 3.5-second
+    /// first-dictation-of-the-afternoon penalty.
+    private static func startIdleRewarm() {
+        guard !neverUnloads, rewarmTask == nil else { return }
+        rewarmTask = Task.detached(priority: .utility) {
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64(rewarmInterval) * 1_000_000_000)
+                guard !Task.isCancelled else { return }
+                await warmUp()
+            }
         }
     }
 
