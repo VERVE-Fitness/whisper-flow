@@ -27,6 +27,16 @@ enum UsageLog {
         let stt_confidence: Double?
         let rms: Double?
         let outcome: String
+        /// Stage timings for the stop pipeline, so a slow or stalled stop can
+        /// be read off the log instead of guessed at from one `stt_ms` total.
+        /// `stt_finish_ms` is the trailing silence pad plus finishStream,
+        /// `batch_ms` the batch re-check, `insert_ms` the paste itself.
+        /// Optional for the same reason as the fields above: every line
+        /// written before these existed stays readable, and the CLI/file
+        /// paths that have no stop pipeline simply omit them.
+        let stt_finish_ms: Int?
+        let batch_ms: Int?
+        let insert_ms: Int?
     }
 
     static var logURL: URL {
@@ -68,7 +78,8 @@ enum UsageLog {
                        sttMs: Int, cleanupMs: Int, cleanupBackend: String,
                        rawText: String = "", cleanedText: String = "",
                        sttConfidence: Double? = nil, rms: Double? = nil,
-                       inputDevice: String? = nil, outcome: String = "inserted") {
+                       inputDevice: String? = nil, outcome: String = "inserted",
+                       sttFinishMs: Int? = nil, batchMs: Int? = nil, insertMs: Int? = nil) {
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let entry = Entry(ts: iso.string(from: Date()), mode: mode, audio_seconds: audioSeconds,
@@ -76,7 +87,8 @@ enum UsageLog {
                           stt_ms: sttMs, cleanup_ms: cleanupMs, cleanup_backend: cleanupBackend,
                           raw_text: String(rawText.prefix(200)), cleaned_text: String(cleanedText.prefix(200)),
                           input_device: inputDevice,
-                          stt_confidence: sttConfidence, rms: rms, outcome: outcome)
+                          stt_confidence: sttConfidence, rms: rms, outcome: outcome,
+                          stt_finish_ms: sttFinishMs, batch_ms: batchMs, insert_ms: insertMs)
         do {
             let dir = logURL.deletingLastPathComponent()
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

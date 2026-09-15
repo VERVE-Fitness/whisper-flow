@@ -101,6 +101,26 @@ final class ParakeetBackend: TranscriptionBackend, @unchecked Sendable {
         return text
     }
 
+    /// Throw the current streaming session away without waiting for it.
+    ///
+    /// Called after a `finishStream()` that timed out: that session is stuck
+    /// somewhere inside the sliding-window manager and there is no way to
+    /// know when, or whether, it will come back. Leaving it installed meant
+    /// the NEXT dictation started against a wedged manager and hung in the
+    /// same place -- one stall turned into every dictation stalling until the
+    /// app was restarted. Clearing the fields synchronously means the next
+    /// startStream builds a fresh manager; the old one is cleaned up on a
+    /// detached task so this call never blocks its caller.
+    func resetStream() {
+        let stuck = streamingManager
+        streamUpdatesTask?.cancel()
+        streamingManager = nil
+        streamUpdatesTask = nil
+        onPartial = nil
+        guard let stuck else { return }
+        Task.detached { await stuck.cleanup() }
+    }
+
     // MARK: - Batch (CLI)
 
     func transcribeFile(samples: [Float]) async throws -> String {
