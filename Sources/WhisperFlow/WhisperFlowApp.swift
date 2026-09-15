@@ -93,6 +93,11 @@ enum WhisperFlowMain {
             }
             exit(runCLIDualCaptureTest(seconds: seconds))
         }
+        // Past every CLI harness mode (each of which exits above), so this is
+        // the real app starting. Point stderr at app.log before anything has
+        // had a chance to say something worth keeping: launched from Finder,
+        // which is how it is always launched, stderr otherwise goes nowhere.
+        Diagnostics.redirectStandardErrorToLogFile()
         // Before any window, hotkey or permission prompt exists: if another
         // copy of this app is already running from a different folder, one of
         // the two has to go, or both hold the same hotkey and every dictation

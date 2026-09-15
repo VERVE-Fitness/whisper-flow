@@ -637,6 +637,14 @@ final class AppState: ObservableObject {
 
         let generation = UUID()
         stopGeneration = generation
+        // Short, stable handle for this dictation so the six stage lines in
+        // app.log can be read as one run.
+        let dictationID = String(generation.uuidString.prefix(8))
+        func trace(_ stage: String) {
+            Diagnostics.dictation(dictationID, stage: stage,
+                                  ms: Int(Date().timeIntervalSince(stopPressedAt) * 1000))
+        }
+        trace("start")
 
         // The watchdog sleeps on a DETACHED task, not the main actor. The
         // previous version slept with `Task { try? await Task.sleep(...) }`
@@ -720,6 +728,7 @@ final class AppState: ObservableObject {
             // two places the stop pipeline was seen to wedge.
             capture.stop()
             await capture.stopAndWait(timeout: Self.captureTeardownTimeout)
+            trace("engine_stopped")
             guard current() else { return }
 
             let feed = feedTask
@@ -772,6 +781,7 @@ final class AppState: ObservableObject {
                 backend.resetStream()
             }
             let sttFinishMs = Int(Date().timeIntervalSince(sttT0) * 1000)
+            trace("stt_finished")
             guard current() else { return }
             // stt_ms is what it always claimed to be in its comment and now
             // actually is: stop-press to final text, which is the number the
@@ -874,6 +884,7 @@ final class AppState: ObservableObject {
                     FileHandle.standardError.write(Data("[stt] batch pass failed, keeping the streaming result: \(error)\n".utf8))
                 }
                 batchMs = Int(Date().timeIntervalSince(batchT0) * 1000)
+                trace("batch")
                 let choice = TranscriptChoice.choose(streaming: raw, batch: batchText)
                 FileHandle.standardError.write(Data((TranscriptChoice.logLine(choice) + "\n").utf8))
                 raw = choice.text
@@ -921,6 +932,7 @@ final class AppState: ObservableObject {
             let focusContext = await focusContextTask?.value ?? nil
             guard current() else { return }
             let cleanResult = await router.clean(raw, context: focusContext)
+            trace("cleanup")
             guard current() else { return }
             let cleanedText = TextNormalizer.normalizeSentenceSpacing(cleanResult.text)
             cleanedTranscript = cleanedText
@@ -967,6 +979,11 @@ final class AppState: ObservableObject {
                             inputDevice: deviceLabel,
                             outcome: loggedOutcome,
                             sttFinishMs: sttFinishMs, batchMs: batchMs, insertMs: insertMs)
+            trace("inserted")
+            // One stat per dictation, so a log that has outgrown its 5 MB
+            // budget is rotated during a long-running session and not only at
+            // the next launch.
+            Diagnostics.rotateAppLogIfNeeded()
         }
     }
 
