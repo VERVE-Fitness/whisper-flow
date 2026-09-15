@@ -705,6 +705,11 @@ final class AppState: ObservableObject {
             guard current() else { return }
             let audioSeconds = capture.capturedSeconds
             let deviceName = capture.activeDevice?.name ?? "?"
+            // A capture that gave up on a silent device logs both names, so
+            // "why did this dictation come from the wrong mic" is answerable
+            // from the usage log alone.
+            let silentSwitch = capture.silentDeviceSwitch
+            let deviceLabel = silentSwitch.map { "\($0.from) → \($0.to)" } ?? deviceName
 
             // Closing the mic is now two calls: stop() returns straight away
             // having finished the stream continuation (which is what ends the
@@ -791,7 +796,7 @@ final class AppState: ObservableObject {
                                 rawChars: 0, cleanedChars: 0,
                                 sttMs: sttMs, cleanupMs: 0, cleanupBackend: "-",
                                 rawText: "", cleanedText: "",
-                                inputDevice: deviceName,
+                                inputDevice: deviceLabel,
                                 outcome: finishStalled ? "stt_stalled" : "discard_empty",
                                 sttFinishMs: sttFinishMs)
                 return
@@ -801,19 +806,24 @@ final class AppState: ObservableObject {
             let rms = captured.map { Self.rms(of: $0) }
             if let rms, let captured,
                rms < Self.silenceRmsThreshold || captured.count < Self.minimumSamplesForTranscription {
-                FileHandle.standardError.write(Data("[stt] discarding near-silent/too-short capture (rms=\(rms), samples=\(captured.count), device=\(deviceName))\n".utf8))
+                FileHandle.standardError.write(Data("[stt] discarding near-silent/too-short capture (rms=\(rms), samples=\(captured.count), device=\(deviceLabel))\n".utf8))
                 rawTranscript = ""
                 cleanedTranscript = ""
                 phase = .done
                 if mode != .window {
-                    pill.show(.discarded)
+                    // An RMS of exactly zero is not a quiet room, it is a
+                    // microphone that recorded nothing at all -- four
+                    // dictations from AirPods in September read like this.
+                    // "Didn't catch that" sends the person back to try again
+                    // with the same dead device; name it instead.
+                    pill.show(rms == 0 ? .failed("\(deviceName) gave no audio") : .discarded)
                     hotkeys.reset()
                 }
                 UsageLog.append(mode: mode.rawValue, audioSeconds: audioSeconds,
                                 rawChars: raw.count, cleanedChars: 0,
                                 sttMs: sttMs, cleanupMs: 0, cleanupBackend: "-",
                                 rawText: raw, cleanedText: "",
-                                rms: Double(rms), inputDevice: deviceName, outcome: "discard_silence",
+                                rms: Double(rms), inputDevice: deviceLabel, outcome: "discard_silence",
                                 sttFinishMs: sttFinishMs)
                 return
             }
@@ -852,7 +862,7 @@ final class AppState: ObservableObject {
                                         sttMs: sttMs, cleanupMs: 0, cleanupBackend: "-",
                                         rawText: batch.text, cleanedText: "",
                                         sttConfidence: sttConfidence, rms: rms.map(Double.init),
-                                        inputDevice: deviceName, outcome: "discard_low_confidence",
+                                        inputDevice: deviceLabel, outcome: "discard_low_confidence",
                                         sttFinishMs: sttFinishMs,
                                         batchMs: Int(Date().timeIntervalSince(batchT0) * 1000))
                         return
@@ -903,7 +913,7 @@ final class AppState: ObservableObject {
                                 sttMs: sttMs, cleanupMs: 0, cleanupBackend: "snippet",
                                 rawText: raw, cleanedText: snippetText,
                                 sttConfidence: sttConfidence, rms: rms.map(Double.init),
-                                inputDevice: deviceName, outcome: "snippet",
+                                inputDevice: deviceLabel, outcome: "snippet",
                                 sttFinishMs: sttFinishMs, batchMs: batchMs, insertMs: insertMs)
                 return
             }
@@ -954,7 +964,7 @@ final class AppState: ObservableObject {
                             cleanedText: cleanedText,
                             sttConfidence: sttConfidence,
                             rms: rms.map(Double.init),
-                            inputDevice: deviceName,
+                            inputDevice: deviceLabel,
                             outcome: loggedOutcome,
                             sttFinishMs: sttFinishMs, batchMs: batchMs, insertMs: insertMs)
         }

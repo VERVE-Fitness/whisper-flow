@@ -103,6 +103,11 @@ final class AudioCapture: @unchecked Sendable {
     private var _buffersDelivered = 0
     private var _lastBufferAt: Date?
     private var _activeDevice: AudioInputDevice?
+    /// How many samples in this capture were not exactly 0.0.
+    private var _nonZeroSamples = 0
+    /// The silent-device switch is offered once per capture, no more.
+    private var _silentSwitchAttempted = false
+    private var _silentDeviceSwitch: (from: String, to: String)?
 
     private func locked<T>(_ body: () -> T) -> T {
         stateLock.lock(); defer { stateLock.unlock() }
@@ -117,6 +122,12 @@ final class AudioCapture: @unchecked Sendable {
     /// The device the current/last capture actually recorded from (for the
     /// menu status line and the usage log).
     var activeDevice: AudioInputDevice? { locked { _activeDevice } }
+    /// Set when this capture gave up on a device that delivered nothing but
+    /// digital zeros and moved to another one. AppState puts both names in
+    /// the usage row and, if the dictation still came out silent, on the pill
+    /// -- "Didn't catch that" is the wrong thing to tell somebody whose
+    /// microphone was never actually recording.
+    var silentDeviceSwitch: (from: String, to: String)? { locked { _silentDeviceSwitch } }
     /// Diagnostics only: whether the engine believes it is running. Reads the
     /// reference under the lock and the property outside it, on purpose --
     /// see the class doc comment.
@@ -138,6 +149,13 @@ final class AudioCapture: @unchecked Sendable {
     /// try again once the storm has passed.
     private static let maxReconfigures = 3
     private static let reconfigureCooldown: TimeInterval = 5.0
+    /// How much audio to hear before concluding a device is not recording at
+    /// all. Every sample exactly 0.0 is not quiet, it is DIGITAL silence: a
+    /// working microphone in a silent room still delivers a noise floor. One
+    /// second is long enough that a device still waking up is not written off
+    /// and short enough that the switch happens while the person is still
+    /// talking, so the dictation survives.
+    private static let silentDeviceWindow: Double = 1.0
 
     /// Start capturing from the device `selection` resolves to. Returns a
     /// stream of 16 kHz mono Float32 chunks.
@@ -161,6 +179,9 @@ final class AudioCapture: @unchecked Sendable {
             _reconfigureCount = 0
             _isReconfiguring = false
             _stallLogged = false
+            _nonZeroSamples = 0
+            _silentSwitchAttempted = false
+            _silentDeviceSwitch = nil
             return _generation
         }
 
@@ -286,10 +307,27 @@ final class AudioCapture: @unchecked Sendable {
             guard status != .error, error == nil, out.frameLength > 0,
                   let channel = out.floatChannelData?[0] else { return }
             let samples = Array(UnsafeBufferPointer(start: channel, count: Int(out.frameLength)))
-            self.locked {
+            var nonZero = 0
+            for sample in samples where sample != 0 { nonZero += 1 }
+            let switchFrom: Int? = self.locked {
                 self._capturedSeconds += Double(samples.count) / Self.targetSampleRate
                 self._buffersDelivered += 1
                 self._lastBufferAt = Date()
+                self._nonZeroSamples += nonZero
+                // Not one non-zero sample in a full second of audio: this
+                // device is not recording. Claim the switch here, under the
+                // lock, so only one buffer can start it.
+                guard self._nonZeroSamples == 0,
+                      self._capturedSeconds >= Self.silentDeviceWindow,
+                      self._isActive,
+                      !self._silentSwitchAttempted,
+                      !self._isReconfiguring else { return nil }
+                self._silentSwitchAttempted = true
+                self._isReconfiguring = true
+                return self._generation
+            }
+            if let switchFrom {
+                self.switchAwayFromSilentDevice(generation: switchFrom)
             }
             // Yielding to a finished continuation is a documented no-op, so
             // a tap that outlives stop() by a callback is harmless.
@@ -410,6 +448,51 @@ final class AudioCapture: @unchecked Sendable {
                 locked { _stallLogged = false }
                 captureNote("could not resume: \(error.localizedDescription)")
                 captureLog.error("could not resume capture after configuration change: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+    }
+
+    // MARK: - Silent device
+
+    /// The device we are recording from has delivered a full second of
+    /// nothing but exact zeros, so move to the best alternative and keep the
+    /// same output stream. Runs on `engineQueue` like every other engine
+    /// rebuild, so it cannot overlap a stop() teardown or a configuration
+    /// change. Caller has already claimed `_isReconfiguring`.
+    private func switchAwayFromSilentDevice(generation: Int) {
+        let from = activeDevice
+        let fromName = from?.name ?? "?"
+        guard let replacement = AudioDevices.rankedFallbacks(excluding: from?.uid).first else {
+            locked { _isReconfiguring = false }
+            captureNote("\"\(fromName)\" delivered only zeros for \(String(format: "%.1f", Self.silentDeviceWindow))s; nothing better to switch to, staying put")
+            captureLog.error("input \"\(fromName, privacy: .public)\" delivered only digital silence and there is no other input to switch to")
+            return
+        }
+        captureNote("\"\(fromName)\" delivered only zeros for \(String(format: "%.1f", Self.silentDeviceWindow))s; switching to \"\(replacement.name)\"")
+        captureLog.error("input \"\(fromName, privacy: .public)\" delivered only digital silence; switching to \"\(replacement.name, privacy: .public)\"")
+        locked { _silentDeviceSwitch = (from: fromName, to: replacement.name) }
+
+        engineQueue.async { [self] in
+            defer { locked { _isReconfiguring = false } }
+            let old = locked { _engine }
+            old.inputNode.removeTap(onBus: 0)
+            old.stop()
+            guard isCurrent(generation) else { return }
+            do {
+                let rebuilt = try configureAndStart(selection: .device(uid: replacement.uid))
+                guard isCurrent(generation) else {
+                    rebuilt.inputNode.removeTap(onBus: 0)
+                    rebuilt.stop()
+                    return
+                }
+                installConfigurationChangeObserver(generation: generation, on: rebuilt)
+                locked {
+                    _lastBufferAt = Date()
+                    _stallLogged = false
+                }
+            } catch {
+                captureNote("could not switch to \"\(replacement.name)\": \(error.localizedDescription)")
+                captureLog.error("could not switch away from a silent input: \(error.localizedDescription, privacy: .public)")
             }
         }
     }
