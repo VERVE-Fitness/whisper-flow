@@ -145,7 +145,10 @@ final class AppState: ObservableObject {
     /// recording start (feature: context-aware spelling) -- by stop time our
     /// own pill/window may have shifted focus, so capturing later would read
     /// the wrong element.
-    private var capturedFocusContext: String?
+    /// The read runs off the main actor (an unresponsive target app used to
+    /// freeze the start of the recording), so what is held here is the task,
+    /// not the text; the cleanup stage awaits it long after it has finished.
+    private var focusContextTask: Task<String?, Never>?
     /// Defense-in-depth against stopRecording() being entered twice for one
     /// dictation: the actual observed cause was duplicate flagsChanged
     /// delivery (see HotkeyManager.lastHandledFlagsTimestamp), now deduped at
@@ -498,7 +501,8 @@ final class AppState: ObservableObject {
         lastSttMs = nil
         lastCleanupMs = nil
         recordStart = Date()
-        capturedFocusContext = accessibility.isTrusted ? FocusContext.captureBeforeCaret() : nil
+        focusContextTask?.cancel()
+        focusContextTask = accessibility.isTrusted ? Task { await FocusContext.captureBeforeCaret() } : nil
 
         if mode != .window {
             pill.show(.listening(partial: ""))
@@ -577,6 +581,8 @@ final class AppState: ObservableObject {
         let streamTask = streamStartTask
         captureStartTask = nil
         streamStartTask = nil
+        focusContextTask?.cancel()
+        focusContextTask = nil
         Task {
             defer { isStopping = false }
             _ = try? await streamTask?.value
@@ -881,7 +887,7 @@ final class AppState: ObservableObject {
                 var insertMs: Int?
                 if mode != .window {
                     let insertT0 = Date()
-                    let outcome = TextInserter.insert(snippetText, accessibilityTrusted: accessibility.isTrusted)
+                    let outcome = await TextInserter.insert(snippetText, accessibilityTrusted: accessibility.isTrusted)
                     insertMs = Int(Date().timeIntervalSince(insertT0) * 1000)
                     switch outcome {
                     case .inserted:
@@ -902,7 +908,9 @@ final class AppState: ObservableObject {
                 return
             }
 
-            let cleanResult = await router.clean(raw, context: capturedFocusContext)
+            let focusContext = await focusContextTask?.value ?? nil
+            guard current() else { return }
+            let cleanResult = await router.clean(raw, context: focusContext)
             guard current() else { return }
             let cleanedText = TextNormalizer.normalizeSentenceSpacing(cleanResult.text)
             cleanedTranscript = cleanedText
@@ -922,7 +930,7 @@ final class AppState: ObservableObject {
             var insertMs: Int?
             if mode != .window {
                 let insertT0 = Date()
-                let outcome = TextInserter.insert(cleanedText, accessibilityTrusted: accessibility.isTrusted)
+                let outcome = await TextInserter.insert(cleanedText, accessibilityTrusted: accessibility.isTrusted)
                 insertMs = Int(Date().timeIntervalSince(insertT0) * 1000)
                 switch outcome {
                 case .inserted:
