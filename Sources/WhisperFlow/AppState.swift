@@ -47,6 +47,9 @@ final class AppState: ObservableObject {
     @Published var lastSttMs: Int?
     @Published var lastCleanupMs: Int?
     @Published var launchAtLogin: Bool = SMAppService.mainApp.status == .enabled
+    /// macOS is holding the login item back (System Settings, Login Items, Allow in the
+    /// Background is off for Whisper Flow). Until 20 Oct 2026 the box just unticked itself.
+    @Published var loginNeedsApproval: Bool = SMAppService.mainApp.status == .requiresApproval
     /// Which microphone to record from (see InputDeviceSelection for why the
     /// default is the built-in mic, not the system default).
     @Published var inputSelection: InputDeviceSelection = InputDeviceSelection.saved
@@ -794,7 +797,29 @@ final class AppState: ObservableObject {
             // The words the pill has been showing are a real transcript,
             // so a stalled final pass falls back to them instead of
             // losing the dictation. Nil means there is nothing at all.
-            guard let rawSource = StopPipeline.rawText(finished: finished, partial: rawTranscript) else {
+            var rawSourceFound = StopPipeline.rawText(finished: finished, partial: rawTranscript)
+            // The streaming decoder heard nothing, but the audio may still be there: 9 of the
+            // 12 dictations lost on Niall's Mac from 15 Sep to 20 Oct 2026 were thrown away
+            // here, several of them 3 to 5 seconds of speech and four during an AirPods to
+            // built-in microphone switch. The batch decoder reads the whole retained buffer,
+            // so it gets one bounded try before the dictation is given up.
+            if rawSourceFound == nil, let captured,
+               captured.count >= Self.minimumSamplesForTranscription,
+               Self.rms(of: captured) >= Self.silenceRmsThreshold {
+                do {
+                    let rescued = try await withTimeout(seconds: TranscriptChoice.batchTimeoutSeconds) {
+                        [backend, captured] in
+                        try await backend.transcribeFileWithConfidence(samples: captured)
+                    }
+                    let text = rescued.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    FileHandle.standardError.write(Data("[stt] streaming heard nothing; batch pass found \(text.split(whereSeparator: \.isWhitespace).count) words (confidence=\(rescued.confidence))\n".utf8))
+                    if !text.isEmpty { rawSourceFound = text }
+                } catch {
+                    FileHandle.standardError.write(Data("[stt] streaming heard nothing and the batch rescue failed: \(error)\n".utf8))
+                }
+                guard current() else { return }
+            }
+            guard let rawSource = rawSourceFound else {
                 rawTranscript = ""
                 cleanedTranscript = ""
                 phase = .done
@@ -857,8 +882,12 @@ final class AppState: ObservableObject {
                     }
                     guard current() else { return }
                     sttConfidence = Double(batch.confidence)
+                    // One or two words at low confidence is the accidental tap ("Thank you.")
+                    // this guard exists for. Three or more is a sentence someone said:
+                    // "Some of the things that" (5 words, 0.43) was thrown away on 20 Oct 2026.
                     if audioSeconds < Self.shortClipSecondsThreshold,
-                       batch.confidence < Self.minimumBatchConfidence {
+                       batch.confidence < Self.minimumBatchConfidence,
+                       batch.text.split(whereSeparator: \.isWhitespace).count <= 2 {
                         FileHandle.standardError.write(Data("[stt] discarding low-confidence short clip (confidence=\(batch.confidence), text=\"\(batch.text)\")\n".utf8))
                         rawTranscript = ""
                         cleanedTranscript = ""
@@ -1381,9 +1410,22 @@ final class AppState: ObservableObject {
                 try SMAppService.mainApp.unregister()
             }
         } catch {
-            // Fall through to re-reading actual status below.
+            // Logged, then the real status below decides what the box shows.
+            FileHandle.standardError.write(Data("[login] \(on ? "register" : "unregister") failed: \(error.localizedDescription)\n".utf8))
         }
-        launchAtLogin = SMAppService.mainApp.status == .enabled
+        refreshLoginStatus()
+        // The one case the person can fix and the app cannot: macOS wants it allowed in
+        // System Settings. Take them straight to the switch rather than leave the box blank.
+        if on && loginNeedsApproval {
+            SMAppService.openSystemSettingsLoginItems()
+        }
+    }
+
+    func refreshLoginStatus() {
+        let status = SMAppService.mainApp.status
+        launchAtLogin = status == .enabled
+        loginNeedsApproval = status == .requiresApproval
+        FileHandle.standardError.write(Data("[login] status \(status.rawValue)\n".utf8))
     }
 
     /// Normalizes the raw transcript (lowercase, strip punctuation/common
