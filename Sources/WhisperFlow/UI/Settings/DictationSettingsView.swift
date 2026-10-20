@@ -1,4 +1,5 @@
 import SwiftUI
+import ServiceManagement
 import AppKit
 
 /// Dictation: the microphone, what the keys do, whether the app learns from corrections,
@@ -65,6 +66,15 @@ struct DictationSettingsView: View {
                     set: { state.setLaunchAtLogin($0) }
                 ))
                 .padding(.top, 6)
+                .onAppear { state.refreshLoginStatus() }
+                if state.loginNeedsApproval {
+                    Text("macOS is blocking this. In System Settings, General, Login Items & Extensions, turn on WhisperFlow under Allow in the Background, then tick this box again.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button("Open Login Items settings") { SMAppService.openSystemSettingsLoginItems() }
+                        .buttonStyle(.link)
+                }
             }
 
             SettingsBlock(title: "Cleanup model",
